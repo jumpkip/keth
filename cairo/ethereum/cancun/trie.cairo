@@ -1,4 +1,5 @@
 from starkware.cairo.common.cairo_builtins import PoseidonBuiltin
+from starkware.cairo.common.default_dict import default_dict_new
 from starkware.cairo.common.builtin_poseidon.poseidon import poseidon_hash, poseidon_hash_many
 from starkware.cairo.common.alloc import alloc
 from starkware.cairo.common.math_cmp import is_le
@@ -9,8 +10,8 @@ from starkware.cairo.lang.compiler.lib.registers import get_fp_and_pc
 from starkware.cairo.common.cairo_builtins import KeccakBuiltin
 from starkware.cairo.common.memcpy import memcpy
 
-from src.utils.bytes import uint256_to_bytes32_little
-from src.utils.dict import hashdict_read, hashdict_write, dict_new_empty
+from legacy.utils.bytes import uint256_to_bytes32_little
+from legacy.utils.dict import hashdict_read, hashdict_write, dict_new_empty, dict_read
 from ethereum.crypto.hash import keccak256
 from ethereum.utils.numeric import min
 from ethereum_rlp.rlp import encode, _encode_bytes, _encode
@@ -18,9 +19,12 @@ from ethereum.utils.numeric import U256__eq__
 from ethereum_types.numeric import U256, Uint, bool, U256Struct
 from ethereum_types.bytes import (
     HashedBytes,
+    HashedBytes32,
     Bytes,
+    Bytes20,
     BytesStruct,
     Bytes32,
+    Bytes32Struct,
     StringStruct,
     String,
     MappingBytesBytes,
@@ -31,13 +35,18 @@ from ethereum_types.bytes import (
 )
 from ethereum.cancun.blocks import (
     Receipt,
+    ReceiptStruct,
     Withdrawal,
+    WithdrawalStruct,
     UnionBytesLegacyTransaction,
     UnionBytesLegacyTransactionEnum,
     OptionalUnionBytesLegacyTransaction,
     UnionBytesReceipt,
     UnionBytesReceiptEnum,
     OptionalUnionBytesReceipt,
+    UnionBytesWithdrawal,
+    UnionBytesWithdrawalEnum,
+    OptionalUnionBytesWithdrawal,
 )
 from ethereum.cancun.fork_types import (
     Account,
@@ -45,14 +54,21 @@ from ethereum.cancun.fork_types import (
     AccountStruct,
     Address,
     OptionalAccount,
+    TupleAddressBytes32,
+    TupleAddressBytes32Struct,
     TupleAddressBytes32U256DictAccess,
     MappingAddressAccount,
     MappingAddressAccountStruct,
     AddressAccountDictAccess,
     MappingTupleAddressBytes32U256,
     MappingTupleAddressBytes32U256Struct,
+    OptionalMappingAddressBytes32,
+    MappingAddressBytes32,
+    MappingAddressBytes32Struct,
+    AddressBytes32DictAccess,
+    Root,
 )
-from ethereum.cancun.transactions_types import LegacyTransaction
+from ethereum.cancun.transactions_types import LegacyTransaction, LegacyTransactionStruct
 from ethereum_rlp.rlp import (
     Extended,
     SequenceExtended,
@@ -67,8 +83,10 @@ from ethereum_rlp.rlp import (
     encode_u256,
 )
 from ethereum.utils.numeric import divmod
+from ethereum.utils.bytes import Bytes32_to_Bytes, Bytes20_to_Bytes, Bytes_to_Bytes32
 
 from cairo_core.comparison import is_zero
+from cairo_core.control_flow import raise
 
 struct LeafNodeStruct {
     rest_of_key: Bytes,
@@ -165,20 +183,6 @@ namespace InternalNodeImpl {
     }
 }
 
-struct NodeEnum {
-    account: Account,
-    bytes: Bytes,
-    legacy_transaction: LegacyTransaction,
-    receipt: Receipt,
-    uint: Uint*,
-    u256: U256,
-    withdrawal: Withdrawal,
-}
-
-struct Node {
-    value: NodeEnum*,
-}
-
 struct TrieAddressOptionalAccountStruct {
     secured: bool,
     default: OptionalAccount,
@@ -189,6 +193,10 @@ struct TrieAddressOptionalAccount {
     value: TrieAddressOptionalAccountStruct*,
 }
 
+// Internal representation of the Dict[Address, Trie[Bytes32, U256]]
+// which holds the storage tries for each account.
+// During execution, the storage tries are "merged" into a single trie where the keys are
+// the hash of the account address and the storage key.
 struct TrieTupleAddressBytes32U256Struct {
     secured: bool,
     default: U256,
@@ -197,6 +205,33 @@ struct TrieTupleAddressBytes32U256Struct {
 
 struct TrieTupleAddressBytes32U256 {
     value: TrieTupleAddressBytes32U256Struct*,
+}
+
+// To compute storage roots, we will extract mapping of all storage tries for each account.
+struct Bytes32U256DictAccess {
+    key: HashedBytes32,
+    prev_value: U256,
+    new_value: U256,
+}
+
+struct MappingBytes32U256Struct {
+    dict_ptr_start: Bytes32U256DictAccess*,
+    dict_ptr: Bytes32U256DictAccess*,
+    parent_dict: MappingBytes32U256Struct*,
+}
+
+struct MappingBytes32U256 {
+    value: MappingBytes32U256Struct*,
+}
+
+struct TrieBytes32U256Struct {
+    secured: bool,
+    default: U256,
+    _data: MappingBytes32U256,
+}
+
+struct TrieBytes32U256 {
+    value: TrieBytes32U256Struct*,
 }
 
 struct BytesOptionalUnionBytesLegacyTransactionDictAccess {
@@ -249,6 +284,58 @@ struct TrieBytesOptionalUnionBytesReceiptStruct {
 
 struct TrieBytesOptionalUnionBytesReceipt {
     value: TrieBytesOptionalUnionBytesReceiptStruct*,
+}
+
+struct BytesOptionalUnionBytesWithdrawalDictAccess {
+    key: HashedBytes,
+    prev_value: OptionalUnionBytesWithdrawal,
+    new_value: OptionalUnionBytesWithdrawal,
+}
+
+struct MappingBytesOptionalUnionBytesWithdrawalStruct {
+    dict_ptr_start: BytesOptionalUnionBytesWithdrawalDictAccess*,
+    dict_ptr: BytesOptionalUnionBytesWithdrawalDictAccess*,
+    parent_dict: MappingBytesOptionalUnionBytesWithdrawalStruct*,
+}
+
+struct MappingBytesOptionalUnionBytesWithdrawal {
+    value: MappingBytesOptionalUnionBytesWithdrawalStruct*,
+}
+
+struct TrieBytesOptionalUnionBytesWithdrawalStruct {
+    secured: bool,
+    default: OptionalUnionBytesWithdrawal,
+    _data: MappingBytesOptionalUnionBytesWithdrawal,
+}
+
+struct TrieBytesOptionalUnionBytesWithdrawal {
+    value: TrieBytesOptionalUnionBytesWithdrawalStruct*,
+}
+
+struct EthereumTries {
+    value: EthereumTriesEnum*,
+}
+
+struct EthereumTriesEnum {
+    account: TrieAddressOptionalAccount,
+    storage: TrieBytes32U256,
+    transaction: TrieBytesOptionalUnionBytesLegacyTransaction,
+    receipt: TrieBytesOptionalUnionBytesReceipt,
+    withdrawal: TrieBytesOptionalUnionBytesWithdrawal,
+}
+
+struct NodeEnum {
+    account: Account,
+    bytes: Bytes,
+    legacy_transaction: LegacyTransaction,
+    receipt: Receipt,
+    uint: Uint*,
+    u256: U256,
+    withdrawal: Withdrawal,
+}
+
+struct Node {
+    value: NodeEnum*,
 }
 
 func encode_internal_node{
@@ -333,6 +420,9 @@ func encode_node{range_check_ptr, bitwise_ptr: BitwiseBuiltin*, keccak_ptr: Kecc
 ) -> Bytes {
     alloc_locals;
 
+    tempvar is_none = is_zero(cast(node.value, felt));
+    jmp none if is_none != 0;
+
     tempvar is_account = cast(node.value.account.value, felt);
     jmp account if is_account != 0;
 
@@ -356,17 +446,11 @@ func encode_node{range_check_ptr, bitwise_ptr: BitwiseBuiltin*, keccak_ptr: Kecc
 
     none:
     // None defined for type Node but actually not supported in the EELS
-    with_attr error_message("encode_node: node cannot be None") {
-        assert 0 = 1;
-    }
-    tempvar result = Bytes(new BytesStruct(cast(0, felt*), 0));
-    return result;
+    raise('AssertionError');
 
     account:
     if (cast(storage_root.value, felt) == 0) {
-        with_attr error_message("encode_node: account without storage root") {
-            assert 0 = 1;
-        }
+        raise('AssertionError');
     }
     let encoded = encode_account(node.value.account, storage_root);
     return encoded;
@@ -383,8 +467,13 @@ func encode_node{range_check_ptr, bitwise_ptr: BitwiseBuiltin*, keccak_ptr: Kecc
     return encoded;
 
     uint:
-    let encoded = encode_uint([node.value.uint]);
-    return encoded;
+    // Node is Union[Account, Bytes, LegacyTransaction, Receipt, Uint, U256, Withdrawal, None]
+    // but encode_node(Uint) will raise AssertionError in EELS
+    raise('AssertionError');
+
+    // TODO: use this code once Uint is supported in the EELS
+    // let encoded = encode_uint([node.value.uint]);
+    // return encoded;
 
     u256:
     let encoded = encode_u256(node.value.u256);
@@ -458,8 +547,11 @@ func trie_get_TrieAddressOptionalAccount{
     let fp_and_pc = get_fp_and_pc();
     local __fp__: felt* = fp_and_pc.fp_val;
 
-    with dict_ptr {
-        let (pointer) = hashdict_read(1, &key.value);
+    let (pointer) = hashdict_read{dict_ptr=dict_ptr}(1, &key.value);
+    if (pointer == 0) {
+        tempvar pointer = cast(trie.value.default.value, felt);
+    } else {
+        tempvar pointer = pointer;
     }
     let new_dict_ptr = cast(dict_ptr, AddressAccountDictAccess*);
     let parent_dict = trie.value._data.value.parent_dict;
@@ -478,6 +570,7 @@ func trie_get_TrieAddressOptionalAccount{
 func trie_get_TrieTupleAddressBytes32U256{
     poseidon_ptr: PoseidonBuiltin*, trie: TrieTupleAddressBytes32U256
 }(address: Address, key: Bytes32) -> U256 {
+    alloc_locals;
     let dict_ptr = cast(trie.value._data.value.dict_ptr, DictAccess*);
 
     let (keys) = alloc();
@@ -485,8 +578,11 @@ func trie_get_TrieTupleAddressBytes32U256{
     assert keys[1] = key.value.low;
     assert keys[2] = key.value.high;
 
-    with dict_ptr {
-        let (pointer) = hashdict_read(3, keys);
+    let (pointer) = hashdict_read{dict_ptr=dict_ptr}(3, keys);
+    if (pointer == 0) {
+        tempvar pointer = cast(trie.value.default.value, felt);
+    } else {
+        tempvar pointer = pointer;
     }
     let new_dict_ptr = cast(dict_ptr, TupleAddressBytes32U256DictAccess*);
     let parent_dict = trie.value._data.value.parent_dict;
@@ -502,13 +598,47 @@ func trie_get_TrieTupleAddressBytes32U256{
     return res;
 }
 
+func trie_get_TrieBytes32U256{poseidon_ptr: PoseidonBuiltin*, trie: TrieBytes32U256}(
+    key: Bytes32
+) -> U256 {
+    alloc_locals;
+    let dict_ptr = cast(trie.value._data.value.dict_ptr, DictAccess*);
+
+    let (keys) = alloc();
+    assert keys[0] = key.value.low;
+    assert keys[1] = key.value.high;
+
+    let (pointer) = hashdict_read{dict_ptr=dict_ptr}(2, keys);
+    if (pointer == 0) {
+        tempvar pointer = cast(trie.value.default.value, felt);
+    } else {
+        tempvar pointer = pointer;
+    }
+    let new_dict_ptr = cast(dict_ptr, Bytes32U256DictAccess*);
+    let parent_dict = trie.value._data.value.parent_dict;
+    tempvar mapping = MappingBytes32U256(
+        new MappingBytes32U256Struct(
+            trie.value._data.value.dict_ptr_start, new_dict_ptr, parent_dict
+        ),
+    );
+    tempvar trie = TrieBytes32U256(
+        new TrieBytes32U256Struct(trie.value.secured, trie.value.default, mapping)
+    );
+    tempvar res = U256(cast(pointer, U256Struct*));
+    return res;
+}
+
 func trie_get_TrieBytesOptionalUnionBytesLegacyTransaction{
     poseidon_ptr: PoseidonBuiltin*, trie: TrieBytesOptionalUnionBytesLegacyTransaction
 }(key: Bytes) -> OptionalUnionBytesLegacyTransaction {
+    alloc_locals;
     let dict_ptr = cast(trie.value._data.value.dict_ptr, DictAccess*);
 
-    with dict_ptr {
-        let (pointer) = hashdict_read(key.value.len, key.value.data);
+    let (pointer) = hashdict_read{dict_ptr=dict_ptr}(key.value.len, key.value.data);
+    if (pointer == 0) {
+        tempvar pointer = cast(trie.value.default.value, felt);
+    } else {
+        tempvar pointer = pointer;
     }
     let new_dict_ptr = cast(dict_ptr, BytesOptionalUnionBytesLegacyTransactionDictAccess*);
     let parent_dict = trie.value._data.value.parent_dict;
@@ -531,9 +661,15 @@ func trie_get_TrieBytesOptionalUnionBytesLegacyTransaction{
 func trie_get_TrieBytesOptionalUnionBytesReceipt{
     poseidon_ptr: PoseidonBuiltin*, trie: TrieBytesOptionalUnionBytesReceipt
 }(key: Bytes) -> OptionalUnionBytesReceipt {
+    alloc_locals;
     let dict_ptr = cast(trie.value._data.value.dict_ptr, DictAccess*);
 
     let (pointer) = hashdict_read{dict_ptr=dict_ptr}(key.value.len, key.value.data);
+    if (pointer == 0) {
+        tempvar pointer = cast(trie.value.default.value, felt);
+    } else {
+        tempvar pointer = pointer;
+    }
     let new_dict_ptr = cast(dict_ptr, BytesOptionalUnionBytesReceiptDictAccess*);
     let parent_dict = trie.value._data.value.parent_dict;
     tempvar mapping = MappingBytesOptionalUnionBytesReceipt(
@@ -550,6 +686,34 @@ func trie_get_TrieBytesOptionalUnionBytesReceipt{
     return res;
 }
 
+func trie_get_TrieBytesOptionalUnionBytesWithdrawal{
+    poseidon_ptr: PoseidonBuiltin*, trie: TrieBytesOptionalUnionBytesWithdrawal
+}(key: Bytes) -> OptionalUnionBytesWithdrawal {
+    alloc_locals;
+    let dict_ptr = cast(trie.value._data.value.dict_ptr, DictAccess*);
+
+    let (pointer) = hashdict_read{dict_ptr=dict_ptr}(key.value.len, key.value.data);
+    if (pointer == 0) {
+        tempvar pointer = cast(trie.value.default.value, felt);
+    } else {
+        tempvar pointer = pointer;
+    }
+    let new_dict_ptr = cast(dict_ptr, BytesOptionalUnionBytesWithdrawalDictAccess*);
+    let parent_dict = trie.value._data.value.parent_dict;
+    tempvar mapping = MappingBytesOptionalUnionBytesWithdrawal(
+        new MappingBytesOptionalUnionBytesWithdrawalStruct(
+            trie.value._data.value.dict_ptr_start, new_dict_ptr, parent_dict
+        ),
+    );
+    tempvar trie = TrieBytesOptionalUnionBytesWithdrawal(
+        new TrieBytesOptionalUnionBytesWithdrawalStruct(
+            trie.value.secured, trie.value.default, mapping
+        ),
+    );
+    tempvar res = OptionalUnionBytesWithdrawal(cast(pointer, UnionBytesWithdrawalEnum*));
+    return res;
+}
+
 func trie_set_TrieAddressOptionalAccount{
     poseidon_ptr: PoseidonBuiltin*, trie: TrieAddressOptionalAccount
 }(key: Address, value: OptionalAccount) {
@@ -558,16 +722,9 @@ func trie_set_TrieAddressOptionalAccount{
     let (keys) = alloc();
     assert [keys] = key.value;
 
-    // Compare to the null pointer, as the default is _always_ an optional account.
-    if (cast(value.value, felt) == 0) {
-        hashdict_write{dict_ptr=dict_ptr}(1, keys, 0);
-        tempvar dict_ptr = dict_ptr;
-        tempvar poseidon_ptr = poseidon_ptr;
-    } else {
-        hashdict_write{dict_ptr=dict_ptr}(1, keys, cast(value.value, felt));
-        tempvar dict_ptr = dict_ptr;
-        tempvar poseidon_ptr = poseidon_ptr;
-    }
+    // Writes 0 if value.value is the null ptr
+    hashdict_write{dict_ptr=dict_ptr}(1, keys, cast(value.value, felt));
+
     let new_dict_ptr = cast(dict_ptr, AddressAccountDictAccess*);
     tempvar mapping = MappingAddressAccount(
         new MappingAddressAccountStruct(
@@ -594,12 +751,8 @@ func trie_set_TrieTupleAddressBytes32U256{
 
     if (is_default.value != 0) {
         hashdict_write{dict_ptr=dict_ptr}(3, keys, 0);
-        tempvar dict_ptr = dict_ptr;
-        tempvar poseidon_ptr = poseidon_ptr;
     } else {
         hashdict_write{dict_ptr=dict_ptr}(3, keys, cast(value.value, felt));
-        tempvar dict_ptr = dict_ptr;
-        tempvar poseidon_ptr = poseidon_ptr;
     }
     let new_dict_ptr = cast(dict_ptr, TupleAddressBytes32U256DictAccess*);
     tempvar mapping = MappingTupleAddressBytes32U256(
@@ -613,21 +766,44 @@ func trie_set_TrieTupleAddressBytes32U256{
     return ();
 }
 
+func trie_set_TrieBytes32U256{poseidon_ptr: PoseidonBuiltin*, trie: TrieBytes32U256}(
+    key: Bytes32, value: U256
+) {
+    alloc_locals;
+    let dict_ptr = cast(trie.value._data.value.dict_ptr, DictAccess*);
+
+    let is_default = U256__eq__(value, trie.value.default);
+
+    let (keys) = alloc();
+    assert keys[0] = key.value.low;
+    assert keys[1] = key.value.high;
+
+    if (is_default.value != 0) {
+        hashdict_write{dict_ptr=dict_ptr}(2, keys, 0);
+    } else {
+        hashdict_write{dict_ptr=dict_ptr}(2, keys, cast(value.value, felt));
+    }
+
+    let new_dict_ptr = cast(dict_ptr, Bytes32U256DictAccess*);
+    tempvar mapping = MappingBytes32U256(
+        new MappingBytes32U256Struct(
+            trie.value._data.value.dict_ptr_start, new_dict_ptr, trie.value._data.value.parent_dict
+        ),
+    );
+    tempvar trie = TrieBytes32U256(
+        new TrieBytes32U256Struct(trie.value.secured, trie.value.default, mapping)
+    );
+    return ();
+}
 func trie_set_TrieBytesOptionalUnionBytesLegacyTransaction{
     poseidon_ptr: PoseidonBuiltin*, trie: TrieBytesOptionalUnionBytesLegacyTransaction
 }(key: Bytes, value: OptionalUnionBytesLegacyTransaction) {
     alloc_locals;
     let dict_ptr = cast(trie.value._data.value.dict_ptr, DictAccess*);
 
-    if (cast(value.value, felt) == 0) {
-        hashdict_write{dict_ptr=dict_ptr}(key.value.len, key.value.data, 0);
-        tempvar dict_ptr = dict_ptr;
-        tempvar poseidon_ptr = poseidon_ptr;
-    } else {
-        hashdict_write{dict_ptr=dict_ptr}(key.value.len, key.value.data, cast(value.value, felt));
-        tempvar dict_ptr = dict_ptr;
-        tempvar poseidon_ptr = poseidon_ptr;
-    }
+    // Writes 0 if value.value is the null ptr
+    hashdict_write{dict_ptr=dict_ptr}(key.value.len, key.value.data, cast(value.value, felt));
+
     let new_dict_ptr = cast(dict_ptr, BytesOptionalUnionBytesLegacyTransactionDictAccess*);
     tempvar mapping = MappingBytesOptionalUnionBytesLegacyTransaction(
         new MappingBytesOptionalUnionBytesLegacyTransactionStruct(
@@ -648,15 +824,8 @@ func trie_set_TrieBytesOptionalUnionBytesReceipt{
     alloc_locals;
     let dict_ptr = cast(trie.value._data.value.dict_ptr, DictAccess*);
 
-    if (cast(value.value, felt) == 0) {
-        hashdict_write{dict_ptr=dict_ptr}(key.value.len, key.value.data, 0);
-        tempvar dict_ptr = dict_ptr;
-        tempvar poseidon_ptr = poseidon_ptr;
-    } else {
-        hashdict_write{dict_ptr=dict_ptr}(key.value.len, key.value.data, cast(value.value, felt));
-        tempvar dict_ptr = dict_ptr;
-        tempvar poseidon_ptr = poseidon_ptr;
-    }
+    // Writes 0 if value.value is the null ptr
+    hashdict_write{dict_ptr=dict_ptr}(key.value.len, key.value.data, cast(value.value, felt));
 
     let new_dict_ptr = cast(dict_ptr, BytesOptionalUnionBytesReceiptDictAccess*);
     tempvar mapping = MappingBytesOptionalUnionBytesReceipt(
@@ -667,6 +836,30 @@ func trie_set_TrieBytesOptionalUnionBytesReceipt{
 
     tempvar trie = TrieBytesOptionalUnionBytesReceipt(
         new TrieBytesOptionalUnionBytesReceiptStruct(
+            trie.value.secured, trie.value.default, mapping
+        ),
+    );
+    return ();
+}
+
+func trie_set_TrieBytesOptionalUnionBytesWithdrawal{
+    poseidon_ptr: PoseidonBuiltin*, trie: TrieBytesOptionalUnionBytesWithdrawal
+}(key: Bytes, value: OptionalUnionBytesWithdrawal) {
+    alloc_locals;
+    let dict_ptr = cast(trie.value._data.value.dict_ptr, DictAccess*);
+
+    // Writes 0 if value.value is the null ptr
+    hashdict_write{dict_ptr=dict_ptr}(key.value.len, key.value.data, cast(value.value, felt));
+
+    let new_dict_ptr = cast(dict_ptr, BytesOptionalUnionBytesWithdrawalDictAccess*);
+    tempvar mapping = MappingBytesOptionalUnionBytesWithdrawal(
+        new MappingBytesOptionalUnionBytesWithdrawalStruct(
+            trie.value._data.value.dict_ptr_start, new_dict_ptr, trie.value._data.value.parent_dict
+        ),
+    );
+
+    tempvar trie = TrieBytesOptionalUnionBytesWithdrawal(
+        new TrieBytesOptionalUnionBytesWithdrawalStruct(
             trie.value.secured, trie.value.default, mapping
         ),
     );
@@ -792,64 +985,558 @@ func bytes_to_nibble_list{bitwise_ptr: BitwiseBuiltin*}(bytes_: Bytes) -> Bytes 
     return result;
 }
 
-// func _prepare_trie(trie: Trie[K, V], get_storage_root: Callable[List(elts=[Name(id='Address', ctx=Load())], ctx=Load()), Root]) -> Mapping[Bytes, Bytes] {
-//     // Implementation:
-//     // mapped: MutableMapping[Bytes, Bytes] = {}
-//     // for (preimage, value) in trie._data.items():
-//     // if isinstance(value, Account):
-//     // assert get_storage_root is not None
-//     // address = Address(preimage)
-//     // encoded_value = encode_node(value, get_storage_root(address))
-//     // else:
-//     // encoded_value = encode_node(value)
-//     // if encoded_value == b'':
-//     // raise AssertionError
-//     // key: Bytes
-//     // if trie.secured:
-//     // key = keccak256(preimage)
-//     // else:
-//     // key = preimage
-//     // mapped[bytes_to_nibble_list(key)] = encoded_value
-//         // if isinstance(value, Account):
-//         // assert get_storage_root is not None
-//         // address = Address(preimage)
-//         // encoded_value = encode_node(value, get_storage_root(address))
-//         // else:
-//         // encoded_value = encode_node(value)
-//             // assert get_storage_root is not None
-//             // address = Address(preimage)
-//             // encoded_value = encode_node(value, get_storage_root(address))
-//         // else:
-//             // encoded_value = encode_node(value)
-//         // if encoded_value == b'':
-//         // raise AssertionError
-//             // raise AssertionError
-//         // key: Bytes
-//         // if trie.secured:
-//         // key = keccak256(preimage)
-//         // else:
-//         // key = preimage
-//             // key = keccak256(preimage)
-//         // else:
-//             // key = preimage
-//         // mapped[bytes_to_nibble_list(key)] = encoded_value
-//     // return mapped
-// }
+func _prepare_trie{
+    range_check_ptr,
+    bitwise_ptr: BitwiseBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
+}(trie_union: EthereumTries, storage_roots_: OptionalMappingAddressBytes32) -> MappingBytesBytes {
+    alloc_locals;
 
-// func root(trie: Trie[K, V], get_storage_root: Callable[List(elts=[Name(id='Address', ctx=Load())], ctx=Load()), Root]) -> Root {
-//     // Implementation:
-//     // obj = _prepare_trie(trie, get_storage_root)
-//     // root_node = encode_internal_node(patricialize(obj, Uint(0)))
-//     // if len(encode(root_node)) < 32:
-//     // return keccak256(encode(root_node))
-//     // else:
-//     // assert isinstance(root_node, Bytes)
-//     // return Root(root_node)
-//         // return keccak256(encode(root_node))
-//     // else:
-//         // assert isinstance(root_node, Bytes)
-//         // return Root(root_node)
-// }
+    let (local mapping_ptr_start: BytesBytesDictAccess*) = default_dict_new(0);
+
+    tempvar is_account = cast(trie_union.value.account.value, felt);
+    jmp account if is_account != 0;
+
+    tempvar is_storage = cast(trie_union.value.storage.value, felt);
+    jmp storage if is_storage != 0;
+
+    tempvar is_transaction = cast(trie_union.value.transaction.value, felt);
+    jmp transaction if is_transaction != 0;
+
+    tempvar is_receipt = cast(trie_union.value.receipt.value, felt);
+    jmp receipt if is_receipt != 0;
+
+    tempvar is_withdrawal = cast(trie_union.value.withdrawal.value, felt);
+    jmp withdrawal if is_withdrawal != 0;
+
+    raise('Invalid trie union');
+
+    account:
+    if (cast(storage_roots_.value, felt) == 0) {
+        raise('Missing Storage Roots');
+    }
+    let account_trie = trie_union.value.account;
+    _prepare_trie_inner_account(
+        account_trie,
+        account_trie.value._data.value.dict_ptr_start,
+        mapping_ptr_start,
+        MappingAddressBytes32(storage_roots_.value),
+    );
+    jmp end;
+
+    storage:
+    let storage_trie = trie_union.value.storage;
+    _prepare_trie_inner_storage(
+        storage_trie, storage_trie.value._data.value.dict_ptr_start, mapping_ptr_start
+    );
+    jmp end;
+
+    transaction:
+    let transaction_trie = trie_union.value.transaction;
+    _prepare_trie_inner_transaction(
+        transaction_trie, transaction_trie.value._data.value.dict_ptr_start, mapping_ptr_start
+    );
+    jmp end;
+
+    receipt:
+    let receipt_trie = trie_union.value.receipt;
+    _prepare_trie_inner_receipt(
+        receipt_trie, receipt_trie.value._data.value.dict_ptr_start, mapping_ptr_start
+    );
+    jmp end;
+
+    withdrawal:
+    let withdrawal_trie = trie_union.value.withdrawal;
+    _prepare_trie_inner_withdrawal(
+        withdrawal_trie, withdrawal_trie.value._data.value.dict_ptr_start, mapping_ptr_start
+    );
+    jmp end;
+
+    end:
+    let range_check_ptr = [ap - 5];
+    let bitwise_ptr = cast([ap - 4], BitwiseBuiltin*);
+    let keccak_ptr = cast([ap - 3], KeccakBuiltin*);
+    let poseidon_ptr = cast([ap - 2], PoseidonBuiltin*);
+    let mapping_ptr_end = cast([ap - 1], BytesBytesDictAccess*);
+
+    tempvar result = MappingBytesBytes(
+        new MappingBytesBytesStruct(
+            cast(mapping_ptr_start, BytesBytesDictAccess*),
+            cast(mapping_ptr_end, BytesBytesDictAccess*),
+            cast(0, MappingBytesBytesStruct*),
+        ),
+    );
+    return result;
+}
+
+func _prepare_trie_inner_account{
+    range_check_ptr,
+    bitwise_ptr: BitwiseBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
+}(
+    trie: TrieAddressOptionalAccount,
+    dict_ptr: AddressAccountDictAccess*,
+    mapping_ptr_end: BytesBytesDictAccess*,
+    storage_roots_: MappingAddressBytes32,
+) -> BytesBytesDictAccess* {
+    alloc_locals;
+
+    if (dict_ptr == trie.value._data.value.dict_ptr) {
+        return mapping_ptr_end;
+    }
+
+    // Skip all None values, which are deleted trie entries
+    if (cast(dict_ptr.new_value.value, felt) == 0) {
+        return _prepare_trie_inner_account(
+            trie, dict_ptr + AddressAccountDictAccess.SIZE, mapping_ptr_end, storage_roots_
+        );
+    }
+
+    let storage_roots_ptr = cast(storage_roots_.value.dict_ptr, DictAccess*);
+    let (storage_root_ptr) = dict_read{dict_ptr=storage_roots_ptr}(dict_ptr.key.value);
+    let storage_root_b32 = Bytes32(cast(storage_root_ptr, Bytes32Struct*));
+    tempvar storage_roots_ = MappingAddressBytes32(
+        new MappingAddressBytes32Struct(
+            storage_roots_.value.dict_ptr_start,
+            cast(storage_roots_ptr, AddressBytes32DictAccess*),
+            storage_roots_.value.parent_dict,
+        ),
+    );
+    let storage_root = Bytes32_to_Bytes(storage_root_b32);
+
+    let preimage = Bytes20_to_Bytes(dict_ptr.key);
+    let value = dict_ptr.new_value;
+
+    let (buffer: felt*) = alloc();
+    tempvar node = Node(
+        new NodeEnum(
+            account=value,
+            bytes=Bytes(cast(0, BytesStruct*)),
+            legacy_transaction=LegacyTransaction(cast(0, LegacyTransactionStruct*)),
+            receipt=Receipt(cast(0, ReceiptStruct*)),
+            uint=cast(0, Uint*),
+            u256=U256(cast(0, U256Struct*)),
+            withdrawal=Withdrawal(cast(0, WithdrawalStruct*)),
+        ),
+    );
+    let encoded_value = encode_node(node, storage_root);
+
+    if (encoded_value.value.len == 0) {
+        raise('AssertionError');
+    }
+
+    // TODO: Common part, factorise.
+
+    if (trie.value.secured.value != 0) {
+        let key_bytes32 = keccak256(preimage);
+        let key_bytes = Bytes32_to_Bytes(key_bytes32);
+        tempvar range_check_ptr = range_check_ptr;
+        tempvar bitwise_ptr = bitwise_ptr;
+        tempvar keccak_ptr = keccak_ptr;
+    } else {
+        tempvar key_bytes = preimage;
+        tempvar range_check_ptr = range_check_ptr;
+        tempvar bitwise_ptr = bitwise_ptr;
+        tempvar keccak_ptr = keccak_ptr;
+    }
+    let key_bytes = Bytes(cast([ap - 4], BytesStruct*));
+    let range_check_ptr = [ap - 3];
+    let bitwise_ptr = cast([ap - 2], BitwiseBuiltin*);
+    let keccak_ptr = cast([ap - 1], KeccakBuiltin*);
+
+    let nibbles_list = bytes_to_nibble_list(key_bytes);
+    let mapping_dict_ptr = cast(mapping_ptr_end, DictAccess*);
+    hashdict_write{dict_ptr=mapping_dict_ptr}(
+        nibbles_list.value.len, nibbles_list.value.data, cast(encoded_value.value, felt)
+    );
+
+    return _prepare_trie_inner_account(
+        trie,
+        dict_ptr + AddressAccountDictAccess.SIZE,
+        cast(mapping_dict_ptr, BytesBytesDictAccess*),
+        storage_roots_,
+    );
+}
+
+func _prepare_trie_inner_storage{
+    range_check_ptr,
+    bitwise_ptr: BitwiseBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
+}(
+    trie: TrieBytes32U256, dict_ptr: Bytes32U256DictAccess*, mapping_ptr_end: BytesBytesDictAccess*
+) -> BytesBytesDictAccess* {
+    alloc_locals;
+
+    if (dict_ptr == trie.value._data.value.dict_ptr) {
+        return mapping_ptr_end;
+    }
+
+    // Skip all None values, which are deleted trie entries
+    // Note: Considering that the given trie was built from the state._storage_tries of type
+    // Trie[Tuple[Address, Bytes32], U256], there should not be any None values remaining.
+    if (dict_ptr.new_value.value == 0) {
+        return _prepare_trie_inner_storage(
+            trie, dict_ptr + Bytes32U256DictAccess.SIZE, mapping_ptr_end
+        );
+    }
+
+    let preimage_b32 = _get_bytes32_preimage_for_key(
+        dict_ptr.key.value, cast(trie.value._data.value.dict_ptr, DictAccess*)
+    );
+    let preimage = Bytes32_to_Bytes(preimage_b32);
+
+    let value = dict_ptr.new_value;
+    tempvar node = Node(
+        new NodeEnum(
+            account=Account(cast(0, AccountStruct*)),
+            bytes=Bytes(cast(0, BytesStruct*)),
+            legacy_transaction=LegacyTransaction(cast(0, LegacyTransactionStruct*)),
+            receipt=Receipt(cast(0, ReceiptStruct*)),
+            uint=cast(0, Uint*),
+            u256=value,
+            withdrawal=Withdrawal(cast(0, WithdrawalStruct*)),
+        ),
+    );
+    let encoded_value = encode_node(node, Bytes(cast(0, BytesStruct*)));
+
+    // TODO: Common part, factorise.
+    if (encoded_value.value.len == 0) {
+        raise('AssertionError');
+    }
+
+    if (trie.value.secured.value != 0) {
+        let key_bytes32 = keccak256(preimage);
+        let key_bytes = Bytes32_to_Bytes(key_bytes32);
+        tempvar range_check_ptr = range_check_ptr;
+        tempvar bitwise_ptr = bitwise_ptr;
+        tempvar keccak_ptr = keccak_ptr;
+    } else {
+        tempvar key_bytes = preimage;
+        tempvar range_check_ptr = range_check_ptr;
+        tempvar bitwise_ptr = bitwise_ptr;
+        tempvar keccak_ptr = keccak_ptr;
+    }
+    let key_bytes = Bytes(cast([ap - 4], BytesStruct*));
+    let range_check_ptr = [ap - 3];
+    let bitwise_ptr = cast([ap - 2], BitwiseBuiltin*);
+    let keccak_ptr = cast([ap - 1], KeccakBuiltin*);
+
+    let nibbles_list = bytes_to_nibble_list(key_bytes);
+    let mapping_dict_ptr = cast(mapping_ptr_end, DictAccess*);
+    hashdict_write{dict_ptr=mapping_dict_ptr}(
+        nibbles_list.value.len, nibbles_list.value.data, cast(encoded_value.value, felt)
+    );
+
+    return _prepare_trie_inner_storage(
+        trie, dict_ptr + Bytes32U256DictAccess.SIZE, cast(mapping_dict_ptr, BytesBytesDictAccess*)
+    );
+}
+
+func _prepare_trie_inner_transaction{
+    range_check_ptr,
+    bitwise_ptr: BitwiseBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
+}(
+    trie: TrieBytesOptionalUnionBytesLegacyTransaction,
+    dict_ptr: BytesOptionalUnionBytesLegacyTransactionDictAccess*,
+    mapping_ptr_end: BytesBytesDictAccess*,
+) -> BytesBytesDictAccess* {
+    alloc_locals;
+
+    if (dict_ptr == trie.value._data.value.dict_ptr) {
+        return mapping_ptr_end;
+    }
+
+    let preimage = _get_bytes_preimage_for_key(
+        dict_ptr.key.value, cast(trie.value._data.value.dict_ptr, DictAccess*)
+    );
+    let value = dict_ptr.new_value;
+
+    // Skip all None values, which are deleted trie entries
+    if (cast(dict_ptr.new_value.value, felt) == 0) {
+        return _prepare_trie_inner_transaction(
+            trie,
+            dict_ptr + BytesOptionalUnionBytesLegacyTransactionDictAccess.SIZE,
+            mapping_ptr_end,
+        );
+    }
+
+    // Create the correct node type
+
+    if (dict_ptr.new_value.value.bytes.value != 0) {
+        tempvar node = Node(
+            new NodeEnum(
+                account=Account(cast(0, AccountStruct*)),
+                bytes=dict_ptr.new_value.value.bytes,
+                legacy_transaction=LegacyTransaction(cast(0, LegacyTransactionStruct*)),
+                receipt=Receipt(cast(0, ReceiptStruct*)),
+                uint=cast(0, Uint*),
+                u256=U256(cast(0, U256Struct*)),
+                withdrawal=Withdrawal(cast(0, WithdrawalStruct*)),
+            ),
+        );
+    } else {
+        tempvar node = Node(
+            new NodeEnum(
+                account=Account(cast(0, AccountStruct*)),
+                bytes=Bytes(cast(0, BytesStruct*)),
+                legacy_transaction=dict_ptr.new_value.value.legacy_transaction,
+                receipt=Receipt(cast(0, ReceiptStruct*)),
+                uint=cast(0, Uint*),
+                u256=U256(cast(0, U256Struct*)),
+                withdrawal=Withdrawal(cast(0, WithdrawalStruct*)),
+            ),
+        );
+    }
+
+    let encoded_value = encode_node(node, Bytes(cast(0, BytesStruct*)));
+
+    if (encoded_value.value.len == 0) {
+        raise('AssertionError');
+    }
+
+    if (trie.value.secured.value != 0) {
+        let key_bytes32 = keccak256(preimage);
+        let key_bytes = Bytes32_to_Bytes(key_bytes32);
+        tempvar range_check_ptr = range_check_ptr;
+        tempvar bitwise_ptr = bitwise_ptr;
+        tempvar keccak_ptr = keccak_ptr;
+    } else {
+        tempvar key_bytes = preimage;
+        tempvar range_check_ptr = range_check_ptr;
+        tempvar bitwise_ptr = bitwise_ptr;
+        tempvar keccak_ptr = keccak_ptr;
+    }
+    let key_bytes = Bytes(cast([ap - 4], BytesStruct*));
+    let range_check_ptr = [ap - 3];
+    let bitwise_ptr = cast([ap - 2], BitwiseBuiltin*);
+    let keccak_ptr = cast([ap - 1], KeccakBuiltin*);
+
+    let nibbles_list = bytes_to_nibble_list(key_bytes);
+    let mapping_dict_ptr = cast(mapping_ptr_end, DictAccess*);
+    hashdict_write{dict_ptr=mapping_dict_ptr}(
+        nibbles_list.value.len, nibbles_list.value.data, cast(encoded_value.value, felt)
+    );
+
+    return _prepare_trie_inner_transaction(
+        trie,
+        dict_ptr + BytesOptionalUnionBytesLegacyTransactionDictAccess.SIZE,
+        cast(mapping_dict_ptr, BytesBytesDictAccess*),
+    );
+}
+
+func _prepare_trie_inner_receipt{
+    range_check_ptr,
+    bitwise_ptr: BitwiseBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
+}(
+    trie: TrieBytesOptionalUnionBytesReceipt,
+    dict_ptr: BytesOptionalUnionBytesReceiptDictAccess*,
+    mapping_ptr_end: BytesBytesDictAccess*,
+) -> BytesBytesDictAccess* {
+    alloc_locals;
+
+    if (dict_ptr == trie.value._data.value.dict_ptr) {
+        return mapping_ptr_end;
+    }
+
+    let preimage = _get_bytes_preimage_for_key(
+        dict_ptr.key.value, cast(trie.value._data.value.dict_ptr, DictAccess*)
+    );
+    let value = dict_ptr.new_value;
+
+    // Skip all None values, which are deleted trie entries
+    if (cast(dict_ptr.new_value.value, felt) == 0) {
+        return _prepare_trie_inner_receipt(
+            trie, dict_ptr + BytesOptionalUnionBytesReceiptDictAccess.SIZE, mapping_ptr_end
+        );
+    }
+
+    // Create the correct node type
+
+    if (dict_ptr.new_value.value.bytes.value != 0) {
+        tempvar node = Node(
+            new NodeEnum(
+                account=Account(cast(0, AccountStruct*)),
+                bytes=dict_ptr.new_value.value.bytes,
+                legacy_transaction=LegacyTransaction(cast(0, LegacyTransactionStruct*)),
+                receipt=Receipt(cast(0, ReceiptStruct*)),
+                uint=cast(0, Uint*),
+                u256=U256(cast(0, U256Struct*)),
+                withdrawal=Withdrawal(cast(0, WithdrawalStruct*)),
+            ),
+        );
+    } else {
+        tempvar node = Node(
+            new NodeEnum(
+                account=Account(cast(0, AccountStruct*)),
+                bytes=Bytes(cast(0, BytesStruct*)),
+                legacy_transaction=LegacyTransaction(cast(0, LegacyTransactionStruct*)),
+                receipt=dict_ptr.new_value.value.receipt,
+                uint=cast(0, Uint*),
+                u256=U256(cast(0, U256Struct*)),
+                withdrawal=Withdrawal(cast(0, WithdrawalStruct*)),
+            ),
+        );
+    }
+
+    let encoded_value = encode_node(node, Bytes(cast(0, BytesStruct*)));
+
+    if (encoded_value.value.len == 0) {
+        raise('AssertionError');
+    }
+
+    if (trie.value.secured.value != 0) {
+        let key_bytes32 = keccak256(preimage);
+        let key_bytes = Bytes32_to_Bytes(key_bytes32);
+        tempvar range_check_ptr = range_check_ptr;
+        tempvar bitwise_ptr = bitwise_ptr;
+        tempvar keccak_ptr = keccak_ptr;
+    } else {
+        tempvar key_bytes = preimage;
+        tempvar range_check_ptr = range_check_ptr;
+        tempvar bitwise_ptr = bitwise_ptr;
+        tempvar keccak_ptr = keccak_ptr;
+    }
+    let key_bytes = Bytes(cast([ap - 4], BytesStruct*));
+    let range_check_ptr = [ap - 3];
+    let bitwise_ptr = cast([ap - 2], BitwiseBuiltin*);
+    let keccak_ptr = cast([ap - 1], KeccakBuiltin*);
+
+    let nibbles_list = bytes_to_nibble_list(key_bytes);
+    let mapping_dict_ptr = cast(mapping_ptr_end, DictAccess*);
+    hashdict_write{dict_ptr=mapping_dict_ptr}(
+        nibbles_list.value.len, nibbles_list.value.data, cast(encoded_value.value, felt)
+    );
+
+    return _prepare_trie_inner_receipt(
+        trie,
+        dict_ptr + BytesOptionalUnionBytesReceiptDictAccess.SIZE,
+        cast(mapping_dict_ptr, BytesBytesDictAccess*),
+    );
+}
+
+func _prepare_trie_inner_withdrawal{
+    range_check_ptr,
+    bitwise_ptr: BitwiseBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
+}(
+    trie: TrieBytesOptionalUnionBytesWithdrawal,
+    dict_ptr: BytesOptionalUnionBytesWithdrawalDictAccess*,
+    mapping_ptr_end: BytesBytesDictAccess*,
+) -> BytesBytesDictAccess* {
+    alloc_locals;
+
+    if (dict_ptr == trie.value._data.value.dict_ptr) {
+        return mapping_ptr_end;
+    }
+
+    let preimage = _get_bytes_preimage_for_key(
+        dict_ptr.key.value, cast(trie.value._data.value.dict_ptr, DictAccess*)
+    );
+    let value = dict_ptr.new_value;
+
+    // Skip all None values, which are deleted trie entries
+    if (cast(dict_ptr.new_value.value, felt) == 0) {
+        return _prepare_trie_inner_withdrawal(
+            trie, dict_ptr + BytesOptionalUnionBytesWithdrawalDictAccess.SIZE, mapping_ptr_end
+        );
+    }
+
+    // Create the correct node type
+    if (dict_ptr.new_value.value.bytes.value != 0) {
+        tempvar node = Node(
+            new NodeEnum(
+                account=Account(cast(0, AccountStruct*)),
+                bytes=dict_ptr.new_value.value.bytes,
+                legacy_transaction=LegacyTransaction(cast(0, LegacyTransactionStruct*)),
+                receipt=Receipt(cast(0, ReceiptStruct*)),
+                uint=cast(0, Uint*),
+                u256=U256(cast(0, U256Struct*)),
+                withdrawal=Withdrawal(cast(0, WithdrawalStruct*)),
+            ),
+        );
+    } else {
+        tempvar node = Node(
+            new NodeEnum(
+                account=Account(cast(0, AccountStruct*)),
+                bytes=Bytes(cast(0, BytesStruct*)),
+                legacy_transaction=LegacyTransaction(cast(0, LegacyTransactionStruct*)),
+                receipt=Receipt(cast(0, ReceiptStruct*)),
+                uint=cast(0, Uint*),
+                u256=U256(cast(0, U256Struct*)),
+                withdrawal=dict_ptr.new_value.value.withdrawal,
+            ),
+        );
+    }
+
+    let encoded_value = encode_node(node, Bytes(cast(0, BytesStruct*)));
+
+    if (encoded_value.value.len == 0) {
+        raise('AssertionError');
+    }
+
+    if (trie.value.secured.value != 0) {
+        let key_bytes32 = keccak256(preimage);
+        let key_bytes = Bytes32_to_Bytes(key_bytes32);
+        tempvar range_check_ptr = range_check_ptr;
+        tempvar bitwise_ptr = bitwise_ptr;
+        tempvar keccak_ptr = keccak_ptr;
+    } else {
+        tempvar key_bytes = preimage;
+        tempvar range_check_ptr = range_check_ptr;
+        tempvar bitwise_ptr = bitwise_ptr;
+        tempvar keccak_ptr = keccak_ptr;
+    }
+    let key_bytes = Bytes(cast([ap - 4], BytesStruct*));
+    let range_check_ptr = [ap - 3];
+    let bitwise_ptr = cast([ap - 2], BitwiseBuiltin*);
+    let keccak_ptr = cast([ap - 1], KeccakBuiltin*);
+
+    let nibbles_list = bytes_to_nibble_list(key_bytes);
+    let mapping_dict_ptr = cast(mapping_ptr_end, DictAccess*);
+    hashdict_write{dict_ptr=mapping_dict_ptr}(
+        nibbles_list.value.len, nibbles_list.value.data, cast(encoded_value.value, felt)
+    );
+
+    return _prepare_trie_inner_withdrawal(
+        trie,
+        dict_ptr + BytesOptionalUnionBytesWithdrawalDictAccess.SIZE,
+        cast(mapping_dict_ptr, BytesBytesDictAccess*),
+    );
+}
+
+func root{
+    range_check_ptr,
+    bitwise_ptr: BitwiseBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
+}(trie_union: EthereumTries, storage_roots_: OptionalMappingAddressBytes32) -> Root {
+    alloc_locals;
+
+    let obj = _prepare_trie(trie_union, storage_roots_);
+    let patricialized = patricialize(obj, Uint(0));
+    let root_node = encode_internal_node(patricialized);
+    let rlp_encoded_root_node = encode(root_node);
+
+    let is_encoding_lt_32 = is_le(rlp_encoded_root_node.value.len, 31);
+    if (is_encoding_lt_32 != 0) {
+        let root_hash = keccak256(rlp_encoded_root_node);
+        return root_hash;
+    }
+
+    if (cast(root_node.value.bytes.value, felt) == 0) {
+        raise('AssertionError');
+    }
+    let root_b32 = Bytes_to_Bytes32(root_node.value.bytes);
+    return root_b32;
+}
 
 // Finds the maximum length of common prefix among all keys in a trie at a given level.
 //
@@ -884,7 +1571,7 @@ func _search_common_prefix_length{
         return current_length;
     }
 
-    let preimage = _get_preimage_for_key(obj.key.value, dict_ptr_stop);
+    let preimage = _get_bytes_preimage_for_key(obj.key.value, cast(dict_ptr_stop, DictAccess*));
     tempvar sliced_key = Bytes(
         new BytesStruct(preimage.value.data + level.value, preimage.value.len - level.value)
     );
@@ -910,7 +1597,9 @@ func _get_branch_for_nibble_at_level_inner{poseidon_ptr: PoseidonBuiltin*}(
         return (branch_ptr, value);
     }
 
-    let preimage = _get_preimage_for_key(dict_ptr.key.value, dict_ptr_stop);
+    let preimage = _get_bytes_preimage_for_key(
+        dict_ptr.key.value, cast(dict_ptr_stop, DictAccess*)
+    );
 
     // Check cases
     let is_value_case = is_zero(preimage.value.len - level);
@@ -1134,8 +1823,8 @@ func _get_branches{poseidon_ptr: PoseidonBuiltin*}(obj: MappingBytesBytes, level
 // The preimage is validated to be correctly provided by the prover by hashing it and comparing it to the key.
 // @param key - The key to get the preimage for. Either a hashed or non-hashed key - but it must be a felt.
 // @param dict_ptr_stop - The pointer to the end of the dict segment, the one registered in the tracker.
-func _get_preimage_for_key{poseidon_ptr: PoseidonBuiltin*}(
-    key: felt, dict_ptr_stop: BytesBytesDictAccess*
+func _get_bytes_preimage_for_key{poseidon_ptr: PoseidonBuiltin*}(
+    key: felt, dict_ptr_stop: DictAccess*
 ) -> Bytes {
     alloc_locals;
 
@@ -1163,6 +1852,53 @@ func _get_preimage_for_key{poseidon_ptr: PoseidonBuiltin*}(
     return res;
 }
 
+// @notice Given a key (inside `dict_ptr`), returns the bytes32 preimage of the key registered in the tracker.
+// The preimage is validated to be correctly provided by the prover by hashing it and comparing it to the key.
+// @param key - The key to get the preimage for. Either a hashed or non-hashed key - but it must be a felt.
+// @param dict_ptr_stop - The pointer to the end of the dict segment, the one registered in the tracker.
+func _get_bytes32_preimage_for_key{poseidon_ptr: PoseidonBuiltin*}(
+    key: felt, dict_ptr_stop: DictAccess*
+) -> Bytes32 {
+    alloc_locals;
+
+    // Get preimage data
+    let (local preimage_data: felt*) = alloc();
+    local preimage_len;
+    %{ get_preimage_for_key %}
+
+    let (preimage_hash) = poseidon_hash_many(preimage_len, preimage_data);
+    with_attr error_message("preimage_hash != key") {
+        assert preimage_hash = key;
+    }
+
+    tempvar res = Bytes32(new Bytes32Struct(preimage_data[0], preimage_data[1]));
+    return res;
+}
+
+func get_tuple_address_bytes32_preimage_for_key{poseidon_ptr: PoseidonBuiltin*}(
+    key: felt, dict_ptr_stop: DictAccess*
+) -> TupleAddressBytes32 {
+    alloc_locals;
+
+    // Get preimage data
+    let (local preimage_data: felt*) = alloc();
+    local preimage_len;
+    %{ get_preimage_for_key %}
+
+    let (preimage_hash) = poseidon_hash_many(preimage_len, preimage_data);
+    with_attr error_message("preimage_hash != key") {
+        assert preimage_hash = key;
+    }
+
+    tempvar res = TupleAddressBytes32(
+        new TupleAddressBytes32Struct(
+            address=Address(preimage_data[0]),
+            bytes32=Bytes32(new Bytes32Struct(preimage_data[1], preimage_data[2])),
+        ),
+    );
+    return res;
+}
+
 // @dev The obj mapping needs to be squashed before calling this function.
 // @dev No other squashing is required after this function returns as it only reads from the DictAccess segment.
 // @dev This function could be made faster by sorting the DictAccess segment by key before processing it.
@@ -1182,7 +1918,7 @@ func patricialize{
 
     let arbitrary_value = obj.value.dict_ptr_start.new_value;
     let current_key = obj.value.dict_ptr_start.key.value;
-    let preimage = _get_preimage_for_key(current_key, obj.value.dict_ptr);
+    let preimage = _get_bytes_preimage_for_key(current_key, cast(obj.value.dict_ptr, DictAccess*));
 
     // if leaf node
     if (len == 1) {

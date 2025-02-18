@@ -14,10 +14,11 @@ from ethereum.cancun.transactions import (
     signing_hash_pre155,
     validate_transaction,
 )
-from ethereum_types.numeric import U64
-from hypothesis import given
+from ethereum_types.bytes import Bytes0
+from ethereum_types.numeric import U64, U256, Uint
+from hypothesis import example, given
 
-from tests.utils.errors import strict_raises
+from cairo_addons.testing.errors import strict_raises
 
 
 class TestTransactions:
@@ -26,9 +27,23 @@ class TestTransactions:
         assert calculate_intrinsic_cost(tx) == cairo_run("calculate_intrinsic_cost", tx)
 
     @given(tx=...)
-    def test_validate_transaction(self, cairo_run_py, tx: Transaction):
+    # Test case where contract creation code size is not valid
+    @example(
+        tx=LegacyTransaction(
+            value=U256(0),
+            nonce=U256(0),
+            data=bytes(b"1" * 49153),
+            to=Bytes0(),
+            gas=Uint(2_000_000),
+            gas_price=Uint(0),
+            v=U256(0),
+            r=U256(0),
+            s=U256(0),
+        )
+    )
+    def test_validate_transaction(self, cairo_run, tx: Transaction):
         try:
-            result_cairo = cairo_run_py("validate_transaction", tx)
+            result_cairo = cairo_run("validate_transaction", tx)
         except Exception as cairo_error:
             with strict_raises(type(cairo_error)):
                 validate_transaction(tx)
@@ -62,10 +77,9 @@ class TestTransactions:
         assert signing_hash_4844(tx) == cairo_result
 
     @given(chain_id=..., tx=...)
-    def test_recover_sender(self, cairo_run_py, chain_id: U64, tx: Transaction):
+    def test_recover_sender(self, cairo_run, chain_id: U64, tx: Transaction):
         try:
-            # TODO: replace cairo_run_py by cairo_run once garaga hints are implemented in Rust
-            cairo_result = cairo_run_py("recover_sender", chain_id, tx)
+            cairo_result = cairo_run("recover_sender", chain_id, tx)
         except Exception as cairo_error:
             with strict_raises(type(cairo_error)):
                 recover_sender(chain_id, tx)

@@ -1,12 +1,19 @@
+from collections import defaultdict
 from typing import Mapping, Optional, Tuple, Union
 
 import pytest
-from ethereum.cancun.blocks import LegacyTransaction, Receipt
-from ethereum.cancun.fork_types import Account, Address
+from ethereum.cancun.blocks import Receipt, Withdrawal
+from ethereum.cancun.fork_types import Account, Address, Root
+from ethereum.cancun.state import EMPTY_TRIE_ROOT
+from ethereum.cancun.transactions import LegacyTransaction
 from ethereum.cancun.trie import (
+    BranchNode,
+    ExtensionNode,
     InternalNode,
+    LeafNode,
     Node,
     Trie,
+    _prepare_trie,
     bytes_to_nibble_list,
     common_prefix_length,
     copy_trie,
@@ -14,18 +21,28 @@ from ethereum.cancun.trie import (
     encode_node,
     nibble_list_to_compact,
     patricialize,
+    root,
     trie_get,
     trie_set,
 )
 from ethereum_types.bytes import Bytes, Bytes32
 from ethereum_types.numeric import U256, Uint
-from hypothesis import assume, given
+from hypothesis import Verbosity, example, given, settings
 from hypothesis import strategies as st
 
+from cairo_addons.testing.errors import cairo_error, strict_raises
 from cairo_addons.testing.hints import patch_hint
+from tests.utils.args_gen import EthereumTries
 from tests.utils.assertion import sequence_equal
-from tests.utils.errors import cairo_error
-from tests.utils.strategies import bytes32, nibble, uint4
+from tests.utils.strategies import bytes32, nibble, trie_strategy, uint4
+
+
+@st.composite
+def prepare_trie_strategy(draw):
+    key_type, value_type = draw(
+        st.sampled_from([t.__args__ for t in EthereumTries.__args__])
+    )
+    return draw(trie_strategy(thing=Trie[key_type, value_type], include_none=True))
 
 
 class TestTrie:
@@ -36,13 +53,17 @@ class TestTrie:
         )
 
     @given(node=..., storage_root=...)
+    @example(node=None, storage_root=None)
+    @example(node=Uint(145), storage_root=None)
     def test_encode_node(self, cairo_run, node: Node, storage_root: Optional[Bytes]):
-        assume(node is not None)
-        assume(not isinstance(node, Uint))
-        assume(not (isinstance(node, Account) and storage_root is None))
-        assert encode_node(node, storage_root) == cairo_run(
-            "encode_node", node, storage_root
-        )
+        try:
+            cairo_result = cairo_run("encode_node", node, storage_root)
+        except Exception as cairo_error:
+            with strict_raises(type(cairo_error)):
+                encode_node(node, storage_root)
+            return
+        result = encode_node(node, storage_root)
+        assert cairo_result == result
 
     @given(node=...)
     def test_encode_account_should_fail_without_storage_root(
@@ -50,7 +71,7 @@ class TestTrie:
     ):
         with pytest.raises(AssertionError):
             encode_node(node, None)
-        with cairo_error(message="encode_node"):
+        with pytest.raises(AssertionError):
             cairo_run("encode_node", node, None)
 
     @given(a=..., b=...)
@@ -58,12 +79,13 @@ class TestTrie:
         assert common_prefix_length(a, b) == cairo_run("common_prefix_length", a, b)
 
     @given(a=..., b=...)
+    @settings(verbosity=Verbosity.quiet)
     def test_common_prefix_length_should_fail(
-        self, cairo_program, cairo_run_py, a: Bytes, b: Bytes
+        self, cairo_programs, cairo_run_py, a: Bytes, b: Bytes
     ):
         with (
             patch_hint(
-                cairo_program,
+                cairo_programs,
                 "common_prefix_length_hint",
                 "import random; memory[fp] = random.randint(0, 100)",
             ),
@@ -80,12 +102,13 @@ class TestTrie:
         )
 
     @given(x=nibble.filter(lambda x: len(x) != 0), is_leaf=...)
+    @settings(verbosity=Verbosity.quiet)
     def test_nibble_list_to_compact_should_raise_when_wrong_remainder(
-        self, cairo_program, cairo_run_py, x, is_leaf: bool
+        self, cairo_programs, cairo_run_py, x, is_leaf: bool
     ):
         with (
             patch_hint(
-                cairo_program,
+                cairo_programs,
                 "value_len_mod_two",
                 "ids.remainder = not (ids.len % 2)",
             ),
@@ -98,9 +121,6 @@ class TestTrie:
     def test_bytes_to_nibble_list(self, cairo_run, bytes_: Bytes):
         assert bytes_to_nibble_list(bytes_) == cairo_run("bytes_to_nibble_list", bytes_)
 
-    # def test_root(self, cairo_run, trie, get_storage_root):
-    #     assert root(trie, get_storage_root) == cairo_run("root", trie, get_storage_root)
-
     @given(
         obj=st.dictionaries(nibble, bytes32).filter(
             lambda x: len(x) > 0 and all(len(k) > 0 for k in x)
@@ -111,10 +131,10 @@ class TestTrie:
     def test_get_branch_for_nibble_at_level(self, cairo_run, obj, nibble, level):
         prefix = (b"prefix" * 3)[:level]
         obj = {(prefix + k)[:64]: v for k, v in obj.items()}
-        branche, value = cairo_run(
+        branch, value = cairo_run(
             "_get_branch_for_nibble_at_level", obj, nibble, level
         )
-        assert branche == {
+        assert branch == {
             k: v for k, v in obj.items() if k[level] == nibble and len(k) > level
         }
         assert value == obj.get(level, b"")
@@ -140,6 +160,113 @@ class TestTrie:
     def test_patricialize(self, cairo_run, obj: Mapping[Bytes, Bytes]):
         assert patricialize(obj, Uint(0)) == cairo_run("patricialize", obj, Uint(0))
 
+    @given(leaf_node=...)
+    def test_internal_node_leaf_node(self, cairo_run, leaf_node: LeafNode):
+        result = cairo_run("InternalNodeImpl.leaf_node", leaf_node)
+        assert result == leaf_node
+
+    @given(extension_node=...)
+    def test_internal_node_extension_node(
+        self, cairo_run, extension_node: ExtensionNode
+    ):
+        result = cairo_run("InternalNodeImpl.extension_node", extension_node)
+        assert result == extension_node
+
+    @given(branch_node=...)
+    def test_internal_node_branch_node(self, cairo_run, branch_node: BranchNode):
+        result = cairo_run("InternalNodeImpl.branch_node", branch_node)
+        assert result == branch_node
+
+    @given(trie_with_none=prepare_trie_strategy(), storage_tries=...)
+    def test_prepare_trie(
+        self,
+        cairo_run,
+        trie_with_none: EthereumTries,
+        storage_tries: Mapping[Address, Trie[Bytes32, U256]],
+    ):
+        key_type, _ = trie_with_none.__orig_class__.__args__
+
+        # Python expects tries not to have None values (as writing the default None suppresses the key)
+        # In Cairo, the filtering is done in `prepare_trie` where they're filtered out of the output
+        # Mapping during iteration over dict entries.
+        trie = Trie(
+            secured=trie_with_none.secured,
+            default=trie_with_none.default,
+            _data=defaultdict(
+                trie_with_none._data.default_factory,
+                {k: v for k, v in trie_with_none._data.items() if v is not None},
+            ),
+        )
+
+        if key_type is Address:
+            # Cairo expects a Dict[Address, Root] as storage_roots - not a callable function
+            storage_roots = defaultdict(
+                lambda: U256.from_le_bytes(EMPTY_TRIE_ROOT),
+                {
+                    address: U256.from_le_bytes(root(storage_tries[address]))
+                    for address in storage_tries
+                },
+            )
+
+            def get_storage_root(address: Address) -> Root:
+                return storage_roots[address].to_le_bytes32()
+
+        else:
+            storage_roots = None
+            get_storage_root = None
+
+        try:
+            result_cairo = cairo_run("_prepare_trie", trie_with_none, storage_roots)
+        except Exception as e:
+            with strict_raises(type(e)):
+                _prepare_trie(trie, get_storage_root)
+            return
+
+        assert result_cairo == _prepare_trie(trie, get_storage_root)
+
+    @given(trie_with_none=prepare_trie_strategy(), storage_tries=...)
+    def test_root(
+        self,
+        cairo_run,
+        trie_with_none: EthereumTries,
+        storage_tries: Mapping[Address, Trie[Bytes32, U256]],
+    ):
+        key_type, _ = trie_with_none.__orig_class__.__args__
+
+        # Python expects tries not to have None values (as writing the default None suppresses the key)
+        # In Cairo, the filtering is done in `prepare_trie` where they're filtered out of the output
+        # Mapping during iteration over dict entries.
+        trie = Trie(
+            secured=trie_with_none.secured,
+            default=trie_with_none.default,
+            _data={k: v for k, v in trie_with_none._data.items() if v is not None},
+        )
+
+        if key_type is Address:
+            # Cairo expects a Dict[Address, Root] as storage_roots - not a callable function
+            storage_roots = defaultdict(
+                lambda: U256.from_le_bytes(EMPTY_TRIE_ROOT),
+                {
+                    address: U256.from_le_bytes(root(storage_tries[address]))
+                    for address in storage_tries
+                },
+            )
+
+            def get_storage_root(address: Address) -> Root:
+                return storage_roots[address].to_le_bytes32()
+
+        else:
+            storage_roots = None
+            get_storage_root = None
+
+        try:
+            result_cairo = cairo_run("root", trie_with_none, storage_roots)
+        except Exception as e:
+            with strict_raises(type(e)):
+                root(trie, get_storage_root)
+            return
+        assert result_cairo == root(trie, get_storage_root)
+
 
 class TestTrieOperations:
     class TestGet:
@@ -150,6 +277,15 @@ class TestTrieOperations:
             trie_cairo, result_cairo = cairo_run(
                 "trie_get_TrieAddressOptionalAccount", trie, key
             )
+            result_py = trie_get(trie, key)
+            assert result_cairo == result_py
+            assert trie_cairo == trie
+
+        @given(trie=..., key=...)
+        def test_trie_get_TrieBytes32U256(
+            self, cairo_run, trie: Trie[Bytes32, U256], key: Bytes32
+        ):
+            trie_cairo, result_cairo = cairo_run("trie_get_TrieBytes32U256", trie, key)
             result_py = trie_get(trie, key)
             assert result_cairo == result_py
             assert trie_cairo == trie
@@ -197,6 +333,19 @@ class TestTrieOperations:
             assert result_cairo == result_py
             assert trie_cairo == trie
 
+        @given(trie=..., key=...)
+        def test_trie_get_TrieBytesOptionalUnionBytesWithdrawal(
+            self,
+            cairo_run,
+            trie: Trie[Bytes, Optional[Union[Bytes, Withdrawal]]],
+            key: Bytes,
+        ):
+            trie_cairo, result_cairo = cairo_run(
+                "trie_get_TrieBytesOptionalUnionBytesWithdrawal", trie, key
+            )
+            assert result_cairo == trie_get(trie, key)
+            assert trie_cairo == trie
+
     class TestSet:
         @given(trie=..., key=..., value=...)
         def test_trie_set_TrieAddressOptionalAccount(
@@ -209,6 +358,14 @@ class TestTrieOperations:
             cairo_trie = cairo_run(
                 "trie_set_TrieAddressOptionalAccount", trie, key, value
             )
+            trie_set(trie, key, value)
+            assert cairo_trie == trie
+
+        @given(trie=..., key=..., value=...)
+        def test_trie_set_TrieBytes32U256(
+            self, cairo_run, trie: Trie[Bytes32, U256], key: Bytes32, value: U256
+        ):
+            cairo_trie = cairo_run("trie_set_TrieBytes32U256", trie, key, value)
             trie_set(trie, key, value)
             assert cairo_trie == trie
 
@@ -254,6 +411,20 @@ class TestTrieOperations:
         ):
             cairo_trie = cairo_run(
                 "trie_set_TrieBytesOptionalUnionBytesReceipt", trie, key, value
+            )
+            trie_set(trie, key, value)
+            assert cairo_trie == trie
+
+        @given(trie=..., key=..., value=...)
+        def test_trie_set_TrieBytesOptionalUnionBytesWithdrawal(
+            self,
+            cairo_run,
+            trie: Trie[Bytes, Optional[Union[Bytes, Withdrawal]]],
+            key: Bytes,
+            value: Union[Bytes, Withdrawal],
+        ):
+            cairo_trie = cairo_run(
+                "trie_set_TrieBytesOptionalUnionBytesWithdrawal", trie, key, value
             )
             trie_set(trie, key, value)
             assert cairo_trie == trie

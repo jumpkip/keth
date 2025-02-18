@@ -1,3 +1,4 @@
+from ethereum.cancun.vm import Evm
 from ethereum.cancun.vm.instructions.arithmetic import (
     add,
     addmod,
@@ -11,10 +12,10 @@ from ethereum.cancun.vm.instructions.arithmetic import (
     smod,
     sub,
 )
+from ethereum_types.numeric import U256
 from hypothesis import given
 
-from tests.utils.args_gen import Evm
-from tests.utils.errors import strict_raises
+from cairo_addons.testing.errors import strict_raises
 from tests.utils.evm_builder import EvmBuilder
 
 arithmetic_tests_strategy = EvmBuilder().with_stack().with_gas_left().build()
@@ -108,6 +109,21 @@ class TestArithmetic:
 
     @given(evm=arithmetic_tests_strategy)
     def test_addmod(self, cairo_run, evm: Evm):
+        try:
+            cairo_result = cairo_run("addmod", evm)
+        except Exception as cairo_error:
+            with strict_raises(type(cairo_error)):
+                addmod(evm)
+            return
+
+        addmod(evm)
+        assert evm == cairo_result
+
+    @given(evm=arithmetic_tests_strategy)
+    def test_addmod_overflow_u256_cairo(self, cairo_run, evm: Evm):
+        evm.stack.push_or_replace_many(
+            [U256(2**256 - 1), U256(2**256 - 2), U256(2**256 - 2)]
+        )
         try:
             cairo_result = cairo_run("addmod", evm)
         except Exception as cairo_error:

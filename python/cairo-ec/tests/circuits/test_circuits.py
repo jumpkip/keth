@@ -2,7 +2,7 @@ from typing import Type
 
 import pytest
 from ethereum.crypto.finite_field import PrimeField
-from hypothesis import assume, given
+from hypothesis import Verbosity, assume, given, settings
 from hypothesis import strategies as st
 from sympy import sqrt_mod
 from sympy.core.numbers import mod_inverse
@@ -49,6 +49,7 @@ def curve(prime_cls: Type[PrimeField]):
 class TestCircuits:
     class TestModOps:
         @given(data=st.data())
+        @settings(verbosity=Verbosity.quiet)
         def test_add(self, cairo_program, cairo_run, prime_cls, st_prime, data):
             inputs = {"x": data.draw(st_prime), "y": data.draw(st_prime)}
             values_ptr = [limb for v in inputs.values() for limb in int_to_uint384(v)]
@@ -84,6 +85,7 @@ class TestCircuits:
             )
 
         @given(data=st.data())
+        @settings(verbosity=Verbosity.quiet)
         def test_sub(self, cairo_program, cairo_run, prime_cls, st_prime, data):
             inputs = {"x": data.draw(st_prime), "y": data.draw(st_prime)}
             values_ptr = [limb for v in inputs.values() for limb in int_to_uint384(v)]
@@ -119,6 +121,7 @@ class TestCircuits:
             )
 
         @given(data=st.data())
+        @settings(verbosity=Verbosity.quiet)
         def test_mul(self, cairo_program, cairo_run, prime_cls, st_prime, data):
             inputs = {"x": data.draw(st_prime), "y": data.draw(st_prime)}
             values_ptr = [limb for v in inputs.values() for limb in int_to_uint384(v)]
@@ -154,6 +157,7 @@ class TestCircuits:
             )
 
         @given(data=st.data())
+        @settings(verbosity=Verbosity.quiet)
         def test_div(self, cairo_program, cairo_run, prime, data, prime_cls):
             inputs = {
                 "x": data.draw(st.integers(min_value=0, max_value=prime - 1)),
@@ -194,6 +198,7 @@ class TestCircuits:
             )
 
         @given(data=st.data())
+        @settings(verbosity=Verbosity.quiet)
         def test_diff_ratio(self, cairo_program, cairo_run, prime_cls, st_prime, data):
             inputs = {"x": data.draw(st_prime), "y": data.draw(st_prime)}
             assume(inputs["x"] != inputs["y"])
@@ -233,6 +238,7 @@ class TestCircuits:
             )
 
         @given(data=st.data())
+        @settings(verbosity=Verbosity.quiet)
         def test_sum_ratio(self, cairo_program, cairo_run, prime_cls, st_prime, data):
             inputs = {"x": data.draw(st_prime), "y": data.draw(st_prime)}
             assume(inputs["x"] != -inputs["y"])
@@ -272,6 +278,7 @@ class TestCircuits:
             )
 
         @given(data=st.data())
+        @settings(verbosity=Verbosity.quiet)
         def test_inv(self, cairo_program, cairo_run, prime, data, prime_cls):
             inputs = {
                 "x": data.draw(st.integers(min_value=1, max_value=prime - 1)),
@@ -312,6 +319,7 @@ class TestCircuits:
             )
 
         @given(data=st.data())
+        @settings(verbosity=Verbosity.quiet)
         def test_assert_is_quad_residue(
             self, cairo_program, cairo_run, curve, data, st_prime
         ):
@@ -346,6 +354,7 @@ class TestCircuits:
 
     class TestEcOps:
         @given(data=st.data())
+        @settings(verbosity=Verbosity.quiet)
         def test_ec_add(self, cairo_program, cairo_run, curve, data, st_prime):
             seed_p = data.draw(st_prime)
             seed_q = data.draw(st_prime)
@@ -388,6 +397,7 @@ class TestCircuits:
             )
 
         @given(data=st.data())
+        @settings(verbosity=Verbosity.quiet)
         def test_ec_double(self, cairo_program, cairo_run, curve, data, st_prime):
             seed_p = data.draw(st_prime)
             p = curve.random_point(x=seed_p)
@@ -424,4 +434,38 @@ class TestCircuits:
                 == circuit_output
                 == compiled_circuit_output
                 == [expected_output.x, expected_output.y]
+            )
+
+        @given(data=st.data())
+        @settings(verbosity=Verbosity.quiet)
+        def test_assert_is_on_curve(
+            self, cairo_program, cairo_run, curve, data, st_prime
+        ):
+            seed_p = data.draw(st_prime)
+            p = curve.random_point(x=seed_p, retry=False)
+            inputs = {
+                "x": int(p.x),
+                "y": int(p.y),
+                "a": int(curve.A),
+                "b": int(curve.B),
+                "g": int(curve.G),
+                "is_on_curve": curve.is_on_curve(p.x, p.y),
+            }
+
+            cairo_run("assert_is_on_curve", **inputs)
+            compiled_circuit = circuit_compile(cairo_program, "assert_is_on_curve")
+            values_ptr = flatten(compiled_circuit["constants"]) + [
+                limb for v in inputs.values() for limb in int_to_uint384(v)
+            ]
+            cairo_run(
+                "test__circuit",
+                values_ptr=values_ptr,
+                values_ptr_len=len(values_ptr),
+                p=int_to_uint384(curve.FIELD.PRIME),
+                **compiled_circuit,
+            )
+            cairo_run(
+                "assert_is_on_curve_compiled",
+                **{k: int_to_uint384(v) for k, v in inputs.items()},
+                p=int_to_uint384(curve.FIELD.PRIME),
             )

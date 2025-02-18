@@ -2,6 +2,7 @@ from typing import List, Tuple
 
 from ethereum.cancun.blocks import Header
 from ethereum.cancun.transactions import BlobTransaction
+from ethereum.cancun.vm import Evm
 from ethereum.cancun.vm.gas import (
     GAS_CALL_STIPEND,
     calculate_blob_gas_price,
@@ -21,8 +22,8 @@ from hypothesis import assume, given
 from hypothesis import strategies as st
 from hypothesis.strategies import composite
 
-from tests.utils.args_gen import Evm, Memory
-from tests.utils.errors import strict_raises
+from cairo_addons.testing.errors import strict_raises
+from tests.utils.args_gen import Memory
 from tests.utils.evm_builder import EvmBuilder
 from tests.utils.strategies import excess_blob_gas
 
@@ -125,13 +126,19 @@ class TestGas:
 
     @given(excess_blob_gas=excess_blob_gas)
     def test_calculate_blob_gas_price(self, cairo_run, excess_blob_gas):
-        assert calculate_blob_gas_price(excess_blob_gas) == cairo_run(
+        """Saturates at 2**64 - 1"""
+        blob_gas_price_py = min(
+            calculate_blob_gas_price(excess_blob_gas), Uint(2**64 - 1)
+        )
+        assert blob_gas_price_py == cairo_run(
             "calculate_blob_gas_price", excess_blob_gas
         )
 
     @given(excess_blob_gas=excess_blob_gas, tx=...)
     def test_calculate_data_fee(self, cairo_run, excess_blob_gas, tx: BlobTransaction):
+        """Saturates at (2**64 - 1)**2"""
         assume(len(tx.blob_versioned_hashes) > 0)
-        assert calculate_data_fee(excess_blob_gas, tx) == cairo_run(
-            "calculate_data_fee", excess_blob_gas, tx
+        data_fee_py = min(
+            calculate_data_fee(excess_blob_gas, tx), Uint((2**64 - 1) ** 2)
         )
+        assert data_fee_py == cairo_run("calculate_data_fee", excess_blob_gas, tx)

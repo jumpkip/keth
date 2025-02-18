@@ -1,11 +1,13 @@
 # ruff: noqa: E402
 
 import os
+from collections import ChainMap, defaultdict
 from typing import (
     ForwardRef,
     Generic,
     Optional,
     Sequence,
+    Tuple,
     TypeAlias,
     TypeVar,
     Union,
@@ -16,6 +18,7 @@ from unittest.mock import patch
 
 from eth_keys.datatypes import PrivateKey
 from ethereum.cancun.trie import copy_trie
+from ethereum.cancun.vm import Environment, Evm, Message
 from ethereum.crypto.elliptic_curve import SECP256K1N
 from ethereum.exceptions import EthereumException
 from ethereum_types.bytes import Bytes0, Bytes4, Bytes8, Bytes20, Bytes32, Bytes256
@@ -24,10 +27,7 @@ from hypothesis import strategies as st
 from starkware.cairo.lang.cairo_constants import DEFAULT_PRIME
 
 from tests.utils.args_gen import (
-    Environment,
-    Evm,
     Memory,
-    Message,
     MutableBloom,
     Stack,
     State,
@@ -114,8 +114,7 @@ MAX_ACCOUNTS_TO_DELETE_SIZE = int(
     os.getenv("HYPOTHESIS_MAX_ACCOUNTS_TO_DELETE_SIZE", 10)
 )
 MAX_TOUCHED_ACCOUNTS_SIZE = int(os.getenv("HYPOTHESIS_MAX_TOUCHED_ACCOUNTS_SIZE", 10))
-MAX_LOGS_SIZE = int(os.getenv("HYPOTHESIS_MAX_LOGS_SIZE", 10))
-
+MAX_TUPLE_SIZE = int(os.getenv("HYPOTHESIS_MAX_TUPLE_SIZE", 20))
 
 small_bytes = st.binary(min_size=0, max_size=256)
 code = st.binary(min_size=0, max_size=MAX_CODE_SIZE)
@@ -135,7 +134,7 @@ extended = st.recursive(
 )
 
 
-def trie_strategy(thing, min_size=0):
+def trie_strategy(thing, min_size=0, include_none=False):
     key_type, value_type = thing.__args__
     value_type_origin = get_origin(value_type) or value_type
 
@@ -149,11 +148,13 @@ def trie_strategy(thing, min_size=0):
 
     # Create a strategy for non-default values
     def non_default_strategy(default):
-        if default is None:
+        if default is None and not include_none:
             # For Optional types, just use the base type strategy (which won't generate None)
             defined_types = [t for t in get_args(value_type) if t is not type(None)]
             # random choice of the defined types
             return st.one_of(*(st.from_type(t) for t in defined_types))
+        elif default is None and include_none:
+            return st.from_type(value_type)
         elif value_type is U256:
             # For U256, we don't want to generate 0 as default value
             return st.integers(min_value=1, max_value=2**256 - 1).map(U256)
@@ -173,14 +174,14 @@ def trie_strategy(thing, min_size=0):
                 non_default_strategy(default),
                 min_size=min_size,
                 max_size=15,
-            ),
+            ).map(lambda x: defaultdict(lambda: default, x)),
         )
     )
 
 
-def stack_strategy(thing):
+def stack_strategy(thing, max_size=1024):
     value_type = thing.__args__[0]
-    return st.lists(st.from_type(value_type), min_size=0, max_size=1024).map(
+    return st.lists(st.from_type(value_type), min_size=0, max_size=max_size).map(
         lambda x: Stack[value_type](x)
     )
 
@@ -201,13 +202,37 @@ def tuple_strategy(thing):
 
     # Handle ellipsis tuples
     if len(types) == 2 and types[1] == Ellipsis:
-        return st.tuples(st.from_type(types[0]), st.from_type(types[0])).map(
-            lambda x: TypedTuple[types[0], Ellipsis](x)
+        return (
+            st.lists(st.from_type(types[0]), max_size=MAX_TUPLE_SIZE)
+            .map(tuple)
+            .map(lambda x: TypedTuple[types](x))
         )
 
     return st.tuples(*(st.from_type(t) for t in types)).map(
-        lambda x: TypedTuple[tuple(types)](x)
+        lambda x: TypedTuple[types](x)
     )
+
+
+K = TypeVar("K")
+V = TypeVar("V")
+
+
+class TypedDict(dict, Generic[K, V]):
+    """A dict that maintains its type information."""
+
+    def __new__(cls, values):
+        return super(TypedDict, cls).__new__(cls, values)
+
+
+def dict_strategy(thing):
+    if hasattr(thing, "__args__"):
+        # If the thing contains type information, use it
+        key_type, value_type = thing.__args__
+        return st.dictionaries(st.from_type(key_type), st.from_type(value_type)).map(
+            lambda x: TypedDict[key_type, value_type](x)
+        )
+    else:
+        return st.dictionaries()
 
 
 gas_left = st.integers(min_value=0, max_value=BLOCK_GAS_LIMIT).map(Uint)
@@ -353,7 +378,7 @@ evm = st.builds(
     gas_left=gas_left,
     env=st.from_type(Environment),
     valid_jump_destinations=st.sets(st.from_type(Uint)),
-    logs=st.tuples(st.from_type(Log)),
+    logs=st.from_type(Tuple[Log, ...]),
     refund_counter=st.integers(min_value=0),
     running=st.booleans(),
     message=message,
@@ -377,7 +402,7 @@ empty_state = st.builds(
         Trie[Address, Optional[Account]],
         secured=st.just(True),
         default=st.none(),
-        _data=st.builds(dict, st.just({})),
+        _data=st.builds(dict, st.just({})).map(lambda x: defaultdict(lambda: None, x)),
     ),
     _storage_tries=st.builds(dict, st.just({})),
     _snapshots=st.lists(
@@ -386,9 +411,11 @@ empty_state = st.builds(
                 Trie[Address, Optional[Account]],
                 secured=st.just(True),
                 default=st.none(),
-                _data=st.builds(dict, st.just({})),
+                _data=st.builds(dict, st.just({})).map(
+                    lambda x: defaultdict(lambda: None, x)
+                ),
             ),
-            st.builds(dict, st.just({})),
+            st.builds(dict, st.just({})).map(lambda x: defaultdict(lambda: U256(0), x)),
         ),
         min_size=1,
         max_size=1,
@@ -405,8 +432,8 @@ state = st.lists(address, max_size=MAX_ADDRESS_SET_SIZE, unique=True).flatmap(
             secured=st.just(True),
             default=st.none(),
             _data=st.fixed_dictionaries(
-                {address: st.from_type(Account) for address in addresses}
-            ),
+                {address: st.from_type(Account) for address in addresses},
+            ).map(lambda x: defaultdict(lambda: None, x)),
         ),
         # Storage tries are not always present for existing accounts
         # Thus we generate a subset of addresses from the existing accounts
@@ -441,6 +468,26 @@ state = st.lists(address, max_size=MAX_ADDRESS_SET_SIZE, unique=True).flatmap(
     ),
 )
 
+header = st.builds(
+    Header,
+    parent_hash=hash32,
+    ommers_hash=hash32,
+    coinbase=address,
+    state_root=root,
+    transactions_root=root,
+    receipt_root=root,
+    bloom=bloom,
+    difficulty=uint,
+    number=uint,
+    gas_limit=uint,
+    gas_used=uint,
+    timestamp=uint256,
+    extra_data=small_bytes,
+    prev_randao=bytes32,
+    nonce=bytes8,
+    base_fee_per_gas=uint,
+)
+
 
 private_key = (
     st.integers(min_value=1, max_value=int(SECP256K1N) - 1)
@@ -469,7 +516,7 @@ def register_type_strategies():
     st.register_type_strategy(Account, account_strategy)
     st.register_type_strategy(Withdrawal, st.builds(Withdrawal))
     st.register_type_strategy(Header, st.builds(Header))
-    st.register_type_strategy(Log, st.builds(Log))
+    st.register_type_strategy(Log, st.builds(Log, data=small_bytes))
     st.register_type_strategy(Receipt, st.builds(Receipt))
     st.register_type_strategy(
         LegacyTransaction, st.builds(LegacyTransaction, data=small_bytes)
@@ -526,7 +573,14 @@ def register_type_strategies():
     st.register_type_strategy(Memory, memory)
     st.register_type_strategy(Evm, evm)
     st.register_type_strategy(tuple, tuple_strategy)
+    st.register_type_strategy(dict, dict_strategy)
+    st.register_type_strategy(ChainMap, dict_strategy)
     st.register_type_strategy(State, state)
     st.register_type_strategy(TransientStorage, transient_storage)
     st.register_type_strategy(MutableBloom, bloom.map(MutableBloom))
     st.register_type_strategy(Environment, environment_lite)
+    st.register_type_strategy(Header, header)
+    st.register_type_strategy(
+        VersionedHash,
+        st.binary(min_size=31, max_size=31).map(lambda x: VersionedHash(b"\x01" + x)),
+    )

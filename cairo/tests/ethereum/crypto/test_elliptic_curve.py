@@ -1,13 +1,10 @@
-import pytest
 from eth_keys.datatypes import PrivateKey
 from ethereum.crypto.elliptic_curve import secp256k1_recover
 from ethereum.crypto.hash import Hash32
 from ethereum_types.numeric import U256
 from hypothesis import given
 
-from tests.utils.errors import strict_raises
-
-pytestmark = pytest.mark.python_vm
+from cairo_addons.testing.errors import strict_raises
 
 
 class TestEllipticCurve:

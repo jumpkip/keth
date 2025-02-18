@@ -11,7 +11,7 @@ from ethereum.cancun.vm.gas import GasConstants, charge_gas
 from ethereum_types.numeric import Uint
 from ethereum_types.bytes import Bytes, BytesStruct, ListBytes4, ListBytes4Struct
 
-from src.utils.utils import Helpers
+from legacy.utils.utils import Helpers
 from cairo_core.hash.sha256 import sha256_be_output
 from cairo_core.maths import unsigned_div_rem
 
@@ -36,7 +36,7 @@ func sha256{range_check_ptr, bitwise_ptr: BitwiseBuiltin*, keccak_ptr: KeccakBui
     }
 
     let list_bytes4_be = Bytes_to_be_ListBytes4(data);
-    // The numbero of bytes to hash is taken from the original input
+    // The number of bytes to hash is taken from the original input
     let hash = sha256_be_output(list_bytes4_be.value.data, data.value.len);
     tempvar hash_bytes4 = ListBytes4(new ListBytes4Struct(cast(hash, Bytes4*), 8));
     // Split words and return bytes hash code.

@@ -13,8 +13,7 @@ from starkware.cairo.common.math_cmp import is_le, is_not_zero, RC_BOUND, is_le_
 from starkware.cairo.common.math import assert_le_felt
 from starkware.cairo.common.uint256 import ALL_ONES, uint256_eq, uint256_le
 
-from src.utils.uint256 import uint256_add
-from src.constants import Constants
+from legacy.utils.uint256 import uint256_add
 
 from cairo_core.comparison import is_zero
 
@@ -145,7 +144,7 @@ const MAX_MEMORY_SIZE = 2 ** 64 - 32;
 // @dev: max output value given this saturation is MAX_MEMORY_COST
 func calculate_memory_gas_cost{range_check_ptr}(size_in_bytes: Uint) -> Uint {
     let size = ceil32(size_in_bytes);
-    let (size_in_words, _) = divmod(size.value, 32);
+    let size_in_words = size.value / 32;
     let linear_cost = size_in_words * GasConstants.GAS_MEMORY;
     let quadratic_cost = size_in_words * size_in_words;
     let (quadratic_cost, _) = divmod(quadratic_cost, 512);
@@ -241,7 +240,7 @@ func max_message_call_gas{range_check_ptr}(gas: Uint) -> Uint {
 
 func init_code_cost{range_check_ptr}(init_code_length: Uint) -> Uint {
     let length = ceil32(init_code_length);
-    let (words, _) = divmod(length.value, 32);
+    let words = length.value / 32;
     let cost = Uint(GasConstants.GAS_INIT_CODE_WORD_COST * words);
     return cost;
 }
@@ -258,31 +257,46 @@ func calculate_excess_blob_gas{range_check_ptr}(parent_header: Header) -> U64 {
     return excess_blob_gas;
 }
 
+// @dev: Saturates at 2**64 - 1
 func calculate_total_blob_gas{range_check_ptr}(tx: Transaction) -> Uint {
     if (tx.value.blob_transaction.value != 0) {
-        let total_blob_gas = Uint(
+        tempvar total_blob_gas = Uint(
             GasConstants.GAS_PER_BLOB *
             tx.value.blob_transaction.value.blob_versioned_hashes.value.len,
         );
+        let saturate = is_le_felt(2 ** 64, total_blob_gas.value);
+        if (saturate != 0) {
+            tempvar res = Uint(2 ** 64 - 1);
+            return res;
+        }
         return total_blob_gas;
     }
     let total_blob_gas = Uint(0);
     return total_blob_gas;
 }
 
+// @dev: Saturates at 2**64 - 1
 func calculate_blob_gas_price{range_check_ptr}(excess_blob_gas: U64) -> Uint {
     let blob_gas_price = taylor_exponential(
         Uint(GasConstants.MIN_BLOB_GASPRICE),
         Uint(excess_blob_gas.value),
         Uint(GasConstants.BLOB_GASPRICE_UPDATE_FRACTION),
     );
+    let saturate = is_le_felt(2 ** 64, blob_gas_price.value);
+    if (saturate != 0) {
+        tempvar res = Uint(2 ** 64 - 1);
+        return res;
+    }
     return blob_gas_price;
 }
 
 func calculate_data_fee{range_check_ptr}(excess_blob_gas: U64, tx: Transaction) -> Uint {
     alloc_locals;
+    // saturate at 2**64 - 1
     let total_blob_gas = calculate_total_blob_gas(tx);
+    // saturate at 2**64 - 1
     let blob_gas_price = calculate_blob_gas_price(excess_blob_gas);
+    // fits in (2**128-1)
     let data_fee = Uint(total_blob_gas.value * blob_gas_price.value);
     return data_fee;
 }

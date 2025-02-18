@@ -1,6 +1,7 @@
 from starkware.cairo.common.bool import TRUE, FALSE
 from starkware.cairo.common.cairo_builtins import BitwiseBuiltin, KeccakBuiltin, PoseidonBuiltin
-from starkware.cairo.common.dict import dict_read, DictAccess
+from starkware.cairo.common.dict import DictAccess
+from legacy.utils.dict import dict_read
 
 from ethereum_types.numeric import (
     U256,
@@ -18,7 +19,7 @@ from ethereum.cancun.vm.exceptions import InvalidJumpDestError
 from ethereum.cancun.vm.gas import charge_gas, GasConstants
 from ethereum.cancun.vm.stack import Stack, pop, push
 
-from src.utils.dict import hashdict_read
+from legacy.utils.dict import hashdict_read
 
 // @notice Stop further execution of EVM code
 func stop{
@@ -72,7 +73,7 @@ func jump{
     // Check if jump destination is valid by looking it up in valid_jump_destinations
     let valid_jump_destinations_ptr = evm.value.valid_jump_destinations.value.dict_ptr;
     let dict_ptr = cast(valid_jump_destinations_ptr, DictAccess*);
-    let (is_valid_dest) = hashdict_read{dict_ptr=dict_ptr}(1, &jump_dest.value.low);
+    let (is_valid_dest) = dict_read{dict_ptr=dict_ptr}(jump_dest.value.low);
 
     let set_dict_ptr = cast(dict_ptr, SetUintDictAccess*);
     tempvar valid_jumpdests_set = SetUint(
@@ -133,7 +134,7 @@ func jumpi{
 
     let valid_jump_destinations_ptr = evm.value.valid_jump_destinations.value.dict_ptr;
     let dict_ptr = cast(valid_jump_destinations_ptr, DictAccess*);
-    let (is_valid_dest) = hashdict_read{dict_ptr=dict_ptr}(1, &jump_dest.value.low);
+    let (is_valid_dest) = dict_read{dict_ptr=dict_ptr}(jump_dest.value.low);
 
     let set_dict_ptr = cast(dict_ptr, SetUintDictAccess*);
     tempvar valid_jumpdests_set = SetUint(

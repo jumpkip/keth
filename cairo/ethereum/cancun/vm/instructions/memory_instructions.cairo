@@ -23,8 +23,8 @@ from ethereum_types.others import (
     TupleU256U256,
     TupleU256U256Struct,
 )
-from src.utils.bytes import uint256_to_bytes32
-from src.utils.utils import Helpers
+from legacy.utils.bytes import uint256_to_bytes32
+from legacy.utils.utils import Helpers
 
 // @notice Stores a word to memory
 func mstore{
@@ -184,6 +184,7 @@ func mload{
         let err = push(U256(new U256Struct(value.low, value.high)));
         if (cast(err, felt) != 0) {
             EvmImpl.set_stack(stack);
+            EvmImpl.set_memory(memory);
             return err;
         }
     }
@@ -265,7 +266,7 @@ func mcopy{
     }
 
     let length_ceil32 = ceil32(Uint(length.value.low));
-    let (words, _) = divmod(length_ceil32.value, 32);
+    let words = length_ceil32.value / 32;
     let copy_gas_cost = GasConstants.GAS_COPY * words;
 
     let (mem_access_tuples: TupleU256U256*) = alloc();

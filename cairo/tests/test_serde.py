@@ -1,8 +1,9 @@
+from collections import ChainMap
 from typing import Annotated, Any, List, Mapping, Optional, Set, Tuple, Type, Union
 
 import pytest
 from ethereum.cancun.blocks import Block, Header, Log, Receipt, Withdrawal
-from ethereum.cancun.fork import BlockChain
+from ethereum.cancun.fork import ApplyBodyOutput, BlockChain
 from ethereum.cancun.fork_types import Account, Address, Bloom, Root, VersionedHash
 from ethereum.cancun.state import State, TransientStorage
 from ethereum.cancun.transactions import (
@@ -20,6 +21,7 @@ from ethereum.cancun.trie import (
     Node,
     Trie,
 )
+from ethereum.cancun.vm import Environment, Evm, Message
 from ethereum.cancun.vm.exceptions import (
     InvalidOpcode,
     Revert,
@@ -27,6 +29,7 @@ from ethereum.cancun.vm.exceptions import (
     StackUnderflowError,
 )
 from ethereum.cancun.vm.gas import ExtendMemory, MessageCallGas
+from ethereum.cancun.vm.interpreter import MessageCallOutput
 from ethereum.crypto.hash import Hash32
 from ethereum.exceptions import (
     EthereumException,
@@ -41,15 +44,7 @@ from starkware.cairo.lang.cairo_constants import DEFAULT_PRIME
 from starkware.cairo.lang.vm.memory_dict import MemoryDict
 from starkware.cairo.lang.vm.memory_segments import MemorySegmentManager
 
-from tests.utils.args_gen import (
-    Environment,
-    Evm,
-    Memory,
-    Message,
-    MessageCallOutput,
-    Stack,
-    _cairo_struct_to_python_type,
-)
+from tests.utils.args_gen import Memory, Stack, _cairo_struct_to_python_type
 from tests.utils.args_gen import gen_arg as _gen_arg
 from tests.utils.args_gen import to_cairo_type as _to_cairo_type
 from tests.utils.serde import Serde
@@ -88,8 +83,7 @@ def get_type(instance: Any) -> Type:
     if isinstance(instance, Mapping):
         # Get key and value types from the first item in the mapping
         if instance:
-            key_type = get_type(next(iter(instance.keys())))
-            value_type = get_type(next(iter(instance.values())))
+            key_type, value_type = instance.__orig_class__.__args__
             return Mapping[key_type, value_type]
         return Mapping
 
@@ -171,6 +165,17 @@ def single_evm_parent(b: Union[Message, Evm]) -> bool:
             return message.parent_evm.message.parent_evm is None
 
     return True
+
+
+def remove_none_values(b: Any) -> Any:
+    """Recursively remove None values from mappings and their nested structures."""
+    if isinstance(b, (dict, ChainMap, Mapping)):
+        return {k: remove_none_values(v) for k, v in b.items() if v is not None}
+    elif isinstance(b, (list, tuple)):
+        return type(b)(remove_none_values(x) for x in b)
+    elif isinstance(b, set):
+        return {remove_none_values(x) for x in b if x is not None}
+    return b
 
 
 class TestSerde:
@@ -264,19 +269,27 @@ class TestSerde:
             MessageCallOutput,
             Union[Bytes, LegacyTransaction],
             Union[Bytes, Receipt],
+            Union[Bytes, Withdrawal],
             Optional[Union[Bytes, LegacyTransaction]],
             Optional[Union[Bytes, Receipt]],
+            Optional[Union[Bytes, Withdrawal]],
+            Mapping[Bytes, Optional[Union[Bytes, LegacyTransaction]]],
+            Mapping[Bytes, Optional[Union[Bytes, Receipt]]],
+            Mapping[Bytes, Optional[Union[Bytes, Withdrawal]]],
             Tuple[Union[Bytes, LegacyTransaction], ...],
             Block,
             List[Block],
             BlockChain,
             Trie[Bytes, Optional[Union[Bytes, LegacyTransaction]]],
             Trie[Bytes, Optional[Union[Bytes, Receipt]]],
+            Trie[Bytes, Optional[Union[Bytes, Withdrawal]]],
+            ApplyBodyOutput,
         ],
     ):
         assume(no_empty_sequence(b))
         assume(single_evm_parent(b))
         type_ = get_type(b)
+        b = remove_none_values(b)
         base = segments.gen_arg([gen_arg(type_, b)])
         result = serde.serialize(to_cairo_type(type_), base, shift=0)
         assert result == b

@@ -3,15 +3,15 @@ from typing import Tuple
 from ethereum.cancun.blocks import Log
 from ethereum.cancun.fork_types import Address
 from ethereum.cancun.state import TransientStorage
+from ethereum.cancun.vm import Environment, Evm
 from ethereum.exceptions import EthereumException
 from ethereum_types.numeric import U64, U256, Bytes32, Uint
 from hypothesis import strategies as st
 
-from tests.utils.args_gen import Environment, Evm, Stack
+from tests.utils.args_gen import Stack
 from tests.utils.message_builder import MessageBuilder
 from tests.utils.strategies import (
     MAX_ACCOUNTS_TO_DELETE_SIZE,
-    MAX_LOGS_SIZE,
     MAX_TOUCHED_ACCOUNTS_SIZE,
     Memory,
     address_zero,
@@ -51,7 +51,7 @@ class EvmBuilder:
 
     def __init__(self):
         self._pc = st.just(Uint(0))
-        self._stack = st.builds(list, st.just([]))
+        self._stack = st.builds(list, st.just([])).map(lambda x: Stack[U256](x))
         self._memory = st.builds(Memory, st.just(b""))
         self._code = st.just(b"")
         self._gas_left = st.just(Uint(0))
@@ -129,9 +129,7 @@ class EvmBuilder:
         self._return_data = strategy
         return self
 
-    def with_logs(
-        self, strategy=st.lists(st.from_type(Log), max_size=MAX_LOGS_SIZE).map(tuple)
-    ):
+    def with_logs(self, strategy=st.from_type(Tuple[Log, ...])):
         self._logs = strategy
         return self
 

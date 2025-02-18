@@ -69,10 +69,10 @@ from ethereum.utils.numeric import (
     U256_le,
     U256__eq__,
 )
-from src.utils.dict import hashdict_write, dict_copy
+from legacy.utils.dict import hashdict_write, dict_copy
 from starkware.cairo.common.uint256 import uint256_lt
 from starkware.cairo.common.alloc import alloc
-from src.utils.dict import hashdict_read
+from legacy.utils.dict import hashdict_read
 from cairo_core.comparison import is_zero
 
 func generic_call{
@@ -936,6 +936,7 @@ func revert{
     // Raise revert
     tempvar revert = new EthereumException(Revert);
     EvmImpl.set_stack(stack);
+    EvmImpl.set_memory(memory);
     return revert;
 }
 
@@ -1339,7 +1340,7 @@ func create2{
 
     let init_code_gas = init_code_cost(Uint(memory_size.value.low));
     let ceiled_memory_size = ceil32(Uint(memory_size.value.low));
-    let (call_data_words, _) = divmod(ceiled_memory_size.value, 32);
+    let call_data_words = ceiled_memory_size.value / 32;
     let keccak_cost = GasConstants.GAS_KECCAK256_WORD * call_data_words;
 
     // Charge gas for CREATE2 operation

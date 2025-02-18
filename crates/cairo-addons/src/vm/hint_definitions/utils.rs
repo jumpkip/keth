@@ -3,9 +3,12 @@ use std::collections::HashMap;
 
 use cairo_vm::{
     hint_processor::{
-        builtin_hint_processor::hint_utils::{
-            get_integer_from_var_name, get_maybe_relocatable_from_var_name, get_ptr_from_var_name,
-            insert_value_from_var_name,
+        builtin_hint_processor::{
+            dict_manager::DictTracker,
+            hint_utils::{
+                get_integer_from_var_name, get_maybe_relocatable_from_var_name,
+                get_ptr_from_var_name, insert_value_from_var_name, insert_value_into_ap,
+            },
         },
         hint_processor_definition::HintReference,
     },
@@ -27,8 +30,12 @@ pub const HINTS: &[fn() -> Hint] = &[
     b_le_a,
     fp_plus_2_or_0,
     nibble_remainder,
-    print_maybe_relocatable,
     precompile_index_from_address,
+    initialize_jumpdests,
+    print_maybe_relocatable_hint,
+    jumpdest_check_push_last_32_bytes,
+    jumpdest_continue_general_case,
+    jumpdest_continue_no_push_case,
 ];
 
 lazy_static! {
@@ -166,23 +173,6 @@ pub fn nibble_remainder() -> Hint {
     )
 }
 
-pub fn print_maybe_relocatable() -> Hint {
-    Hint::new(
-        String::from("print_maybe_relocatable"),
-        |vm: &mut VirtualMachine,
-         _exec_scopes: &mut ExecutionScopes,
-         ids_data: &HashMap<String, HintReference>,
-         ap_tracking: &ApTracking,
-         _constants: &HashMap<String, Felt252>|
-         -> Result<(), HintError> {
-            let maybe_relocatable =
-                get_maybe_relocatable_from_var_name("x", vm, ids_data, ap_tracking)?;
-            println!("maybe_relocatable: {:?}", maybe_relocatable);
-            Ok(())
-        },
-    )
-}
-
 pub fn precompile_index_from_address() -> Hint {
     Hint::new(
         String::from("precompile_index_from_address"),
@@ -208,6 +198,236 @@ pub fn precompile_index_from_address() -> Hint {
             insert_value_from_var_name(
                 "index",
                 MaybeRelocatable::from(*index),
+                vm,
+                ids_data,
+                ap_tracking,
+            )?;
+            Ok(())
+        },
+    )
+}
+
+pub fn initialize_jumpdests() -> Hint {
+    Hint::new(
+        String::from("initialize_jumpdests"),
+        |vm: &mut VirtualMachine,
+         _exec_scopes: &mut ExecutionScopes,
+         ids_data: &HashMap<String, HintReference>,
+         ap_tracking: &ApTracking,
+         _constants: &HashMap<String, Felt252>|
+         -> Result<(), HintError> {
+            // Get bytecode pointer and length
+            let bytecode =
+                get_maybe_relocatable_from_var_name("bytecode", vm, ids_data, ap_tracking)?;
+            let bytecode_ptr = match bytecode {
+                MaybeRelocatable::RelocatableValue(ptr) => ptr,
+                MaybeRelocatable::Int(value) if value == Felt252::ZERO => {
+                    // Handle empty bytecode case
+                    let base = vm.add_memory_segment();
+
+                    // Get dict manager and create empty dictionary
+                    let dict_manager_ref = _exec_scopes.get_dict_manager()?;
+                    let mut dict_manager = dict_manager_ref.borrow_mut();
+
+                    // Create and insert empty DictTracker
+                    dict_manager.trackers.insert(
+                        base.segment_index,
+                        DictTracker::new_default_dict(
+                            base,
+                            &MaybeRelocatable::from(Felt252::ZERO),
+                            Some(HashMap::new()),
+                        ),
+                    );
+
+                    // Store base address in ap and return
+                    insert_value_into_ap(vm, base)?;
+                    return Ok(());
+                }
+                _ => return Err(HintError::CustomHint(Box::from("Invalid bytecode value"))),
+            };
+
+            let bytecode_len =
+                get_integer_from_var_name("bytecode_len", vm, ids_data, ap_tracking)?;
+            let len: usize = bytecode_len
+                .try_into()
+                .map_err(|_| MathError::Felt252ToUsizeConversion(Box::new(bytecode_len)))?;
+
+            // Read bytecode from memory
+            let mut bytecode = Vec::with_capacity(len);
+            for i in 0..len {
+                let value = vm.get_integer((bytecode_ptr + i)?)?.into_owned();
+                bytecode.push(value.to_bytes_be()[31]); // Get least significant byte
+            }
+
+            // Get valid jump destinations
+            let valid_jumpdest = get_valid_jump_destinations(&bytecode);
+
+            // Create dictionary data with valid jump destinations
+            let mut data = HashMap::new();
+            for dest in valid_jumpdest {
+                data.insert(vec![Felt252::from(dest).into()].into(), Felt252::ONE.into());
+            }
+
+            // Create new segment for the dictionary
+            let base = vm.add_memory_segment();
+
+            // Get dict manager and verify segment doesn't exist
+            let dict_manager_ref = _exec_scopes.get_dict_manager()?;
+            let mut dict_manager = dict_manager_ref.borrow_mut();
+            if dict_manager.trackers.contains_key(&base.segment_index) {
+                return Err(HintError::CustomHint(Box::from(
+                    "Segment already exists in dict_manager.trackers",
+                )));
+            }
+
+            // Create and insert DictTracker
+            dict_manager.trackers.insert(
+                base.segment_index,
+                DictTracker::new_default_dict(
+                    base,
+                    &MaybeRelocatable::from(Felt252::ZERO),
+                    Some(data),
+                ),
+            );
+
+            // Store base address in ap
+            insert_value_into_ap(vm, base)?;
+
+            Ok(())
+        },
+    )
+}
+
+pub fn print_maybe_relocatable_hint() -> Hint {
+    Hint::new(
+        String::from("print_maybe_relocatable_hint"),
+        |vm: &mut VirtualMachine,
+         _exec_scopes: &mut ExecutionScopes,
+         ids_data: &HashMap<String, HintReference>,
+         ap_tracking: &ApTracking,
+         _constants: &HashMap<String, Felt252>|
+         -> Result<(), HintError> {
+            let maybe_relocatable =
+                get_maybe_relocatable_from_var_name("x", vm, ids_data, ap_tracking)?;
+            println!("maybe_relocatable: {:?}", maybe_relocatable);
+            Ok(())
+        },
+    )
+}
+
+fn get_valid_jump_destinations(code: &[u8]) -> Vec<usize> {
+    let mut valid_jumpdest = Vec::new();
+    let mut i = 0;
+
+    while i < code.len() {
+        if code[i] == 0x5b {
+            // JUMPDEST opcode
+            valid_jumpdest.push(i);
+            i += 1;
+            continue;
+        }
+
+        // Skip push data
+        if code[i] >= 0x60 && code[i] <= 0x7f {
+            let n = (code[i] - 0x60 + 1) as usize;
+            i += n + 1;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    valid_jumpdest
+}
+
+pub fn jumpdest_check_push_last_32_bytes() -> Hint {
+    Hint::new(
+        String::from("jumpdest_check_push_last_32_bytes"),
+        |vm: &mut VirtualMachine,
+         _exec_scopes: &mut ExecutionScopes,
+         ids_data: &HashMap<String, HintReference>,
+         ap_tracking: &ApTracking,
+         _constants: &HashMap<String, Felt252>|
+         -> Result<(), HintError> {
+            let bytecode_ptr = get_ptr_from_var_name("bytecode", vm, ids_data, ap_tracking)?;
+            let valid_jumpdest_addr =
+                get_ptr_from_var_name("valid_jumpdest", vm, ids_data, ap_tracking)?;
+            let valid_jumpdest_key: usize =
+                vm.get_integer(valid_jumpdest_addr)?.into_owned().try_into().unwrap();
+            let max_len = std::cmp::min(valid_jumpdest_key, 32);
+
+            // Get the previous 32 bytes (or less) before the potential jumpdest
+            let mut bytecode = Vec::with_capacity(max_len);
+            for i in 0..max_len {
+                let offset = valid_jumpdest_key - i - 1;
+                let value = vm.get_integer((bytecode_ptr + offset)?)?.into_owned();
+                let value_u8: u8 = value.try_into().unwrap();
+                bytecode.push(value_u8);
+            }
+
+            // Check if any PUSH may prevent this to be a JUMPDEST
+            let is_no_push_case = !bytecode.iter().enumerate().any(|(i, &byte)| {
+                // Check if the byte is within the PUSH opcode range for its position (0x60 + i to
+                // 0x7f)
+                (0x60 + i as u8) <= byte && byte <= 0x7f
+            });
+
+            insert_value_from_var_name(
+                "is_no_push_case",
+                Felt252::from(is_no_push_case),
+                vm,
+                ids_data,
+                ap_tracking,
+            )?;
+            Ok(())
+        },
+    )
+}
+
+pub fn jumpdest_continue_general_case() -> Hint {
+    Hint::new(
+        String::from("jumpdest_continue_general_case"),
+        |vm: &mut VirtualMachine,
+         _exec_scopes: &mut ExecutionScopes,
+         ids_data: &HashMap<String, HintReference>,
+         ap_tracking: &ApTracking,
+         _constants: &HashMap<String, Felt252>|
+         -> Result<(), HintError> {
+            let i = get_integer_from_var_name("i", vm, ids_data, ap_tracking)?;
+            let valid_jumpdest_addr =
+                get_ptr_from_var_name("valid_jumpdest", vm, ids_data, ap_tracking)?;
+            let valid_jumpdest_key = vm.get_integer(valid_jumpdest_addr)?.into_owned();
+            let cond = if i < valid_jumpdest_key { 1 } else { 0 };
+            insert_value_from_var_name(
+                "cond",
+                MaybeRelocatable::from(cond),
+                vm,
+                ids_data,
+                ap_tracking,
+            )?;
+            Ok(())
+        },
+    )
+}
+
+pub fn jumpdest_continue_no_push_case() -> Hint {
+    Hint::new(
+        String::from("jumpdest_continue_no_push_case"),
+        |vm: &mut VirtualMachine,
+         _exec_scopes: &mut ExecutionScopes,
+         ids_data: &HashMap<String, HintReference>,
+         ap_tracking: &ApTracking,
+         _constants: &HashMap<String, Felt252>|
+         -> Result<(), HintError> {
+            let offset = get_integer_from_var_name("offset", vm, ids_data, ap_tracking)?;
+            let valid_jumpdest_addr =
+                get_ptr_from_var_name("valid_jumpdest", vm, ids_data, ap_tracking)?;
+            let valid_jumpdest_key = vm.get_integer(valid_jumpdest_addr)?.into_owned();
+            let cond =
+                if offset > Felt252::from(32) || valid_jumpdest_key < offset { 0 } else { 1 };
+            insert_value_from_var_name(
+                "cond",
+                MaybeRelocatable::from(cond),
                 vm,
                 ids_data,
                 ap_tracking,

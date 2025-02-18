@@ -7,10 +7,10 @@ from starkware.cairo.common.cairo_builtins import (
     ModBuiltin,
     PoseidonBuiltin,
 )
-from cairo_ec.curve.secp256k1 import secp256k1
-from ethereum.crypto.elliptic_curve import secp256k1_recover_uint256_bigends
-
-from ethereum.crypto.elliptic_curve import public_key_point_to_eth_address
+from ethereum.crypto.elliptic_curve import (
+    secp256k1_recover_uint256_bigends,
+    public_key_point_to_eth_address,
+)
 from ethereum.utils.numeric import U256_le, U256__eq__
 from ethereum_types.bytes import Bytes, Bytes0, BytesStruct
 from ethereum_types.numeric import Uint, bool, U256, U256Struct, U64
@@ -30,7 +30,6 @@ from ethereum.cancun.transactions_types import (
     BlobTransactionStruct,
     To,
     ToStruct,
-    TransactionImpl,
     TupleAccessListStruct,
     TX_BASE_COST,
     TX_DATA_COST_PER_NON_ZERO,
@@ -38,8 +37,9 @@ from ethereum.cancun.transactions_types import (
     TX_CREATE_COST,
     TX_ACCESS_LIST_ADDRESS_COST,
     TX_ACCESS_LIST_STORAGE_KEY_COST,
+    get_r,
+    get_s,
 )
-
 from ethereum.crypto.hash import keccak256, Hash32
 from ethereum_rlp.rlp import (
     encode_legacy_transaction_for_signing,
@@ -51,10 +51,12 @@ from ethereum_rlp.rlp import (
     decode_to_fee_market_transaction,
     decode_to_blob_transaction,
 )
-
 from ethereum.cancun.blocks import UnionBytesLegacyTransaction
 from ethereum.cancun.utils.constants import MAX_CODE_SIZE
-from src.utils.array import count_not_zero
+
+from cairo_core.control_flow import raise
+from cairo_ec.curve.secp256k1 import secp256k1
+from legacy.utils.array import count_not_zero
 
 func calculate_intrinsic_cost{range_check_ptr}(tx: Transaction) -> Uint {
     alloc_locals;
@@ -100,11 +102,8 @@ func calculate_intrinsic_cost{range_check_ptr}(tx: Transaction) -> Uint {
     }
 
     with_attr error_message("InvalidTransaction") {
-        assert 0 = 1;
+        jmp raise.raise_label;
     }
-
-    let cost = Uint(0);
-    return cost;
 }
 
 func _calculate_data_and_create_cost{range_check_ptr}(data: Bytes, to: To) -> felt {
@@ -252,8 +251,8 @@ func recover_sender{
     );
     tempvar zero = U256(new U256Struct(low=0, high=0));
 
-    let r = TransactionImpl.get_r(tx);
-    let s = TransactionImpl.get_s(tx);
+    let r = get_r(tx);
+    let s = get_s(tx);
 
     let r_is_zero = U256__eq__(r, zero);
     let r_is_out_of_range = U256_le(SECP256K1N, r);
@@ -300,7 +299,7 @@ func recover_sender{
         let y_parity = tx.value.access_list_transaction.value.y_parity;
         let y_parity_is_zero = U256__eq__(y_parity, zero);
         let y_parity_is_one = U256__eq__(y_parity, U256(new U256Struct(low=1, high=0)));
-        with_attr error_message("ValueError") {
+        with_attr error_message("InvalidSignatureError") {
             assert (1 - y_parity_is_zero.value) * (1 - y_parity_is_one.value) = 0;
         }
         let hash = signing_hash_2930(tx.value.access_list_transaction);
@@ -313,7 +312,7 @@ func recover_sender{
         let y_parity = tx.value.fee_market_transaction.value.y_parity;
         let y_parity_is_zero = U256__eq__(y_parity, zero);
         let y_parity_is_one = U256__eq__(y_parity, U256(new U256Struct(low=1, high=0)));
-        with_attr error_message("ValueError") {
+        with_attr error_message("InvalidSignatureError") {
             assert (1 - y_parity_is_zero.value) * (1 - y_parity_is_one.value) = 0;
         }
 
@@ -327,7 +326,7 @@ func recover_sender{
         let y_parity = tx.value.blob_transaction.value.y_parity;
         let y_parity_is_zero = U256__eq__(y_parity, zero);
         let y_parity_is_one = U256__eq__(y_parity, U256(new U256Struct(low=1, high=0)));
-        with_attr error_message("ValueError") {
+        with_attr error_message("InvalidSignatureError") {
             assert (1 - y_parity_is_zero.value) * (1 - y_parity_is_one.value) = 0;
         }
         let hash = signing_hash_4844(tx.value.blob_transaction);
@@ -338,10 +337,8 @@ func recover_sender{
 
     // Invariant: at least one of the transaction types is non-zero.
     with_attr error_message("InvalidTransaction") {
-        assert 0 = 1;
+        jmp raise.raise_label;
     }
-    tempvar res = Address(0);
-    return res;
 }
 
 func decode_transaction{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
@@ -416,8 +413,6 @@ func decode_transaction{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
         return res;
     }
     with_attr error_message("TransactionTypeError") {
-        assert 0 = 1;
-        // unreachable
-        ret;
+        jmp raise.raise_label;
     }
 }

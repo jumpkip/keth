@@ -13,23 +13,66 @@ load_dotenv()
 
 
 @pytest.fixture(scope="module")
-def cairo_run_py(request, cairo_program, cairo_file, main_path):
+def cairo_run_py(
+    request,
+    cairo_programs,
+    cairo_files,
+    main_paths,
+    coverage,
+):
     """Run the cairo program using Python VM."""
     return run_python_vm(
-        cairo_program,
-        cairo_file,
-        main_path,
+        cairo_programs,
+        cairo_files,
+        main_paths,
         request,
         gen_arg_builder=gen_arg_builder,
         serde_cls=Serde,
         to_python_type=to_python_type,
         to_cairo_type=to_cairo_type,
         hint_locals={"get_op": get_op},
+        coverage=coverage,
     )
 
 
+def pytest_configure(config):
+    """
+    Global test configuration for patching core classes.
+
+    How it works:
+    1. pytest runs this hook during test collection, before any tests execute
+    2. We directly replace the class definitions in the original modules
+    3. All subsequent imports of these modules will see our patched versions
+
+    This effectively "rewrites" the module contents at the source, so whether code does:
+        from ethereum.cancun.vm import Evm
+    or:
+        import ethereum.cancun.vm
+        evm = ethereum.cancun.vm.Evm
+
+    They both get our mock version, because the module itself has been modified.
+    """
+    import ethereum
+
+    from tests.utils.args_gen import Environment, Evm, Message, MessageCallOutput
+
+    # Apply patches at module level before any tests run
+    ethereum.cancun.vm.Evm = Evm
+    ethereum.cancun.vm.Message = Message
+    ethereum.cancun.vm.Environment = Environment
+    ethereum.cancun.vm.interpreter.MessageCallOutput = MessageCallOutput
+
+
 @pytest.fixture(scope="module")
-def cairo_run(request, cairo_program, rust_program, cairo_file, main_path):
+def cairo_run(
+    request,
+    cairo_programs,
+    rust_programs,
+    cairo_files,
+    main_paths,
+    coverage,
+    python_vm,
+):
     """
     Run the cairo program corresponding to the python test file at a given entrypoint with given program inputs as kwargs.
     Returns the output of the cairo program put in the output memory segment.
@@ -47,28 +90,30 @@ def cairo_run(request, cairo_program, rust_program, cairo_file, main_path):
     Returns:
         The function's return value, converted back to Python types
     """
-    if request.node.get_closest_marker("python_vm"):
+    if python_vm:
         return run_python_vm(
-            cairo_program,
-            cairo_file,
-            main_path,
+            cairo_programs,
+            cairo_files,
+            main_paths,
             request,
             gen_arg_builder=gen_arg_builder,
             serde_cls=Serde,
             to_python_type=to_python_type,
             to_cairo_type=to_cairo_type,
             hint_locals={"get_op": get_op},
+            coverage=coverage,
         )
 
     return run_rust_vm(
-        cairo_program,
-        rust_program,
-        cairo_file,
-        main_path,
+        cairo_programs,
+        rust_programs,
+        cairo_files,
+        main_paths,
         request,
         gen_arg_builder=gen_arg_builder,
         serde_cls=Serde,
         to_python_type=to_python_type,
+        coverage=coverage,
     )
 
 

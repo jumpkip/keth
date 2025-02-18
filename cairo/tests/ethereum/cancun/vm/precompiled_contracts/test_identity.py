@@ -1,9 +1,9 @@
+from ethereum.cancun.vm import Evm
 from ethereum.cancun.vm.precompiled_contracts.identity import identity
 from ethereum.exceptions import EthereumException
 from hypothesis import given
 
-from tests.utils.args_gen import Evm
-from tests.utils.errors import strict_raises
+from cairo_addons.testing.errors import strict_raises
 from tests.utils.evm_builder import EvmBuilder
 from tests.utils.message_builder import MessageBuilder
 

@@ -1,8 +1,8 @@
 import copy
-from typing import Optional
+from typing import Mapping, Optional
 
 import pytest
-from ethereum.cancun.fork_types import Account, Address
+from ethereum.cancun.fork_types import EMPTY_ACCOUNT, Account, Address
 from ethereum.cancun.state import (
     account_exists,
     account_exists_and_is_empty,
@@ -30,6 +30,8 @@ from ethereum.cancun.state import (
     set_code,
     set_storage,
     set_transient_storage,
+    state_root,
+    storage_root,
     touch_account,
 )
 from ethereum.cancun.trie import Trie, copy_trie
@@ -39,8 +41,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from hypothesis.strategies import composite
 
+from cairo_addons.testing.errors import strict_raises
 from tests.utils.args_gen import State, TransientStorage, Withdrawal
-from tests.utils.errors import strict_raises
 from tests.utils.strategies import (
     address,
     bytes32,
@@ -53,7 +55,10 @@ from tests.utils.strategies import (
 
 @composite
 def state_and_address_and_optional_key(
-    draw, state_strategy=state, address_strategy=address, key_strategy=None
+    draw,
+    state_strategy=state,
+    address_strategy=address,
+    key_strategy=None,
 ):
     state = draw(state_strategy)
 
@@ -296,6 +301,26 @@ class TestStateAccounts:
         assert result_cairo == account_has_code_or_nonce(state, address)
         assert state_cairo == state
 
+    @given(
+        data=state_and_address_and_optional_key(),
+        code=st.binary(min_size=1, max_size=256),
+    )
+    def test_account_has_code_or_nonce_with_code_non_empty(
+        self, cairo_run, data, code: bytes
+    ):
+        state, address = data
+        account = get_account(state, address)
+        set_account(
+            state,
+            address,
+            Account(balance=account.balance, code=code, nonce=account.nonce),
+        )
+        state_cairo, result_cairo = cairo_run(
+            "account_has_code_or_nonce", state, address
+        )
+        assert result_cairo == account_has_code_or_nonce(state, address)
+        assert state_cairo == state
+
     @given(data=state_and_address_and_optional_key())
     def test_account_has_storage(self, cairo_run, data):
         state, address = data
@@ -313,6 +338,14 @@ class TestStateAccounts:
     @given(data=state_and_address_and_optional_key())
     def test_is_account_empty(self, cairo_run, data):
         state, address = data
+        state_cairo, result_cairo = cairo_run("is_account_empty", state, address)
+        assert result_cairo == is_account_empty(state, address)
+        assert state_cairo == state
+
+    @given(data=state_and_address_and_optional_key())
+    def test_is_account_empty_high_balance(self, cairo_run, data):
+        state, address = data
+        set_account_balance(state, address, U256(2**128))
         state_cairo, result_cairo = cairo_run("is_account_empty", state, address)
         assert result_cairo == is_account_empty(state, address)
         assert state_cairo == state
@@ -377,6 +410,19 @@ class TestStateAccounts:
     @given(data=touched_accounts_strategy())
     def test_destroy_touched_empty_accounts(self, cairo_run, data):
         state, touched_accounts = data
+        state_cairo = cairo_run(
+            "destroy_touched_empty_accounts", state, touched_accounts
+        )
+        destroy_touched_empty_accounts(state, touched_accounts)
+        assert state_cairo == state
+
+    @given(data=touched_accounts_strategy(), address=...)
+    def test_destroy_touched_empty_accounts_with_empty_account(
+        self, cairo_run, data, address: Address
+    ):
+        state, touched_accounts = data
+        touched_accounts.add(address)
+        set_account(state, address, EMPTY_ACCOUNT)
         state_cairo = cairo_run(
             "destroy_touched_empty_accounts", state, touched_accounts
         )
@@ -517,3 +563,51 @@ class TestBeginTransaction:
         commit_transaction(state, transient_storage)
         assert state_cairo == state
         assert transient_storage_cairo == transient_storage
+
+
+@composite
+def state_maybe_snapshot(draw):
+    """
+    Draw a state that has a 80% chance of not containing snapshots.
+    """
+    state_ = draw(state)
+    probability = draw(st.floats(min_value=0, max_value=1))
+    if probability < 0.8:
+        state_._snapshots = []
+        return state_
+    return state_
+
+
+class TestRoot:
+    @given(state=state_maybe_snapshot())
+    def test_state_root(self, cairo_run, state: State):
+        try:
+            state_root_cairo = cairo_run("state_root", state)
+        except Exception as e:
+            with strict_raises(type(e)):
+                state_root(state)
+            return
+        state_root_py = state_root(state)
+        assert state_root_cairo == state_root_py
+
+
+class TestStorageRoots:
+    @given(state=state_maybe_snapshot())
+    def test_storage_roots(self, cairo_run, state: State):
+        def storage_roots(state) -> Mapping[Address, Bytes32]:
+            # This assertion is made in each individual storage_root in python -
+            # but in Cairo we can only perform it once.
+            assert not state._snapshots
+            storage_roots_py = {}
+            for addr in state._storage_tries.keys():
+                storage_roots_py[addr] = storage_root(state, addr)
+            return storage_roots_py
+
+        try:
+            storage_roots_cairo = cairo_run("storage_roots", state)
+        except Exception as e:
+            with strict_raises(type(e)):
+                storage_roots(state)
+            return
+
+        assert storage_roots_cairo == storage_roots(state)

@@ -1,11 +1,10 @@
+from ethereum.cancun.vm import Evm
 from ethereum.cancun.vm.instructions.keccak import keccak
-from ethereum.cancun.vm.stack import push
 from ethereum.exceptions import EthereumException
 from ethereum_types.numeric import U256
 from hypothesis import given
 
-from tests.utils.args_gen import Evm
-from tests.utils.errors import strict_raises
+from cairo_addons.testing.errors import strict_raises
 from tests.utils.evm_builder import EvmBuilder
 from tests.utils.strategies import memory_lite_access_size, memory_lite_start_position
 
@@ -20,8 +19,7 @@ class TestKeccak:
         """
         Test the keccak instruction by comparing Cairo and Python implementations
         """
-        push(evm.stack, start_index)
-        push(evm.stack, size)
+        evm.stack.push_or_replace_many([start_index, size])
         try:
             cairo_result = cairo_run("keccak", evm)
         except EthereumException as cairo_error:

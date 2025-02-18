@@ -61,8 +61,8 @@ from ethereum.utils.numeric import (
 )
 from ethereum.utils.bytes import Bytes8_to_Bytes
 from cairo_core.comparison import is_zero
-from src.utils.array import reverse
-from src.utils.bytes import (
+from legacy.utils.array import reverse
+from legacy.utils.bytes import (
     felt_to_bytes,
     felt_to_bytes_little,
     bytes_to_felt,
@@ -73,6 +73,7 @@ from src.utils.bytes import (
     felt_to_bytes16_little,
     uint256_from_bytes_be,
 )
+from cairo_core.control_flow import raise
 
 struct SequenceSimple {
     value: SequenceSimpleStruct*,
@@ -742,15 +743,8 @@ func encode_transaction{range_check_ptr}(transaction: Transaction) -> UnionBytes
     }
 
     // Should never happen - one pointer must be non-null
-    with_attr error_message("Invalid transaction type - no valid pointer") {
-        assert 0 = 1;
-        tempvar result = UnionBytesLegacyTransaction(
-            new UnionBytesLegacyTransactionEnum(
-                bytes=Bytes(cast(0, BytesStruct*)),
-                legacy_transaction=LegacyTransaction(cast(0, LegacyTransactionStruct*)),
-            ),
-        );
-        return result;
+    with_attr error_message("InvalidTransactionType") {
+        jmp raise.raise_label;
     }
 }
 
@@ -950,7 +944,7 @@ func decode_to_fee_market_transaction{range_check_ptr, bitwise_ptr: BitwiseBuilt
     with_attr error_message("Invalid nonce: expected bytes") {
         assert cast(items[1].value.sequence.value, felt) = 0;
     }
-    let nonce = U256_from_be_bytes(items[1].value.bytes.value.len, items[1].value.bytes.value.data);
+    let nonce = U256_from_be_bytes(items[1].value.bytes);
 
     // Decode max_priority_fee_per_gas (third field)
     with_attr error_message("Invalid max_priority_fee_per_gas: expected bytes") {
@@ -980,7 +974,7 @@ func decode_to_fee_market_transaction{range_check_ptr, bitwise_ptr: BitwiseBuilt
     with_attr error_message("Invalid value: expected bytes") {
         assert cast(items[6].value.sequence.value, felt) = 0;
     }
-    let value = U256_from_be_bytes(items[6].value.bytes.value.len, items[6].value.bytes.value.data);
+    let value = U256_from_be_bytes(items[6].value.bytes);
 
     // Decode data (eighth field)
     with_attr error_message("Invalid data: expected bytes") {
@@ -998,21 +992,19 @@ func decode_to_fee_market_transaction{range_check_ptr, bitwise_ptr: BitwiseBuilt
     with_attr error_message("Invalid y_parity: expected bytes") {
         assert cast(items[9].value.sequence.value, felt) = 0;
     }
-    let y_parity = U256_from_be_bytes(
-        items[9].value.bytes.value.len, items[9].value.bytes.value.data
-    );
+    let y_parity = U256_from_be_bytes(items[9].value.bytes);
 
     // Decode r (eleventh field)
     with_attr error_message("Invalid r: expected bytes") {
         assert cast(items[10].value.sequence.value, felt) = 0;
     }
-    let r = U256_from_be_bytes(items[10].value.bytes.value.len, items[10].value.bytes.value.data);
+    let r = U256_from_be_bytes(items[10].value.bytes);
 
     // Decode s (twelfth field)
     with_attr error_message("Invalid s: expected bytes") {
         assert cast(items[11].value.sequence.value, felt) = 0;
     }
-    let s = U256_from_be_bytes(items[11].value.bytes.value.len, items[11].value.bytes.value.data);
+    let s = U256_from_be_bytes(items[11].value.bytes);
 
     tempvar tx = FeeMarketTransaction(
         new FeeMarketTransactionStruct(
@@ -1062,7 +1054,7 @@ func decode_to_blob_transaction{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
     with_attr error_message("Invalid nonce: expected bytes") {
         assert cast(items[1].value.sequence.value, felt) = 0;
     }
-    let nonce = U256_from_be_bytes(items[1].value.bytes.value.len, items[1].value.bytes.value.data);
+    let nonce = U256_from_be_bytes(items[1].value.bytes);
 
     // Decode max_priority_fee_per_gas (third field)
     with_attr error_message("Invalid max_priority_fee_per_gas: expected bytes") {
@@ -1093,7 +1085,7 @@ func decode_to_blob_transaction{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
     with_attr error_message("Invalid value: expected bytes") {
         assert cast(items[6].value.sequence.value, felt) = 0;
     }
-    let value = U256_from_be_bytes(items[6].value.bytes.value.len, items[6].value.bytes.value.data);
+    let value = U256_from_be_bytes(items[6].value.bytes);
 
     // Decode data (eighth field)
     with_attr error_message("Invalid data: expected bytes") {
@@ -1111,9 +1103,7 @@ func decode_to_blob_transaction{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
     with_attr error_message("Invalid max_fee_per_blob_gas: expected bytes") {
         assert cast(items[9].value.sequence.value, felt) = 0;
     }
-    let max_fee_per_blob_gas = U256_from_be_bytes(
-        items[9].value.bytes.value.len, items[9].value.bytes.value.data
-    );
+    let max_fee_per_blob_gas = U256_from_be_bytes(items[9].value.bytes);
 
     // Decode blob_versioned_hashes (eleventh field)
     with_attr error_message("Invalid blob_versioned_hashes: expected sequence") {
@@ -1125,21 +1115,19 @@ func decode_to_blob_transaction{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
     with_attr error_message("Invalid y_parity: expected bytes") {
         assert cast(items[11].value.sequence.value, felt) = 0;
     }
-    let y_parity = U256_from_be_bytes(
-        items[11].value.bytes.value.len, items[11].value.bytes.value.data
-    );
+    let y_parity = U256_from_be_bytes(items[11].value.bytes);
 
     // Decode r (thirteenth field)
     with_attr error_message("Invalid r: expected bytes") {
         assert cast(items[12].value.sequence.value, felt) = 0;
     }
-    let r = U256_from_be_bytes(items[12].value.bytes.value.len, items[12].value.bytes.value.data);
+    let r = U256_from_be_bytes(items[12].value.bytes);
 
     // Decode s (fourteenth field)
     with_attr error_message("Invalid s: expected bytes") {
         assert cast(items[13].value.sequence.value, felt) = 0;
     }
-    let s = U256_from_be_bytes(items[13].value.bytes.value.len, items[13].value.bytes.value.data);
+    let s = U256_from_be_bytes(items[13].value.bytes);
 
     tempvar tx = BlobTransaction(
         new BlobTransactionStruct(
@@ -1188,9 +1176,7 @@ func _decode_versioned_hashes_inner{range_check_ptr, bitwise_ptr: BitwiseBuiltin
         assert cast(items[0].value.sequence.value, felt) = 0;
     }
 
-    let hash = Bytes32_from_be_bytes(
-        items[0].value.bytes.value.len, items[0].value.bytes.value.data
-    );
+    let hash = Bytes32_from_be_bytes(items[0].value.bytes);
     assert [versioned_hashes] = hash;
 
     let remaining_len = _decode_versioned_hashes_inner(
@@ -1228,7 +1214,7 @@ func decode_to_access_list_transaction{range_check_ptr, bitwise_ptr: BitwiseBuil
     with_attr error_message("Invalid nonce: expected bytes") {
         assert cast(items[1].value.sequence.value, felt) = 0;
     }
-    let nonce = U256_from_be_bytes(items[1].value.bytes.value.len, items[1].value.bytes.value.data);
+    let nonce = U256_from_be_bytes(items[1].value.bytes);
 
     // Decode gas_price (third field)
     with_attr error_message("Invalid gas_price: expected bytes") {
@@ -1252,7 +1238,7 @@ func decode_to_access_list_transaction{range_check_ptr, bitwise_ptr: BitwiseBuil
     with_attr error_message("Invalid value: expected bytes") {
         assert cast(items[5].value.sequence.value, felt) = 0;
     }
-    let value = U256_from_be_bytes(items[5].value.bytes.value.len, items[5].value.bytes.value.data);
+    let value = U256_from_be_bytes(items[5].value.bytes);
 
     // Decode data (seventh field)
     with_attr error_message("Invalid data: expected bytes") {
@@ -1270,21 +1256,19 @@ func decode_to_access_list_transaction{range_check_ptr, bitwise_ptr: BitwiseBuil
     with_attr error_message("Invalid y_parity: expected bytes") {
         assert cast(items[8].value.sequence.value, felt) = 0;
     }
-    let y_parity = U256_from_be_bytes(
-        items[8].value.bytes.value.len, items[8].value.bytes.value.data
-    );
+    let y_parity = U256_from_be_bytes(items[8].value.bytes);
 
     // Decode r (tenth field)
     with_attr error_message("Invalid r: expected bytes") {
         assert cast(items[9].value.sequence.value, felt) = 0;
     }
-    let r = U256_from_be_bytes(items[9].value.bytes.value.len, items[9].value.bytes.value.data);
+    let r = U256_from_be_bytes(items[9].value.bytes);
 
     // Decode s (eleventh field)
     with_attr error_message("Invalid s: expected bytes") {
         assert cast(items[10].value.sequence.value, felt) = 0;
     }
-    let s = U256_from_be_bytes(items[10].value.bytes.value.len, items[10].value.bytes.value.data);
+    let s = U256_from_be_bytes(items[10].value.bytes);
 
     // Create and return the AccessListTransaction
     tempvar tx = AccessListTransaction(
@@ -1407,9 +1391,7 @@ func _decode_storage_keys_inner{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
         assert cast(items[0].value.sequence.value, felt) = 0;
     }
 
-    let key = Bytes32_from_be_bytes(
-        items[0].value.bytes.value.len, items[0].value.bytes.value.data
-    );
+    let key = Bytes32_from_be_bytes(items[0].value.bytes);
     assert [storage_keys] = key;
 
     // Process next storage key
@@ -1454,9 +1436,8 @@ func _encode{range_check_ptr}(dst: felt*, raw_data: Extended) -> felt {
         return _encode_uint(dst, raw_data.value.bool.value);
     }
 
-    with_attr error_message("RLP Encoding type is not supported") {
-        assert 0 = 1;
-        return 0;
+    with_attr error_message("RLPEncodeInvalidType") {
+        jmp raise.raise_label;
     }
 }
 

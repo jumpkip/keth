@@ -12,11 +12,10 @@ import json
 import logging
 import marshal
 import math
-import re
 from hashlib import md5
 from pathlib import Path
 from time import time_ns
-from typing import Callable, Optional, Tuple, Type
+from typing import Callable, List, Optional, Tuple, Type
 
 import polars as pl
 import starkware.cairo.lang.instances as LAYOUTS
@@ -50,7 +49,8 @@ from starkware.cairo.lang.vm.security import verify_secure_runner
 from starkware.cairo.lang.vm.utils import RunResources
 from starkware.cairo.lang.vm.vm import VirtualMachine
 
-from cairo_addons.profiler import profile_from_tracer_data
+from cairo_addons.profiler import profile_from_trace
+from cairo_addons.testing.errors import map_to_python_exception
 from cairo_addons.testing.hints import debug_info, oracle
 from cairo_addons.testing.serde import Serde, SerdeProtocol
 from cairo_addons.testing.utils import flatten
@@ -160,9 +160,9 @@ def build_entrypoint(
 
 
 def run_python_vm(
-    cairo_program: Program,
-    cairo_file: Optional[Path],
-    main_path: Tuple[str, ...],
+    cairo_programs: List[Program],
+    cairo_files: List[Path],
+    main_paths: List[Tuple[str, ...]],
     request: FixtureRequest,
     gen_arg_builder: Optional[
         Callable[[DictManager, MemorySegmentManager], Callable]
@@ -172,10 +172,22 @@ def run_python_vm(
     serde_cls: Type[SerdeProtocol] = Serde,
     hint_locals: Optional[dict] = None,
     static_locals: Optional[dict] = None,
+    coverage: Optional[Callable[[pl.DataFrame, int], pl.DataFrame]] = None,
 ):
     """Helper function containing Python VM implementation"""
 
     def _run(entrypoint, *args, **kwargs):
+        cairo_program = cairo_programs[0]
+        cairo_file = cairo_files[0]
+        main_path = main_paths[0]
+        try:
+            cairo_program.get_label(entrypoint)
+        except Exception:
+            # Entrypoint not found - try test program
+            cairo_program = cairo_programs[1]
+            cairo_file = cairo_files[1]
+            main_path = main_paths[1]
+
         _builtins, _implicit_args, _args, return_data_types = build_entrypoint(
             cairo_program, entrypoint, main_path, to_python_type
         )
@@ -245,6 +257,7 @@ def run_python_vm(
         runner.initialize_vm(
             hint_locals={
                 "program_input": kwargs,
+                "builtin_runners": runner.builtin_runners,
                 "__dict_manager": dict_manager,
                 "dict_manager": dict_manager,
                 "serde": serde,
@@ -267,6 +280,13 @@ def run_python_vm(
         try:
             runner.run_until_pc(end, run_resources)
         except Exception as e:
+            runner.end_run(disable_trace_padding=False)
+            runner.relocate()
+            trace = pl.DataFrame(
+                [{"pc": x.pc, "ap": x.ap, "fp": x.fp} for x in runner.relocated_trace]
+            )
+            if coverage is not None:
+                coverage(trace, PROGRAM_BASE)
             map_to_python_exception(e)
 
         runner.end_run(disable_trace_padding=False)
@@ -297,6 +317,11 @@ def run_python_vm(
         verify_secure_runner(runner)
         runner.relocate()
 
+        trace = pl.DataFrame(
+            [{"pc": x.pc, "ap": x.ap, "fp": x.fp} for x in runner.relocated_trace]
+        )
+        if coverage is not None:
+            coverage(trace, PROGRAM_BASE)
         # Create a unique output stem for the given test by using the test file name, the entrypoint and the kwargs
         displayed_args = ""
         if kwargs:
@@ -314,10 +339,7 @@ def run_python_vm(
             f"{output_stem[:160]}_{int(time_ns())}_{md5(output_stem.encode()).digest().hex()[:8]}"
         )
         if request.config.getoption("profile_cairo"):
-            trace = pl.DataFrame(
-                [{"pc": x.pc, "ap": x.ap, "fp": x.fp} for x in runner.relocated_trace]
-            )
-            stats, prof_dict = profile_from_tracer_data(
+            stats, prof_dict = profile_from_trace(
                 program=cairo_program, trace=trace, program_base=PROGRAM_BASE
             )
             stats = stats[
@@ -400,20 +422,34 @@ def run_python_vm(
 
 
 def run_rust_vm(
-    cairo_program: Program,
-    rust_program: RustProgram,
-    cairo_file: Optional[Path],
-    main_path: Tuple[str, ...],
+    cairo_programs: List[Program],
+    rust_programs: List[RustProgram],
+    cairo_files: List[Path],
+    main_paths: List[Tuple[str, ...]],
     request: FixtureRequest,
     gen_arg_builder: Optional[
         Callable[[DictManager, MemorySegmentManager], Callable]
     ] = None,
     to_python_type: Callable = to_python_type,
     serde_cls: Type[SerdeProtocol] = Serde,
+    coverage: Optional[Callable[[pl.DataFrame, int], pl.DataFrame]] = None,
 ):
     """Helper function containing Rust VM implementation"""
 
     def _run(entrypoint, *args, **kwargs):
+        cairo_program = cairo_programs[0]
+        rust_program = rust_programs[0]
+        cairo_file = cairo_files[0]
+        main_path = main_paths[0]
+        try:
+            cairo_program.get_label(entrypoint)
+        except Exception:
+            # Entrypoint not found - try test program
+            cairo_program = cairo_programs[1]
+            rust_program = rust_programs[1]
+            cairo_file = cairo_files[1]
+            main_path = main_paths[1]
+
         _builtins, _implicit_args, _args, return_data_types = build_entrypoint(
             cairo_program, entrypoint, main_path, to_python_type
         )
@@ -466,6 +502,12 @@ def run_rust_vm(
         try:
             runner.run_until_pc(end, RustRunResources())
         except Exception as e:
+            runner.relocate()
+            trace = pl.DataFrame(
+                [{"pc": x.pc, "ap": x.ap, "fp": x.fp} for x in runner.relocated_trace]
+            )
+            if coverage is not None:
+                coverage(trace, PROGRAM_BASE)
             map_to_python_exception(e)
 
         cumulative_retdata_offsets = serde.get_offsets(return_data_types)
@@ -473,6 +515,11 @@ def run_rust_vm(
             cumulative_retdata_offsets[0] if cumulative_retdata_offsets else 0
         )
         runner.verify_and_relocate(offset=first_return_data_offset)
+        trace = pl.DataFrame(
+            [{"pc": x.pc, "ap": x.ap, "fp": x.fp} for x in runner.relocated_trace]
+        )
+        if coverage is not None:
+            coverage(trace, PROGRAM_BASE)
 
         # Create a unique output stem for the given test by using the test file name, the entrypoint and the kwargs
         displayed_args = ""
@@ -491,10 +538,7 @@ def run_rust_vm(
             f"{output_stem[:160]}_{int(time_ns())}_{md5(output_stem.encode()).digest().hex()[:8]}"
         )
         if request.config.getoption("profile_cairo"):
-            trace = pl.DataFrame(
-                [{"pc": x.pc, "ap": x.ap, "fp": x.fp} for x in runner.relocated_trace]
-            )
-            stats, prof_dict = profile_from_tracer_data(
+            stats, prof_dict = profile_from_trace(
                 program=cairo_program, trace=trace, program_base=PROGRAM_BASE
             )
             stats = stats[
@@ -533,24 +577,3 @@ def run_rust_vm(
         return final_output[0] if len(final_output) == 1 else final_output
 
     return _run
-
-
-def map_to_python_exception(e: Exception):
-    import ethereum.exceptions as eth_exceptions
-
-    error_str = str(e)
-
-    # Throw a specialized python exception from the error message, if possible
-    error = re.search(r"Error message: (.*)", error_str)
-    error_type = error.group(1) if error else error_str
-    # Get the exception class from python's builtins or ethereum's exceptions
-    exception_class = __builtins__.get(
-        error_type, getattr(eth_exceptions, error_type, None)
-    )
-    if isinstance(exception_class, type) and issubclass(exception_class, Exception):
-        raise exception_class() from e
-
-    # Fallback to generic exception
-    if "An ASSERT_EQ instruction failed" in error_str:
-        raise AssertionError(e) from e
-    raise Exception(error_str) from e

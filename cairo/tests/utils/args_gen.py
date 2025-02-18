@@ -49,6 +49,7 @@ When adding new types, you must:
 - Add the test generation strategy to strategies.py if it's a new type (not required when only doing composition of existing types, e.g. `Union[U256, bool]`)
 """
 
+import functools
 import inspect
 import sys
 from collections import ChainMap, abc, defaultdict
@@ -74,7 +75,7 @@ from typing import (
 )
 
 from ethereum.cancun.blocks import Block, Header, Log, Receipt, Withdrawal
-from ethereum.cancun.fork import BlockChain
+from ethereum.cancun.fork import ApplyBodyOutput, BlockChain
 from ethereum.cancun.fork_types import Account, Address, Bloom, Root, VersionedHash
 from ethereum.cancun.state import State, TransientStorage
 from ethereum.cancun.transactions import (
@@ -162,7 +163,17 @@ T = TypeVar("T")
 
 
 class Stack(List[T]):
-    pass
+    MAX_SIZE = 1024
+
+    def push_or_replace(self, value: T):
+        if len(self) >= self.MAX_SIZE:
+            self.pop()
+        self.append(value)
+
+    def push_or_replace_many(self, values: List[T]):
+        if len(self) + len(values) > self.MAX_SIZE:
+            del self[self.MAX_SIZE - len(values) :]
+        self.extend(values)
 
 
 @dataclass
@@ -183,7 +194,11 @@ class FlatState:
         """Convert a State object to a FlatState object."""
         flat_state = cls(
             _main_trie=state._main_trie,
-            _storage_tries=Trie(secured=True, default=U256(0), _data={}),
+            _storage_tries=Trie(
+                secured=True,
+                default=U256(0),
+                _data=defaultdict(lambda: U256(0), {}),
+            ),
             _snapshots=[],
             created_accounts=state.created_accounts,
         )
@@ -198,7 +213,9 @@ class FlatState:
         for snapshot in state._snapshots:
             snapshot_main_trie = snapshot[0]
             snapshot_storage_tries = Trie(
-                flat_state._storage_tries.secured, flat_state._storage_tries.default, {}
+                flat_state._storage_tries.secured,
+                flat_state._storage_tries.default,
+                defaultdict(lambda: U256(0), {}),
             )
             for address, storage_trie in snapshot[1].items():
                 for key in storage_trie._data.keys():
@@ -260,7 +277,11 @@ class FlatTransientStorage:
     def from_transient_storage(cls, ts: TransientStorage) -> "FlatTransientStorage":
         """Convert a TransientStorage object to a FlatTransientStorage object."""
         flat_ts = cls(
-            _tries=Trie(secured=True, default=U256(0), _data={}),
+            _tries=Trie(
+                secured=True,
+                default=U256(0),
+                _data=defaultdict(lambda: U256(0), {}),
+            ),
             _snapshots=[],
         )
 
@@ -272,7 +293,11 @@ class FlatTransientStorage:
 
         # Flatten snapshots
         for snapshot in ts._snapshots:
-            snapshot_tries = Trie(flat_ts._tries.secured, flat_ts._tries.default, {})
+            snapshot_tries = Trie(
+                flat_ts._tries.secured,
+                flat_ts._tries.default,
+                defaultdict(lambda: U256(0), {}),
+            )
             for address, storage_trie in snapshot.items():
                 for key in storage_trie._data.keys():
                     value = trie_get(storage_trie, key)
@@ -315,6 +340,7 @@ class FlatTransientStorage:
         return ts
 
 
+# All these classes are auto-patched in test imports in cairo/tests/conftests.py
 @dataclass
 class Environment(
     make_dataclass(
@@ -328,6 +354,16 @@ class Environment(
             getattr(self, field.name) == getattr(other, field.name)
             for field in fields(self)
         )
+
+    @functools.wraps(EnvironmentBase.__init__)
+    def __init__(self, *args, **kwargs):
+        if "traces" in kwargs:
+            del kwargs["traces"]
+        super().__init__(*args, **kwargs)
+
+    @property
+    def traces(self):
+        return []
 
 
 @dataclass
@@ -421,6 +457,17 @@ ethereum_exception_mappings = {
     for name, cls in ethereum_exception_classes
 }
 
+# Union of all possible trie types as defined in the ethereum spec.
+# Does not take into account our internal trie where we merged accounts and storage.
+# ! Order matters here.
+EthereumTries = Union[
+    Trie[Address, Optional[Account]],  # Account Trie
+    Trie[Bytes32, U256],  # Storage Trie
+    Trie[Bytes, Optional[Union[Bytes, LegacyTransaction]]],  # Transaction Trie
+    Trie[Bytes, Optional[Union[Bytes, Receipt]]],  # Receipt Trie
+    Trie[Bytes, Optional[Union[Bytes, Withdrawal]]],  # Withdrawal Trie
+]
+
 _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
     ("ethereum_types", "others", "None"): type(None),
     ("ethereum_types", "numeric", "bool"): bool,
@@ -452,6 +499,7 @@ _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
     ("ethereum", "cancun", "blocks", "Log"): Log,
     ("ethereum", "cancun", "blocks", "TupleLog"): Tuple[Log, ...],
     ("ethereum", "cancun", "blocks", "Receipt"): Receipt,
+    ("ethereum", "cancun", "fork", "UnionBytesReceipt"): Union[Bytes, Receipt],
     ("ethereum", "cancun", "blocks", "UnionBytesLegacyTransaction"): Union[
         Bytes, LegacyTransaction
     ],
@@ -465,9 +513,19 @@ _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
     ("ethereum", "cancun", "blocks", "OptionalUnionBytesReceipt"): Optional[
         Union[Bytes, Receipt]
     ],
+    ("ethereum", "cancun", "blocks", "UnionBytesWithdrawal"): Union[Bytes, Withdrawal],
+    ("ethereum", "cancun", "blocks", "OptionalUnionBytesWithdrawal"): Optional[
+        Union[Bytes, Withdrawal]
+    ],
     ("ethereum", "cancun", "blocks", "Block"): Block,
     ("ethereum", "cancun", "blocks", "ListBlock"): List[Block],
     ("ethereum", "cancun", "fork", "BlockChain"): BlockChain,
+    ("ethereum", "cancun", "fork_types", "MappingAddressBytes32"): Mapping[
+        Address, Bytes32
+    ],
+    ("ethereum", "cancun", "fork_types", "OptionalMappingAddressBytes32"): Optional[
+        Mapping[Address, Bytes32]
+    ],
     ("ethereum", "cancun", "fork_types", "Address"): Address,
     ("ethereum", "cancun", "fork_types", "SetAddress"): Set[Address],
     ("ethereum", "cancun", "fork_types", "Root"): Root,
@@ -478,7 +536,6 @@ _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
         EthereumException
     ],
     ("ethereum", "cancun", "fork_types", "Bloom"): Bloom,
-    ("ethereum", "cancun", "fork", "UnionBytesReceipt"): Union[Bytes, Receipt],
     ("ethereum", "cancun", "bloom", "MutableBloom"): MutableBloom,
     ("ethereum", "cancun", "fork_types", "VersionedHash"): VersionedHash,
     ("ethereum", "cancun", "fork_types", "TupleAddressUintTupleVersionedHash"): Tuple[
@@ -532,11 +589,16 @@ _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
     ("ethereum_rlp", "rlp", "Extended"): Extended,
     ("ethereum_rlp", "rlp", "SequenceSimple"): Sequence[Simple],
     ("ethereum_rlp", "rlp", "SequenceExtended"): Sequence[Extended],
+    ("ethereum", "cancun", "trie", "MappingAddressTrieBytes32U256"): Mapping[
+        Address, Trie[Bytes32, U256]
+    ],
     ("ethereum", "cancun", "trie", "LeafNode"): LeafNode,
     ("ethereum", "cancun", "trie", "ExtensionNode"): ExtensionNode,
     ("ethereum", "cancun", "trie", "BranchNode"): BranchNode,
     ("ethereum", "cancun", "trie", "InternalNode"): InternalNode,
     ("ethereum", "cancun", "trie", "Node"): Node,
+    ("ethereum", "cancun", "trie", "MappingBytes32U256"): Mapping[Bytes32, U256],
+    ("ethereum", "cancun", "trie", "TrieBytes32U256"): Trie[Bytes32, U256],
     ("ethereum", "cancun", "trie", "TrieAddressOptionalAccount"): Trie[
         Address, Optional[Account]
     ],
@@ -567,6 +629,18 @@ _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
         "trie",
         "TrieBytesOptionalUnionBytesReceipt",
     ): Trie[Bytes, Optional[Union[Bytes, Receipt]]],
+    (
+        "ethereum",
+        "cancun",
+        "trie",
+        "MappingBytesOptionalUnionBytesWithdrawal",
+    ): Mapping[Bytes, Optional[Union[Bytes, Withdrawal]]],
+    (
+        "ethereum",
+        "cancun",
+        "trie",
+        "TrieBytesOptionalUnionBytesWithdrawal",
+    ): Trie[Bytes, Optional[Union[Bytes, Withdrawal]]],
     ("ethereum", "cancun", "fork_types", "MappingAddressAccount"): Mapping[
         Address, Account
     ],
@@ -607,10 +681,12 @@ _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
     ("ethereum", "cancun", "vm", "Stack"): Stack[U256],
     ("ethereum", "cancun", "vm", "gas", "ExtendMemory"): ExtendMemory,
     ("ethereum", "cancun", "vm", "interpreter", "MessageCallOutput"): MessageCallOutput,
+    ("ethereum", "cancun", "trie", "EthereumTries"): EthereumTries,
+    ("ethereum", "cancun", "fork", "ApplyBodyOutput"): ApplyBodyOutput,
     **vm_exception_mappings,
     **ethereum_exception_mappings,
     # For tests only
-    ("tests", "src", "utils", "test_dict", "MappingUintUint"): Mapping[Uint, Uint],
+    ("tests", "legacy", "utils", "test_dict", "MappingUintUint"): Mapping[Uint, Uint],
 }
 
 # In the EELS, some functions are annotated with Sequence while it's actually just Bytes.
@@ -636,6 +712,10 @@ def isinstance_with_generic(obj, type_hint):
     if origin is abc.Sequence:
         return type(obj) in (list, tuple)
 
+    if origin is Trie:
+        key_type, value_type = obj.__orig_class__.__args__
+        return origin[key_type, value_type] == type_hint
+
     return isinstance(obj, origin)
 
 
@@ -649,7 +729,7 @@ def _gen_arg(
     arg_type: Type,
     arg: Any,
     annotations: Optional[Any] = None,
-    hash_mode: Optional[bool] = None,
+    for_dict_key: Optional[bool] = None,
 ):
     """
     Generate a Cairo argument from a Python argument.
@@ -661,6 +741,7 @@ def _gen_arg(
         segments: Cairo memory segments
         arg_type: Python type to convert from
         arg: Python value to convert
+        for_dict_key: Whether the argument is meant to be used as a key in a dict. In that case, it's returned as a tuple.
 
     Returns:
         Cairo memory pointer or value
@@ -729,9 +810,13 @@ def _gen_arg(
         # Get the concrete type parameter. For bytearray, the value type is int.
         value_type = next(iter(get_args(arg_type)), int)
         data = defaultdict(int, {k: v for k, v in enumerate(arg)})
-        # Use regular, non-hashed dict entries for stack and memory.
-        base = _gen_arg(
-            dict_manager, segments, Dict[Uint, value_type], data, hash_mode=False
+        base = generate_dict_arg(
+            dict_manager,
+            segments,
+            Dict[Uint, value_type],
+            arg_type_origin,
+            data,
+            for_dict_key=True,
         )
         segments.load_data(base + 2, [len(arg)])
         return base
@@ -759,11 +844,15 @@ def _gen_arg(
             struct_ptr = segments.add()
             data = [
                 _gen_arg(
-                    dict_manager, segments, element_type, value, hash_mode=hash_mode
+                    dict_manager,
+                    segments,
+                    element_type,
+                    value,
+                    for_dict_key=for_dict_key,
                 )
                 for element_type, value in zip(element_types, arg)
             ]
-            if hash_mode:
+            if for_dict_key:
                 return tuple(flatten(data))
             segments.load_data(struct_ptr, data)
             return struct_ptr
@@ -772,11 +861,15 @@ def _gen_arg(
         instances_ptr = segments.add()
         data = [
             _gen_arg(
-                dict_manager, segments, get_args(arg_type)[0], x, hash_mode=hash_mode
+                dict_manager,
+                segments,
+                get_args(arg_type)[0],
+                x,
+                for_dict_key=for_dict_key,
             )
             for x in arg
         ]
-        if hash_mode:
+        if for_dict_key:
             return tuple(flatten(data))
         segments.load_data(instances_ptr, data)
         struct_ptr = segments.add()
@@ -785,7 +878,12 @@ def _gen_arg(
 
     if arg_type_origin in (dict, ChainMap, abc.Mapping, set):
         return generate_dict_arg(
-            dict_manager, segments, arg_type, arg_type_origin, arg, hash_mode=hash_mode
+            dict_manager,
+            segments,
+            arg_type,
+            arg_type_origin,
+            arg,
+            for_dict_key=for_dict_key,
         )
 
     if arg_type in (Union[int, RustRelocatable], Union[int, RelocatableValue]):
@@ -844,7 +942,7 @@ def _gen_arg(
             int.from_bytes(arg[i : i + 16], "little") for i in range(0, len(arg), 16)
         ]
 
-        if hash_mode:
+        if for_dict_key:
             return tuple(felt_values)
 
         base = segments.add()
@@ -852,7 +950,7 @@ def _gen_arg(
         return base
 
     if arg_type is Bytes256:
-        if hash_mode:
+        if for_dict_key:
             return tuple(list(arg))
 
         struct_ptr = segments.add()
@@ -865,7 +963,7 @@ def _gen_arg(
         if isinstance(arg, str):
             arg = arg.encode()
 
-        if hash_mode:
+        if for_dict_key:
             return tuple(list(arg))
 
         bytes_ptr = segments.add()
@@ -877,7 +975,7 @@ def _gen_arg(
     if arg_type in (int, bool, U64, Uint, Bytes0, Bytes4, Bytes8, Bytes20):
         if arg_type is int and arg < 0:
             ret_value = arg + DEFAULT_PRIME
-            return tuple([ret_value]) if hash_mode else ret_value
+            return tuple([ret_value]) if for_dict_key else ret_value
 
         ret_value = (
             int(arg)
@@ -885,7 +983,7 @@ def _gen_arg(
             else int.from_bytes(arg, "little")
         )
 
-        return tuple([ret_value]) if hash_mode else ret_value
+        return tuple([ret_value]) if for_dict_key else ret_value
 
     if isinstance(arg_type, type) and issubclass(arg_type, Exception):
         # For exceptions, we either return 0 (no error) or the ascii representation of the error message
@@ -906,7 +1004,6 @@ def generate_trie_arg(
     parent_trie_data: Optional[RelocatableValue] = None,
 ):
     secured = _gen_arg(dict_manager, segments, type(arg.secured), arg.secured)
-    default = _gen_arg(dict_manager, segments, type(arg.default), arg.default)
     data = generate_dict_arg(
         dict_manager,
         segments,
@@ -916,22 +1013,17 @@ def generate_trie_arg(
         parent_ptr=parent_trie_data,
     )
     base = segments.add()
-    segments.load_data(base, [secured, default, data])
 
-    # In case of a Trie, we need the dict to be a defaultdict with the trie.default as the default value.
+    # In case of a Trie, we need the trie.default to be the default value of the dict.
     dict_ptr = segments.memory.get(data)
-    current_ptr = segments.memory.get(data + 1)
 
     if isinstance(dict_manager, DictManager):
-        dict_manager.trackers[dict_ptr.segment_index].data = defaultdict(
-            lambda: default, dict_manager.trackers[dict_ptr.segment_index].data
-        )
+        default_value = dict_manager.trackers[
+            dict_ptr.segment_index
+        ].data.default_factory()
     else:
-        dict_manager.trackers[dict_ptr.segment_index] = RustDictTracker(
-            data=dict_manager.trackers[dict_ptr.segment_index].data,
-            current_ptr=current_ptr,
-            default_value=default,
-        )
+        default_value = dict_manager.get_default_value(dict_ptr.segment_index)
+    segments.load_data(base, [secured, default_value, data])
 
     return base
 
@@ -1039,7 +1131,7 @@ def generate_dict_arg(
     arg_type: Type,
     arg_type_origin: Type,
     arg: Any,
-    hash_mode: Optional[bool] = None,
+    for_dict_key: Optional[bool] = None,
     parent_ptr: Optional[RelocatableValue] = None,
 ):
 
@@ -1055,13 +1147,23 @@ def generate_dict_arg(
             segments,
             get_args(arg_type)[0],
             k,
-            hash_mode=hash_mode in (True, None),
+            for_dict_key=for_dict_key in (True, None),
         ): _gen_arg(dict_manager, segments, get_args(arg_type)[1], v)
         for k, v in arg.items()
     }
 
     if isinstance_with_generic(arg, defaultdict):
-        data = defaultdict(arg.default_factory, data)
+        default_value = _gen_arg(
+            dict_manager,
+            segments,
+            type(arg.default_factory()),
+            arg.default_factory(),
+        )
+
+        def default_factory():
+            return default_value
+
+        data = defaultdict(default_factory, data)
 
     # This is required for tests where we read data from DictAccess segments while no dict method has been used.
     # Equivalent to doing an initial dict_read of all keys.
@@ -1081,13 +1183,19 @@ def generate_dict_arg(
                 (
                     dict_manager.get_tracker(parent_dict_end_ptr).data.get(k, v)
                     if parent_dict_end_ptr
-                    else v
+                    else (
+                        data.default_factory() if isinstance(data, defaultdict) else v
+                    )
                 ),
                 v,
             )
             for k, v in data.items()
         ]
     )
+
+    all_preimages = {
+        poseidon_hash_many(k) if len(k) != 1 else k[0]: k for k in data.keys()
+    }
 
     segments.load_data(dict_ptr, initial_data)
     current_ptr = dict_ptr + len(initial_data)
@@ -1096,10 +1204,15 @@ def generate_dict_arg(
         dict_manager.trackers[dict_ptr.segment_index] = DictTracker(
             data=data, current_ptr=current_ptr
         )
+        # Set a new field in the dict_manager to store all preimages.
+        if not hasattr(dict_manager, "preimages"):
+            dict_manager.preimages = {}
+        dict_manager.preimages.update(all_preimages)
     else:
         default_value = (
             data.default_factory() if isinstance(data, defaultdict) else None
         )
+        dict_manager.preimages.update(all_preimages)
         dict_manager.trackers[dict_ptr.segment_index] = RustDictTracker(
             data=data,
             current_ptr=current_ptr,
@@ -1110,12 +1223,11 @@ def generate_dict_arg(
 
     # The last element is the original_segment_stop pointer.
     # Because this is a new dict, this is 0 (null ptr).
-    # This does not apply to stack and memory (hash_mode=False), in which case there's only 2 elements.
-    data_to_load = (
-        [dict_ptr, current_ptr, parent_ptr or 0]
-        if (hash_mode is not False)
-        else [dict_ptr, current_ptr]
-    )
+    # This does not apply to Stack, Memory and MutableBloom, in which case there's only 2 elements.
+    if arg_type_origin in (Stack, Memory, MutableBloom):
+        data_to_load = [dict_ptr, current_ptr]
+    else:
+        data_to_load = [dict_ptr, current_ptr, parent_ptr or 0]
     segments.load_data(base, data_to_load)
     return base
 

@@ -27,7 +27,7 @@ from ethereum_types.bytes import Bytes, Bytes0, Bytes8, Bytes32
 from ethereum_types.numeric import U64, U256, Uint
 from hypothesis import assume, given
 
-from tests.utils.errors import cairo_error
+from cairo_addons.testing.errors import cairo_error
 
 
 class TestRlp:
@@ -105,7 +105,6 @@ class TestRlp:
         def test_encode_log(self, cairo_run, log: Log):
             assert encode(log) == cairo_run("encode_log", log)
 
-        @pytest.mark.slow
         @given(tuple_log=...)
         def test_encode_tuple_log(self, cairo_run, tuple_log: Tuple[Log, ...]):
             assert encode(tuple_log) == cairo_run("encode_tuple_log", tuple_log)

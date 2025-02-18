@@ -68,13 +68,13 @@ def copy_dict_segment(
         # Same as new_dict but supports a default value
         base = segments.add()
         assert base.segment_index not in dict_manager.trackers
+        copied_data = {
+            key: segments.gen_arg(value) for key, value in current_tracker.data.items()
+        }
         dict_manager.trackers[base.segment_index] = DictTracker(
             data=defaultdict(
                 current_tracker.data.default_factory,
-                {
-                    key: segments.gen_arg(value)
-                    for key, value in current_tracker.data.items()
-                },
+                copied_data,
             ),
             current_ptr=base,
         )
@@ -87,9 +87,6 @@ def copy_dict_segment(
 def merge_dict_tracker_with_parent(
     dict_manager: DictManager,
     ids: VmConsts,
-    segments: MemorySegmentManager,
-    memory: MemoryDict,
-    ap: RelocatableValue,
 ):
     current_dict_tracker = dict_manager.get_tracker(ids.dict_ptr)
     parent_dict_tracker = dict_manager.get_tracker(ids.parent_dict_end)
@@ -100,9 +97,6 @@ def merge_dict_tracker_with_parent(
 def update_dict_tracker(
     dict_manager: DictManager,
     ids: VmConsts,
-    segments: MemorySegmentManager,
-    memory: MemoryDict,
-    ap: RelocatableValue,
 ):
     dict_tracker = dict_manager.get_tracker(ids.current_tracker_ptr)
     dict_tracker.current_ptr = ids.new_tracker_ptr.address_

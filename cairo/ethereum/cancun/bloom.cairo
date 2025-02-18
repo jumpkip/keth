@@ -1,6 +1,6 @@
 from starkware.cairo.common.alloc import alloc
 from starkware.cairo.common.bool import FALSE, TRUE
-from starkware.cairo.common.dict import DictAccess, dict_read, dict_write
+from starkware.cairo.common.dict import DictAccess
 from starkware.cairo.common.default_dict import default_dict_new
 from starkware.cairo.common.memset import memset
 from starkware.cairo.common.memcpy import memcpy
@@ -11,14 +11,14 @@ from starkware.cairo.common.cairo_builtins import BitwiseBuiltin, KeccakBuiltin
 
 from ethereum_types.bytes import Bytes, BytesStruct, Bytes1DictAccess, Bytes32, TupleBytes32
 from ethereum_types.numeric import U256, Uint, U128
-from ethereum.utils.numeric import max, Uint64_from_be_bytes, divmod
+from ethereum.utils.numeric import max, U64_from_be_bytes, divmod
 from ethereum.utils.bytes import Bytes20_to_Bytes, Bytes32_to_Bytes
 from ethereum.crypto.hash import keccak256
 from ethereum.cancun.blocks import TupleLog
 from ethereum.cancun.fork_types import Bloom
 
-from src.utils.bytes import uint256_to_bytes32, felt_to_bytes16_little
-from src.utils.dict import dict_squash
+from legacy.utils.bytes import uint256_to_bytes32, felt_to_bytes16_little
+from legacy.utils.dict import dict_read, dict_write, default_dict_finalize
 from cairo_core.maths import pow2
 from cairo_core.comparison import is_zero
 const BIT_MASK_11_BITS = 0x07FF;
@@ -54,7 +54,7 @@ func _add_bloom_index{range_check_ptr, bitwise_ptr: BitwiseBuiltin*, bloom: Muta
 ) {
     alloc_locals;
     tempvar hash_subset = Bytes(new BytesStruct(bloom_entry_hash.value.data + index, 2));
-    let hash_subset_uint = Uint64_from_be_bytes(hash_subset);
+    let hash_subset_uint = U64_from_be_bytes(hash_subset);
 
     assert bitwise_ptr.x = hash_subset_uint.value;
     assert bitwise_ptr.y = BIT_MASK_11_BITS;
@@ -135,7 +135,7 @@ func logs_bloom{range_check_ptr, bitwise_ptr: BitwiseBuiltin*, keccak_ptr: Kecca
 
     done:
     let dict_ptr = cast([ap - 1], DictAccess*);
-    dict_squash(mutable_bloom_start, dict_ptr);
+    default_dict_finalize(mutable_bloom_start, dict_ptr, 0);
 
     tempvar bloom = Bloom(cast(bloom_buffer, U128*));
     return bloom;

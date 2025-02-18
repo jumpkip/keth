@@ -1,14 +1,39 @@
 from ethereum.cancun.fork_types import Address
-from ethereum.cancun.vm.gas import BLOB_GASPRICE_UPDATE_FRACTION, MIN_BLOB_GASPRICE
+from ethereum.cancun.vm.gas import (
+    BLOB_GASPRICE_UPDATE_FRACTION,
+    MIN_BLOB_GASPRICE,
+    TARGET_BLOB_GAS_PER_BLOCK,
+)
 from ethereum.utils.numeric import ceil32, taylor_exponential
-from ethereum_types.bytes import Bytes32
-from ethereum_types.numeric import U256, Uint
+from ethereum_types.bytes import Bytes, Bytes32
+from ethereum_types.numeric import U64, U256, Uint
 from hypothesis import given
 from hypothesis import strategies as st
 from starkware.cairo.lang.instances import PRIME
 
-from tests.utils.errors import strict_raises
-from tests.utils.strategies import uint128
+from cairo_addons.testing.errors import strict_raises
+from tests.utils.strategies import small_bytes, uint128, uint256
+
+
+def taylor_exponential_limited(
+    factor: Uint, numerator: Uint, denominator: Uint
+) -> Uint:
+    """
+    Limited version of taylor_exponential that saturates when
+    `numerator_accumulated * numerator` is greater than 2**128 - 1
+    """
+    i = Uint(1)
+    output = Uint(0)
+    numerator_accumulated = factor * denominator
+    while numerator_accumulated > Uint(0):
+        output += numerator_accumulated
+        value = numerator_accumulated * numerator
+        div = denominator * i
+        if value > Uint(2**128 - 1):
+            return output // denominator
+        numerator_accumulated = value // div
+        i += Uint(1)
+    return output // denominator
 
 
 class TestNumeric:
@@ -34,13 +59,31 @@ class TestNumeric:
 
     @given(
         factor=st.just(MIN_BLOB_GASPRICE),
-        numerator=st.integers(min_value=1, max_value=100_000).map(Uint),
+        numerator=st.integers(
+            min_value=1, max_value=10 * int(TARGET_BLOB_GAS_PER_BLOCK)
+        ).map(Uint),
         denominator=st.just(BLOB_GASPRICE_UPDATE_FRACTION),
     )
     def test_taylor_exponential(
         self, cairo_run, factor: Uint, numerator: Uint, denominator: Uint
     ):
         assert taylor_exponential(factor, numerator, denominator) == cairo_run(
+            "taylor_exponential", factor, numerator, denominator
+        )
+
+    @given(
+        factor=st.just(MIN_BLOB_GASPRICE),
+        numerator=st.integers(min_value=1, max_value=100_000_000_000_000_000).map(Uint),
+        denominator=st.just(BLOB_GASPRICE_UPDATE_FRACTION),
+    )
+    def test_taylor_exponential_limited(
+        self, cairo_run, factor: Uint, numerator: Uint, denominator: Uint
+    ):
+        """
+        Compares to our limited version of taylor_exponential that saturates
+        when `numerator_accumulated * numerator` is greater than 2**128 - 1
+        """
+        assert taylor_exponential_limited(factor, numerator, denominator) == cairo_run(
             "taylor_exponential", factor, numerator, denominator
         )
 
@@ -115,3 +158,72 @@ class TestNumeric:
                 a * b
             return
         assert cairo_result == a * b
+
+    @given(bytes=small_bytes)
+    def test_U64_from_be_bytes(self, cairo_run, bytes: Bytes):
+        try:
+            result = cairo_run("U64_from_be_bytes", bytes)
+        except Exception as e:
+            with strict_raises(type(e)):
+                U64.from_be_bytes(bytes)
+            return
+        expected = U64.from_be_bytes(bytes)
+        assert result == expected
+
+    # @dev Note Uint type from EELS is unbounded.
+    # But Uint_from_be_bytes panics if len(bytes) > 31
+    @given(bytes=small_bytes)
+    def test_Uint_from_be_bytes(self, cairo_run, bytes: Bytes):
+        try:
+            assert Uint.from_be_bytes(bytes) == cairo_run("Uint_from_be_bytes", bytes)
+        except Exception:
+            assert len(bytes) > 31
+
+    @given(
+        a=uint256,
+        b=st.integers(min_value=2**256 - 1000, max_value=2**256 - 1).map(U256),
+    )
+    def test_U256_add_with_carry(self, cairo_run, a: U256, b: U256):
+        result, carry = cairo_run("U256_add_with_carry", a, b)
+        total = int(a) + int(b)
+        cairo_total = int(result) + int(carry) * 2**256
+        assert total == cairo_total
+
+    # @dev Note Uint type from EELS is unbounded.
+    # But U256_to_Uint panics if value > STONE_PRIME - 1
+    @given(value=...)
+    def test_U256_to_Uint(self, cairo_run, value: U256):
+        try:
+            assert Uint(value) == cairo_run("U256_to_Uint", value)
+        except Exception:
+            assert int(value) > PRIME - 1
+
+    @given(bytes=small_bytes)
+    def test_U256_from_be_bytes(self, cairo_run, bytes: Bytes):
+        try:
+            result = cairo_run("U256_from_be_bytes", bytes)
+        except Exception as e:
+            with strict_raises(type(e)):
+                U256.from_be_bytes(bytes)
+            return
+        assert result == U256.from_be_bytes(bytes)
+
+    @given(bytes=small_bytes)
+    def test_Bytes32_from_be_bytes(self, cairo_run, bytes: Bytes):
+        try:
+            result = cairo_run("Bytes32_from_be_bytes", bytes)
+        except Exception as e:
+            with strict_raises(type(e)):
+                Bytes32(bytes)
+            return
+        bytes = (
+            int.from_bytes(bytes, "big").to_bytes(32, "big")
+            if len(bytes) < 32
+            else bytes
+        )
+        assert result == Bytes32(bytes)
+
+    @given(value=st.integers(min_value=0, max_value=PRIME - 1).map(Uint))
+    def test_U256_from_felt(self, cairo_run, value: Uint):
+        result = cairo_run("U256_from_Uint", value)
+        assert result == U256(value)

@@ -135,11 +135,13 @@ func try_recover_public_key{
     local g: UInt384 = UInt384(secp256k1.G0, secp256k1.G1, secp256k1.G2, secp256k1.G3);
     local p: UInt384 = UInt384(secp256k1.P0, secp256k1.P1, secp256k1.P2, secp256k1.P3);
 
-    let (y, is_on_curve) = try_get_point_from_x(x=r, v=y_parity, a=&a, b=&b, g=&g, p=&p);
+    let (y, is_on_curve) = try_get_point_from_x(x=&r, v=y_parity, a=&a, b=&b, g=&g, p=&p);
     if (is_on_curve == 0) {
         return (public_key_point=G1Point(x=UInt384(0, 0, 0, 0), y=UInt384(0, 0, 0, 0)), success=0);
     }
-    let r_point = G1Point(x=r, y=y);
+
+    tempvar r_point = G1Point(x=r, y=[y]);
+
     // The result is given by
     //   -(msg_hash / r) * gen + (s / r) * r_point
     // where the division by r is modulo N.
@@ -299,17 +301,7 @@ func try_recover_public_key{
         p=p, values_ptr=cast(range_check96_ptr, UInt384*), offsets_ptr=mul_offsets_ptr, n=108
     );
 
-    %{
-        from starkware.cairo.lang.builtins.modulo.mod_builtin_runner import ModBuiltinRunner
-        assert builtin_runners["add_mod_builtin"].instance_def.batch_size == 1
-        assert builtin_runners["mul_mod_builtin"].instance_def.batch_size == 1
-
-        ModBuiltinRunner.fill_memory(
-            memory=memory,
-            add_mod=(ids.add_mod_ptr.address_, builtin_runners["add_mod_builtin"], 117),
-            mul_mod=(ids.mul_mod_ptr.address_, builtin_runners["mul_mod_builtin"], 108),
-        )
-    %}
+    %{ fill_add_mod_mul_mod_builtin_batch_117_108 %}
 
     tempvar range_check96_ptr = range_check96_ptr_final;
     let add_mod_ptr = add_mod_ptr + 117 * ModBuiltin.SIZE;

@@ -6,13 +6,23 @@ from starkware.cairo.common.cairo_builtins import (
     PoseidonBuiltin,
     ModBuiltin,
 )
+from starkware.cairo.common.default_dict import default_dict_new
 from starkware.cairo.common.dict_access import DictAccess
 from starkware.cairo.common.math import assert_not_zero, split_felt, assert_le_felt
 from starkware.cairo.common.math_cmp import is_le, is_le_felt
 from starkware.cairo.common.registers import get_fp_and_pc
 
-from ethereum_rlp.rlp import Extended, ExtendedImpl, encode_receipt_to_buffer, encode_header
-from ethereum_types.bytes import Bytes, Bytes0, BytesStruct, TupleBytes32
+from ethereum_rlp.rlp import (
+    Extended,
+    ExtendedImpl,
+    encode_receipt_to_buffer,
+    encode_receipt,
+    encode_header,
+    encode_uint,
+    encode_withdrawal,
+    encode_transaction,
+)
+from ethereum_types.bytes import Bytes, Bytes0, BytesStruct, TupleBytes32, Bytes32, Bytes32Struct
 from ethereum_types.numeric import Uint, bool, U256, U256Struct, U64
 from ethereum.cancun.blocks import (
     Header,
@@ -24,8 +34,48 @@ from ethereum.cancun.blocks import (
     Block,
     ListBlock,
     TupleHeader,
+    TupleUnionBytesLegacyTransaction,
+    TupleWithdrawal,
+    Withdrawal,
+    WithdrawalStruct,
 )
 from ethereum.cancun.bloom import logs_bloom
+from ethereum.cancun.trie import (
+    trie_set_TrieBytesOptionalUnionBytesLegacyTransaction,
+    TrieAddressOptionalAccountStruct,
+    root,
+    EthereumTries,
+    EthereumTriesEnum,
+    TrieAddressOptionalAccount,
+    TrieBytes32U256,
+    TrieTupleAddressBytes32U256Struct,
+    trie_set_TrieBytesOptionalUnionBytesReceipt,
+    TrieTupleAddressBytes32U256,
+    BytesOptionalUnionBytesLegacyTransactionDictAccess,
+    MappingBytesOptionalUnionBytesLegacyTransaction,
+    MappingBytesOptionalUnionBytesLegacyTransactionStruct,
+    TrieBytesOptionalUnionBytesLegacyTransaction,
+    TrieBytesOptionalUnionBytesLegacyTransactionStruct,
+    BytesOptionalUnionBytesReceiptDictAccess,
+    MappingBytesOptionalUnionBytesReceipt,
+    MappingBytesOptionalUnionBytesReceiptStruct,
+    TrieBytesOptionalUnionBytesReceipt,
+    TrieBytesOptionalUnionBytesReceiptStruct,
+    BytesOptionalUnionBytesWithdrawalDictAccess,
+    MappingBytesOptionalUnionBytesWithdrawal,
+    MappingBytesOptionalUnionBytesWithdrawalStruct,
+    TrieBytesOptionalUnionBytesWithdrawal,
+    TrieBytesOptionalUnionBytesWithdrawalStruct,
+    OptionalUnionBytesLegacyTransaction,
+    OptionalUnionBytesWithdrawal,
+    UnionBytesWithdrawalEnum,
+    UnionBytesLegacyTransactionEnum,
+    OptionalUnionBytesReceipt,
+    trie_set_TrieBytesOptionalUnionBytesWithdrawal,
+    UnionBytesReceiptEnum,
+    UnionBytesReceipt,
+    TrieBytes32U256Struct,
+)
 from ethereum.cancun.fork_types import (
     Address,
     ListHash32,
@@ -42,6 +92,9 @@ from ethereum.cancun.fork_types import (
     TupleVersionedHash,
     TupleVersionedHashStruct,
     VersionedHash,
+    Bloom,
+    OptionalMappingAddressBytes32,
+    MappingAddressBytes32Struct,
 )
 from ethereum.cancun.state import (
     account_exists_and_is_empty,
@@ -51,6 +104,11 @@ from ethereum.cancun.state import (
     increment_nonce,
     set_account_balance,
     State,
+    TransientStorage,
+    TransientStorageStruct,
+    empty_transient_storage,
+    process_withdrawal,
+    state_root,
 )
 from ethereum.cancun.transactions_types import (
     TX_ACCESS_LIST_ADDRESS_COST,
@@ -60,15 +118,28 @@ from ethereum.cancun.transactions_types import (
     TX_DATA_COST_PER_NON_ZERO,
     TX_DATA_COST_PER_ZERO,
     Transaction,
-    TransactionImpl,
+    get_transaction_type,
+    get_gas,
+    get_r,
+    get_s,
+    get_max_fee_per_gas,
+    get_max_priority_fee_per_gas,
+    get_gas_price,
+    get_nonce,
+    get_value,
     TransactionType,
     TupleAccessList,
+    TupleAccessListStruct,
     To,
     ToStruct,
 )
-from ethereum.cancun.transactions import calculate_intrinsic_cost, validate_transaction
+from ethereum.cancun.transactions import (
+    calculate_intrinsic_cost,
+    validate_transaction,
+    decode_transaction,
+)
 from ethereum.cancun.utils.message import prepare_message
-from ethereum.cancun.vm import Environment, EnvImpl
+from ethereum.cancun.vm import Environment, EnvImpl, EnvironmentStruct
 from ethereum.cancun.vm.exceptions import EthereumException, InvalidBlock
 from ethereum.cancun.vm.gas import (
     calculate_data_fee,
@@ -83,17 +154,19 @@ from ethereum.utils.numeric import (
     divmod,
     min,
     U256_add,
+    U256_sub,
     U256__eq__,
-    U256_from_felt,
+    U256_from_Uint,
     U256_le,
     U256_to_Uint,
     U256_add_with_carry,
 )
 from ethereum.cancun.transactions import recover_sender
+from ethereum.cancun.vm.instructions.block import _append_logs
 from cairo_core.comparison import is_zero
 
-from src.utils.array import count_not_zero
-from src.utils.dict import dict_new_empty, hashdict_write
+from legacy.utils.array import count_not_zero
+from legacy.utils.dict import hashdict_write
 
 const ELASTICITY_MULTIPLIER = 2;
 const BASE_FEE_MAX_CHANGE_DENOMINATOR = 8;
@@ -112,6 +185,24 @@ struct BlockChainStruct {
 struct BlockChain {
     value: BlockChainStruct*,
 }
+
+using Root = Hash32;
+struct ApplyBodyOutput {
+    value: ApplyBodyOutputStruct*,
+}
+
+struct ApplyBodyOutputStruct {
+    block_gas_used: Uint,
+    transactions_root: Root,
+    receipt_root: Root,
+    block_logs_bloom: Bloom,
+    state_root: Root,
+    withdrawals_root: Root,
+    blob_gas_used: Uint,
+}
+
+// Source: <https://eips.ethereum.org/EIPS/eip-4844#specification>
+const MAX_BLOB_GAS_PER_BLOCK = 786432;
 
 func calculate_base_fee_per_gas{range_check_ptr}(
     block_gas_limit: Uint,
@@ -156,7 +247,9 @@ func calculate_base_fee_per_gas{range_check_ptr}(
     return base_fee_per_gas;
 }
 
-func validate_header{range_check_ptr}(header: Header, parent_header: Header) {
+func validate_header{range_check_ptr, bitwise_ptr: BitwiseBuiltin*, keccak_ptr: KeccakBuiltin*}(
+    header: Header, parent_header: Header
+) {
     with_attr error_message("InvalidBlock") {
         assert [range_check_ptr] = header.value.gas_limit.value - header.value.gas_used.value;
         let range_check_ptr = range_check_ptr + 1;
@@ -169,21 +262,28 @@ func validate_header{range_check_ptr}(header: Header, parent_header: Header) {
         );
 
         assert expected_base_fee_per_gas = header.value.base_fee_per_gas;
-        assert [range_check_ptr] = header.value.timestamp.value -
-            parent_header.value.timestamp.value - 1;
-        assert [range_check_ptr + 1] = header.value.number.value -
-            parent_header.value.number.value - 1;
-        assert [range_check_ptr + 2] = 32 - header.value.extra_data.value.len;
-        let range_check_ptr = range_check_ptr + 3;
+
+        let timestamp_invalid = U256_le(header.value.timestamp, parent_header.value.timestamp);
+        assert timestamp_invalid.value = 0;
+
+        let number_is_valid = is_zero(
+            header.value.number.value - parent_header.value.number.value - 1
+        );
+        assert number_is_valid = 1;
+
+        let extra_data_is_valid = is_zero(32 - header.value.extra_data.value.len);
+        assert extra_data_is_valid = 1;
+
         assert header.value.difficulty.value = 0;
+
         assert header.value.nonce.value = 0;
+
         assert header.value.ommers_hash.value.low = EMPTY_OMMER_HASH_LOW;
         assert header.value.ommers_hash.value.high = EMPTY_OMMER_HASH_HIGH;
-    }
 
-    // TODO: Implement block header hash check
-    // let block_parent_hash = keccak256(rlp.encode(parent_header));
-    // assert header.value.parent_hash = block_parent_hash;
+        let parent_block_hash = keccak256_header(parent_header);
+        assert header.value.parent_hash = parent_block_hash;
+    }
     return ();
 }
 
@@ -208,15 +308,6 @@ func check_gas_limit{range_check_ptr}(gas_limit: Uint, parent_gas_limit: Uint) -
 
     tempvar value = bool(TRUE);
     return value;
-}
-
-struct UnionBytesReceiptEnum {
-    bytes: Bytes,
-    receipt: Receipt,
-}
-
-struct UnionBytesReceipt {
-    value: UnionBytesReceiptEnum*,
 }
 
 func make_receipt{range_check_ptr, bitwise_ptr: BitwiseBuiltin*, keccak_ptr: KeccakBuiltin*}(
@@ -302,6 +393,7 @@ func process_transaction{
     local tx_to: To;
     local tx_value: U256;
     local blob_gas_fee: Uint;
+    local access_lists: TupleAccessList;
     if (tx.value.blob_transaction.value != 0) {
         assert tx_gas = tx.value.blob_transaction.value.gas;
         assert tx_data = tx.value.blob_transaction.value.data;
@@ -311,6 +403,7 @@ func process_transaction{
         assert tx_value = tx.value.blob_transaction.value.value;
         let blob_gas_fee_res = calculate_data_fee(env.value.excess_blob_gas, tx);
         assert blob_gas_fee = blob_gas_fee_res;
+        assert access_lists = tx.value.blob_transaction.value.access_list;
         tempvar range_check_ptr = range_check_ptr;
     } else {
         tempvar range_check_ptr = range_check_ptr;
@@ -324,6 +417,7 @@ func process_transaction{
         assert tx_to = tx.value.fee_market_transaction.value.to;
         assert tx_value = tx.value.fee_market_transaction.value.value;
         assert blob_gas_fee = Uint(0);
+        assert access_lists = tx.value.fee_market_transaction.value.access_list;
     }
 
     if (tx.value.legacy_transaction.value != 0) {
@@ -332,6 +426,7 @@ func process_transaction{
         assert tx_to = tx.value.legacy_transaction.value.to;
         assert tx_value = tx.value.legacy_transaction.value.value;
         assert blob_gas_fee = Uint(0);
+        assert access_lists = TupleAccessList(cast(0, TupleAccessListStruct*));
     }
 
     if (tx.value.access_list_transaction.value != 0) {
@@ -340,6 +435,7 @@ func process_transaction{
         assert tx_to = tx.value.access_list_transaction.value.to;
         assert tx_value = tx.value.access_list_transaction.value.value;
         assert blob_gas_fee = Uint(0);
+        assert access_lists = tx.value.access_list_transaction.value.access_list;
     }
 
     let effective_gas_fee = tx_gas.value * env.value.gas_price.value;
@@ -352,24 +448,19 @@ func process_transaction{
     increment_nonce{state=state}(sender);
 
     // Deduct gas fee from sender
-    with_attr error_message("OverflowError") {
-        assert sender_account.value.balance.value.high = 0;  // emulate the cast to Uint
-        assert_le_felt(
-            sender_account.value.balance.value.low, effective_gas_fee + blob_gas_fee.value
-        );
-        let sender_balance_after_gas_fee = sender_account.value.balance.value.low -
-            effective_gas_fee - blob_gas_fee.value;
-        assert [range_check_ptr] = sender_balance_after_gas_fee;
-        let range_check_ptr = range_check_ptr + 1;
-    }
-    tempvar sender_balance_after_gas_fee_u256 = U256(
-        new U256Struct(sender_balance_after_gas_fee, 0)
+    tempvar effective_gas_fee_u256 = U256(new U256Struct(effective_gas_fee, 0));
+    tempvar blob_gas_fee_u256 = U256(new U256Struct(blob_gas_fee.value, 0));
+    let sender_balance_after_gas_fee = U256_sub(
+        sender_account.value.balance, effective_gas_fee_u256
+    );
+    let sender_balance_after_gas_fee_u256 = U256_sub(
+        sender_balance_after_gas_fee, blob_gas_fee_u256
     );
     set_account_balance{state=state}(sender, sender_balance_after_gas_fee_u256);
     EnvImpl.set_state{env=env}(state);
 
     // Create preaccessed addresses and write coinbase
-    let (preaccessed_addresses_ptr) = dict_new_empty();
+    let (preaccessed_addresses_ptr) = default_dict_new(0);
     tempvar preaccessed_addresses_ptr_start = preaccessed_addresses_ptr;
     let address = env.value.coinbase;
     hashdict_write{dict_ptr=preaccessed_addresses_ptr}(1, &address.value, 1);
@@ -380,7 +471,7 @@ func process_transaction{
         ),
     );
     // Create preaccessed storage keys
-    let (preaccessed_storage_keys_ptr) = dict_new_empty();
+    let (preaccessed_storage_keys_ptr) = default_dict_new(0);
     tempvar preaccessed_storage_keys = SetTupleAddressBytes32(
         new SetTupleAddressBytes32Struct(
             dict_ptr_start=cast(preaccessed_storage_keys_ptr, SetTupleAddressBytes32DictAccess*),
@@ -389,11 +480,10 @@ func process_transaction{
     );
 
     if (tx.value.legacy_transaction.value == 0) {
-        let access_list = tx.value.access_list_transaction.value.access_list;
         process_access_list{
             preaccessed_addresses=preaccessed_addresses,
             preaccessed_storage_keys=preaccessed_storage_keys,
-        }(access_list, access_list.value.len, 0);
+        }(access_lists, access_lists.value.len, 0);
         tempvar keccak_ptr = keccak_ptr;
         tempvar bitwise_ptr = bitwise_ptr;
         tempvar poseidon_ptr = poseidon_ptr;
@@ -429,10 +519,13 @@ func process_transaction{
         preaccessed_storage_keys,
     );
     let output = process_message_call{env=env}(message);
+    // Rebind env's state modified in `process_message_call`
+    let state = env.value.state;
 
     // Calculate gas refund
     with_attr error_message("OverflowError") {
         assert output.value.refund_counter.value.high = 0;
+        assert_le_felt(env.value.base_fee_per_gas.value, env.value.gas_price.value);
     }
     let gas_used = tx_gas.value - output.value.gas_left.value;
     let (gas_refund_div_5, _) = divmod(gas_used, 5);
@@ -441,13 +534,15 @@ func process_transaction{
 
     // Calculate priority fee
     let priority_fee_per_gas = env.value.gas_price.value - env.value.base_fee_per_gas.value;
+    // INVARIANT: tx_gas.value - output.value.gas_left.value - gas_refund does not wrap around the prime field
+    assert [range_check_ptr] = tx_gas.value - output.value.gas_left.value - gas_refund;
+    let range_check_ptr = range_check_ptr + 1;
     let transaction_fee = (tx_gas.value - output.value.gas_left.value - gas_refund) *
         priority_fee_per_gas;
 
     // Calculate total gas used
     let total_gas_used = gas_used - gas_refund;
 
-    // Refund gas to sender
     let sender_account = get_account{state=state}(sender);
     let (high, low) = split_felt(gas_refund_amount);
     tempvar gas_refund_amount_u256 = U256(new U256Struct(low, high));
@@ -609,21 +704,21 @@ func check_transaction{
     excess_blob_gas: U64,
 ) -> TupleAddressUintTupleVersionedHash {
     alloc_locals;
-    let gas = TransactionImpl.get_gas(tx);
-    let tx_gas_within_bounds = is_le(gas.value, gas_available.value);
+    let gas = get_gas(tx);
+    let tx_gas_within_bounds = is_le_felt(gas.value, gas_available.value);
     with_attr error_message("InvalidBlock") {
         assert tx_gas_within_bounds = 1;
     }
     let sender_address = recover_sender(chain_id, tx);
     let sender_account = get_account{state=state}(sender_address);
-    let transaction_type = TransactionImpl.get_transaction_type(tx);
+    let transaction_type = get_transaction_type(tx);
     let is_not_blob_or_fee_transaction = (TransactionType.BLOB - transaction_type) * (
         TransactionType.FEE_MARKET - transaction_type
     );
     // Case where transaction is blob or fee transaction
     if (is_not_blob_or_fee_transaction == FALSE) {
-        let max_fee_per_gas = TransactionImpl.get_max_fee_per_gas(tx);
-        let max_priority_fee_per_gas = TransactionImpl.get_max_priority_fee_per_gas(tx);
+        let max_fee_per_gas = get_max_fee_per_gas(tx);
+        let max_priority_fee_per_gas = get_max_priority_fee_per_gas(tx);
         let max_fee_per_gas_valid = is_le(base_fee_per_gas.value, max_fee_per_gas.value);
         let max_priority_fee_per_gas_valid = is_le(
             max_priority_fee_per_gas.value, max_fee_per_gas.value
@@ -638,7 +733,7 @@ func check_transaction{
         tempvar effective_gas_price = Uint(base_fee_per_gas.value + priority_fee_per_gas);
         tempvar max_gas_fee = Uint(gas.value * max_fee_per_gas.value);
     } else {
-        let gas_price = TransactionImpl.get_gas_price(tx);
+        let gas_price = get_gas_price(tx);
         let gas_price_valid = is_le(base_fee_per_gas.value, gas_price.value);
         with_attr error_message("InvalidBlock") {
             assert gas_price_valid = 1;
@@ -662,9 +757,11 @@ func check_transaction{
         let blob_gas_price = calculate_blob_gas_price(excess_blob_gas);
         let max_fee_per_blob_gas_u256 = tx.value.blob_transaction.value.max_fee_per_blob_gas;
         let max_fee_per_blob_gas_uint = U256_to_Uint(max_fee_per_blob_gas_u256);
-        let blob_gas_price_valid = is_le(blob_gas_price.value, max_fee_per_blob_gas_uint.value);
+        let blob_gas_price_invalid = is_le(
+            max_fee_per_blob_gas_uint.value, blob_gas_price.value - 1
+        );
         with_attr error_message("InvalidBlock") {
-            assert blob_gas_price_valid = 1;
+            assert blob_gas_price_invalid = 0;
         }
 
         // Compute total blob gas
@@ -694,7 +791,7 @@ func check_transaction{
 
     // Nonce check
     let sender_account_nonce = sender_account.value.nonce;
-    let tx_nonce = TransactionImpl.get_nonce(tx);
+    let tx_nonce = get_nonce(tx);
     let tx_nonce_uint = U256_to_Uint(tx_nonce);
     with_attr error_message("InvalidBlock") {
         assert tx_nonce_uint.value = sender_account_nonce.value;
@@ -702,8 +799,8 @@ func check_transaction{
 
     // Balance check
     let sender_account_balance = sender_account.value.balance;
-    let tx_value = TransactionImpl.get_value(tx);
-    let max_gas_fee_u256 = U256_from_felt(max_gas_fee.value);
+    let tx_value = get_value(tx);
+    let max_gas_fee_u256 = U256_from_Uint(max_gas_fee);
     let (tx_total_spent, carry) = U256_add_with_carry(tx_value, max_gas_fee_u256);
     with_attr error_message("InvalidBlock") {
         assert carry = 0;
@@ -742,7 +839,7 @@ func _check_versioned_hashes_version{range_check_ptr}(
     let range_check_ptr = [ap - 1];
     let versioned_hash = versioned_hashes[index - 1];
     // Since versioned_hash are hash32 which are little endian, we need to check that the least significant byte is 0x01
-    let (first_byte, _) = divmod(versioned_hash.value.low, 2 ** 120);
+    let (_, first_byte) = divmod(versioned_hash.value.low, 256);
     with_attr error_message("InvalidBlock") {
         assert first_byte = VERSIONED_HASH_VERSION_KZG;
     }
@@ -829,4 +926,370 @@ func keccak256_header{range_check_ptr, bitwise_ptr: BitwiseBuiltin*, keccak_ptr:
 
     // Then compute keccak256 of the encoded bytes
     return keccak256(encoded_header);
+}
+
+func apply_body{
+    range_check_ptr,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
+    bitwise_ptr: BitwiseBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
+    state: State,
+}(
+    block_hashes: ListHash32,
+    coinbase: Address,
+    block_number: Uint,
+    base_fee_per_gas: Uint,
+    block_gas_limit: Uint,
+    block_time: U256,
+    prev_randao: Bytes32,
+    transactions: TupleUnionBytesLegacyTransaction,
+    chain_id: U64,
+    withdrawals: TupleWithdrawal,
+    parent_beacon_block_root: Root,
+    excess_blob_gas: U64,
+) -> ApplyBodyOutput {
+    alloc_locals;
+
+    tempvar blob_gas_used = Uint(0);
+    let gas_available = block_gas_limit;
+
+    let (transaction_ptr) = default_dict_new(0);
+    tempvar transactions_trie_data = MappingBytesOptionalUnionBytesLegacyTransaction(
+        new MappingBytesOptionalUnionBytesLegacyTransactionStruct(
+            dict_ptr_start=cast(
+                transaction_ptr, BytesOptionalUnionBytesLegacyTransactionDictAccess*
+            ),
+            dict_ptr=cast(transaction_ptr, BytesOptionalUnionBytesLegacyTransactionDictAccess*),
+            parent_dict=cast(0, MappingBytesOptionalUnionBytesLegacyTransactionStruct*),
+        ),
+    );
+    tempvar transactions_trie = TrieBytesOptionalUnionBytesLegacyTransaction(
+        new TrieBytesOptionalUnionBytesLegacyTransactionStruct(
+            secured=bool(0),
+            default=OptionalUnionBytesLegacyTransaction(cast(0, UnionBytesLegacyTransactionEnum*)),
+            _data=transactions_trie_data,
+        ),
+    );
+
+    let (receipt_ptr) = default_dict_new(0);
+    tempvar receipts_trie_data = MappingBytesOptionalUnionBytesReceipt(
+        new MappingBytesOptionalUnionBytesReceiptStruct(
+            dict_ptr_start=cast(receipt_ptr, BytesOptionalUnionBytesReceiptDictAccess*),
+            dict_ptr=cast(receipt_ptr, BytesOptionalUnionBytesReceiptDictAccess*),
+            parent_dict=cast(0, MappingBytesOptionalUnionBytesReceiptStruct*),
+        ),
+    );
+    tempvar receipts_trie = TrieBytesOptionalUnionBytesReceipt(
+        new TrieBytesOptionalUnionBytesReceiptStruct(
+            secured=bool(0),
+            default=OptionalUnionBytesReceipt(cast(0, UnionBytesReceiptEnum*)),
+            _data=receipts_trie_data,
+        ),
+    );
+
+    let (withdrawals_ptr) = default_dict_new(0);
+    tempvar withdrawals_trie_data = MappingBytesOptionalUnionBytesWithdrawal(
+        new MappingBytesOptionalUnionBytesWithdrawalStruct(
+            dict_ptr_start=cast(withdrawals_ptr, BytesOptionalUnionBytesWithdrawalDictAccess*),
+            dict_ptr=cast(withdrawals_ptr, BytesOptionalUnionBytesWithdrawalDictAccess*),
+            parent_dict=cast(0, MappingBytesOptionalUnionBytesWithdrawalStruct*),
+        ),
+    );
+    tempvar withdrawals_trie = TrieBytesOptionalUnionBytesWithdrawal(
+        new TrieBytesOptionalUnionBytesWithdrawalStruct(
+            secured=bool(0),
+            default=OptionalUnionBytesWithdrawal(cast(0, UnionBytesWithdrawalEnum*)),
+            _data=withdrawals_trie_data,
+        ),
+    );
+
+    let (logs: Log*) = alloc();
+    tempvar block_logs = TupleLog(new TupleLogStruct(data=logs, len=0));
+
+    // TODO: Implement System message call
+    // beacon_block_roots_contract_code = get_account(
+    //     state, BEACON_ROOTS_ADDRESS
+    // ).code
+
+    // system_tx_message = Message(
+    //     caller=SYSTEM_ADDRESS,
+    //     target=BEACON_ROOTS_ADDRESS,
+    //     gas=SYSTEM_TRANSACTION_GAS,
+    //     value=U256(0),
+    //     data=parent_beacon_block_root,
+    //     code=beacon_block_roots_contract_code,
+    //     depth=Uint(0),
+    //     current_target=BEACON_ROOTS_ADDRESS,
+    //     code_address=BEACON_ROOTS_ADDRESS,
+    //     should_transfer_value=False,
+    //     is_static=False,
+    //     accessed_addresses=set(),
+    //     accessed_storage_keys=set(),
+    //     parent_evm=None,
+    // )
+
+    // system_tx_env = vm.Environment(
+    //     caller=SYSTEM_ADDRESS,
+    //     origin=SYSTEM_ADDRESS,
+    //     block_hashes=block_hashes,
+    //     coinbase=coinbase,
+    //     number=block_number,
+    //     gas_limit=block_gas_limit,
+    //     base_fee_per_gas=base_fee_per_gas,
+    //     gas_price=base_fee_per_gas,
+    //     time=block_time,
+    //     prev_randao=prev_randao,
+    //     state=state,
+    //     chain_id=chain_id,
+    //     traces=[],
+    //     excess_blob_gas=excess_blob_gas,
+    //     blob_versioned_hashes=(),
+    //     transient_storage=TransientStorage(),
+    // )
+
+    // system_tx_output = process_message_call(system_tx_message, system_tx_env)
+
+    // destroy_touched_empty_accounts(
+    //     system_tx_env.state, system_tx_output.touched_accounts
+    // )
+
+    let (blob_gas_used, gas_available, block_logs) = _apply_body_inner{
+        state=state, transactions_trie=transactions_trie, receipts_trie=receipts_trie
+    }(
+        0,
+        transactions.value.len,
+        transactions,
+        gas_available,
+        chain_id,
+        base_fee_per_gas,
+        excess_blob_gas,
+        block_logs,
+        block_hashes,
+        coinbase,
+        block_number,
+        block_gas_limit,
+        block_time,
+        prev_randao,
+        blob_gas_used,
+    );
+
+    tempvar block_gas_used = Uint(block_gas_limit.value - gas_available.value);
+    let block_logs_bloom = logs_bloom(block_logs);
+
+    _process_withdrawals_inner{state=state, trie=withdrawals_trie}(0, withdrawals);
+
+    // Compute all roots
+    tempvar transaction_eth_trie = EthereumTries(
+        new EthereumTriesEnum(
+            account=TrieAddressOptionalAccount(cast(0, TrieAddressOptionalAccountStruct*)),
+            storage=TrieBytes32U256(cast(0, TrieBytes32U256Struct*)),
+            transaction=transactions_trie,
+            receipt=TrieBytesOptionalUnionBytesReceipt(
+                cast(0, TrieBytesOptionalUnionBytesReceiptStruct*)
+            ),
+            withdrawal=TrieBytesOptionalUnionBytesWithdrawal(
+                cast(0, TrieBytesOptionalUnionBytesWithdrawalStruct*)
+            ),
+        ),
+    );
+    let none_storage_roots = OptionalMappingAddressBytes32(cast(0, MappingAddressBytes32Struct*));
+    let transactions_root = root(transaction_eth_trie, none_storage_roots);
+
+    tempvar receipt_eth_trie = EthereumTries(
+        new EthereumTriesEnum(
+            account=TrieAddressOptionalAccount(cast(0, TrieAddressOptionalAccountStruct*)),
+            storage=TrieBytes32U256(cast(0, TrieBytes32U256Struct*)),
+            transaction=TrieBytesOptionalUnionBytesLegacyTransaction(
+                cast(0, TrieBytesOptionalUnionBytesLegacyTransactionStruct*)
+            ),
+            receipt=receipts_trie,
+            withdrawal=TrieBytesOptionalUnionBytesWithdrawal(
+                cast(0, TrieBytesOptionalUnionBytesWithdrawalStruct*)
+            ),
+        ),
+    );
+    let receipts_root = root(receipt_eth_trie, none_storage_roots);
+
+    tempvar withdrawals_eth_trie = EthereumTries(
+        new EthereumTriesEnum(
+            account=TrieAddressOptionalAccount(cast(0, TrieAddressOptionalAccountStruct*)),
+            storage=TrieBytes32U256(cast(0, TrieBytes32U256Struct*)),
+            transaction=TrieBytesOptionalUnionBytesLegacyTransaction(
+                cast(0, TrieBytesOptionalUnionBytesLegacyTransactionStruct*)
+            ),
+            receipt=TrieBytesOptionalUnionBytesReceipt(
+                cast(0, TrieBytesOptionalUnionBytesReceiptStruct*)
+            ),
+            withdrawal=withdrawals_trie,
+        ),
+    );
+    let withdrawals_root = root(withdrawals_eth_trie, none_storage_roots);
+
+    let state_root_ = state_root(state);
+
+    tempvar output = ApplyBodyOutput(
+        new ApplyBodyOutputStruct(
+            block_gas_used=block_gas_used,
+            transactions_root=transactions_root,
+            receipt_root=receipts_root,
+            block_logs_bloom=block_logs_bloom,
+            state_root=state_root_,
+            withdrawals_root=withdrawals_root,
+            blob_gas_used=blob_gas_used,
+        ),
+    );
+    return output;
+}
+
+func _apply_body_inner{
+    range_check_ptr,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
+    bitwise_ptr: BitwiseBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
+    state: State,
+    transactions_trie: TrieBytesOptionalUnionBytesLegacyTransaction,
+    receipts_trie: TrieBytesOptionalUnionBytesReceipt,
+}(
+    index: felt,
+    len: felt,
+    transactions: TupleUnionBytesLegacyTransaction,
+    gas_available: Uint,
+    chain_id: U64,
+    base_fee_per_gas: Uint,
+    excess_blob_gas: U64,
+    block_logs: TupleLog,
+    block_hashes: ListHash32,
+    coinbase: Address,
+    block_number: Uint,
+    block_gas_limit: Uint,
+    block_time: U256,
+    prev_randao: Bytes32,
+    blob_gas_used: Uint,
+) -> (blob_gas_used: Uint, gas_available: Uint, block_logs: TupleLog) {
+    alloc_locals;
+    if (index == len) {
+        return (blob_gas_used, gas_available, block_logs);
+    }
+
+    let encoded_tx = transactions.value.data[index];
+    let tx = decode_transaction(encoded_tx);
+    let encoded_index = encode_uint(Uint(index));
+
+    trie_set_TrieBytesOptionalUnionBytesLegacyTransaction{trie=transactions_trie}(
+        encoded_index, OptionalUnionBytesLegacyTransaction(encoded_tx.value)
+    );
+
+    let tuple_address_uint_tuple_versioned_hash = check_transaction{state=state}(
+        tx, gas_available, chain_id, base_fee_per_gas, excess_blob_gas
+    );
+    let sender_address = tuple_address_uint_tuple_versioned_hash.value.address;
+    let effective_gas_price = tuple_address_uint_tuple_versioned_hash.value.uint;
+    let blob_versioned_hashes = tuple_address_uint_tuple_versioned_hash.value.tuple_versioned_hash;
+
+    let transient_storage = empty_transient_storage();
+
+    tempvar env = Environment(
+        new EnvironmentStruct(
+            caller=sender_address,
+            block_hashes=block_hashes,
+            origin=sender_address,
+            coinbase=coinbase,
+            number=block_number,
+            base_fee_per_gas=base_fee_per_gas,
+            gas_limit=block_gas_limit,
+            gas_price=effective_gas_price,
+            time=block_time,
+            prev_randao=prev_randao,
+            state=state,
+            chain_id=chain_id,
+            excess_blob_gas=excess_blob_gas,
+            blob_versioned_hashes=blob_versioned_hashes,
+            transient_storage=transient_storage,
+        ),
+    );
+
+    let (gas_used, logs, error) = process_transaction{env=env}(tx);
+    tempvar state = env.value.state;
+
+    // Safe because gas_used <= gas_available
+    tempvar gas_available = Uint(gas_available.value - gas_used.value);
+
+    tempvar receipt_gas = Uint(block_gas_limit.value - gas_available.value);
+    let receipt = make_receipt(tx, error, receipt_gas, logs);
+
+    trie_set_TrieBytesOptionalUnionBytesReceipt{trie=receipts_trie}(
+        encoded_index, OptionalUnionBytesReceipt(receipt.value)
+    );
+
+    let new_logs = receipt.value.receipt.value.logs;
+    _append_logs{logs=block_logs}(new_logs);
+    let tx_blob_gas = calculate_total_blob_gas(tx);
+    tempvar blob_gas_used = Uint(blob_gas_used.value + tx_blob_gas.value);
+
+    let blob_gas_within_bounds = is_le_felt(blob_gas_used.value, MAX_BLOB_GAS_PER_BLOCK);
+    with_attr error_message("InvalidBlock") {
+        assert blob_gas_within_bounds = 1;
+    }
+
+    return _apply_body_inner{
+        state=state, transactions_trie=transactions_trie, receipts_trie=receipts_trie
+    }(
+        index + 1,
+        len,
+        transactions,
+        gas_available,
+        chain_id,
+        base_fee_per_gas,
+        excess_blob_gas,
+        block_logs,
+        block_hashes,
+        coinbase,
+        block_number,
+        block_gas_limit,
+        block_time,
+        prev_randao,
+        blob_gas_used,
+    );
+}
+
+func _process_withdrawals_inner{
+    range_check_ptr,
+    poseidon_ptr: PoseidonBuiltin*,
+    state: State,
+    trie: TrieBytesOptionalUnionBytesWithdrawal,
+}(index: felt, withdrawals: TupleWithdrawal) {
+    alloc_locals;
+    if (index == withdrawals.value.len) {
+        return ();
+    }
+
+    let withdrawal = withdrawals.value.data[index];
+    let index_bytes = encode_uint(Uint(index));
+    let withdrawal_bytes = encode_withdrawal(withdrawal);
+    tempvar value = OptionalUnionBytesWithdrawal(
+        new UnionBytesWithdrawalEnum(
+            bytes=withdrawal_bytes, withdrawal=Withdrawal(cast(0, WithdrawalStruct*))
+        ),
+    );
+    trie_set_TrieBytesOptionalUnionBytesWithdrawal{trie=trie}(index_bytes, value);
+
+    process_withdrawal{state=state}(withdrawal);
+
+    let cond = account_exists_and_is_empty(withdrawal.value.address);
+    if (cond.value != 0) {
+        destroy_account{poseidon_ptr=poseidon_ptr, state=state}(withdrawal.value.address);
+        tempvar state = state;
+        tempvar poseidon_ptr = poseidon_ptr;
+    } else {
+        tempvar state = state;
+        tempvar poseidon_ptr = poseidon_ptr;
+    }
+
+    return _process_withdrawals_inner{state=state, trie=trie}(index + 1, withdrawals);
 }

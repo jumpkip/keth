@@ -2,7 +2,7 @@
 
 from starkware.cairo.common.alloc import alloc
 from starkware.cairo.common.bool import FALSE, TRUE
-from starkware.cairo.common.dict import DictAccess, dict_read, dict_write
+from starkware.cairo.common.dict import DictAccess
 from starkware.cairo.common.memset import memset
 from starkware.cairo.common.memcpy import memcpy
 from starkware.cairo.lang.compiler.lib.registers import get_fp_and_pc
@@ -12,7 +12,8 @@ from starkware.cairo.common.math_cmp import is_le, is_not_zero
 from ethereum_types.bytes import Bytes, BytesStruct, Bytes1DictAccess
 from ethereum_types.numeric import U256, Uint
 from ethereum.utils.numeric import max
-from src.utils.bytes import uint256_to_bytes32
+from legacy.utils.bytes import uint256_to_bytes32
+from legacy.utils.dict import dict_read, dict_write
 
 struct MemoryStruct {
     dict_ptr_start: Bytes1DictAccess*,
@@ -35,7 +36,7 @@ func memory_write{range_check_ptr, memory: Memory}(start_position: U256, value: 
     let start_position_felt = start_position.value.low;
 
     // Early return if nothing to write
-    if (value.value.len == 0) {
+    if (bytes_len == 0) {
         return ();
     }
 
@@ -132,7 +133,7 @@ func buffer_read{range_check_ptr}(buffer: Bytes, start_position: U256, size: U25
     return result;
 }
 
-// @notice Internal function to expand memory by a given amount.
+// @notice Expand memory by a given amount.
 // @param memory The pointer to the bytearray.
 // @param expansion The amount to expand by.
 func expand_by{memory: Memory}(expansion: Uint) {
@@ -145,14 +146,11 @@ func expand_by{memory: Memory}(expansion: Uint) {
 }
 
 // @notice Internal function to write bytes to memory.
+// @dev Length was checked to not be 0 in the caller.
 // @param start_position Starting position to write at.
 // @param data Pointer to the bytes data.
 // @param len Length of bytes to write.
 func _write_bytes{dict_ptr: DictAccess*}(start_position: felt, data: felt*, len: felt) {
-    if (len == 0) {
-        return ();
-    }
-
     tempvar index = len;
     tempvar dict_ptr = dict_ptr;
 
@@ -173,14 +171,12 @@ func _write_bytes{dict_ptr: DictAccess*}(start_position: felt, data: felt*, len:
 }
 
 // @notice Internal function to read bytes from memory.
+// @dev Size was checked to not be 0 in the caller.
 // @param start_position Starting position to read from.
 // @param size Number of bytes to read.
 // @param output Pointer to write output bytes to.
 func _read_bytes{dict_ptr: DictAccess*}(start_position: felt, size: felt, output: felt*) {
     alloc_locals;
-    if (size == 0) {
-        return ();
-    }
 
     tempvar dict_index = start_position + size;
     tempvar dict_ptr = dict_ptr;
@@ -203,6 +199,7 @@ func _read_bytes{dict_ptr: DictAccess*}(start_position: felt, size: felt, output
 }
 
 // @notice Internal function to read bytes from a buffer with zero padding.
+// @dev Size was checked to not be 0 in the caller.
 // @param data_len Length of the buffer.
 // @param data Pointer to the buffer data.
 // @param start_position Starting position to read from.
@@ -212,9 +209,6 @@ func _buffer_read{range_check_ptr}(
     data_len: felt, data: felt*, start_position: felt, size: felt, output: felt*
 ) {
     alloc_locals;
-    if (size == 0) {
-        return ();
-    }
 
     // Check if start position is beyond buffer length
     let start_oob = is_le(data_len, start_position);

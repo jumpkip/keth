@@ -7,7 +7,12 @@ from cairo_addons.hints.decorator import register_hint
 
 
 @register_hint
-def decompose_scalar_to_neg3_base(ids: VmConsts):
+def decompose_scalar_to_neg3_base(
+    ids: VmConsts,
+    memory: MemoryDict,
+    ap: RelocatableValue,
+    segments: MemorySegmentManager,
+):
     from garaga.hints.neg_3 import neg_3_base_le
 
     assert 0 <= ids.scalar < 2**128
@@ -15,7 +20,9 @@ def decompose_scalar_to_neg3_base(ids: VmConsts):
     digits = digits + [0] * (82 - len(digits))
     # ruff: noqa: F821
     # ruff: noqa: F841
-    i = 1  # Loop init
+    segments.write_arg(ids.digits, digits)
+    ids.d0 = digits[0]
+    i = memory[ap] = 1  # Loop init
 
 
 @register_hint
@@ -59,10 +66,11 @@ def compute_y_from_x_hint(ids: VmConsts, segments: MemorySegmentManager):
     p = uint384_to_int(ids.p.d0, ids.p.d1, ids.p.d2, ids.p.d3)
     g = uint384_to_int(ids.g.d0, ids.g.d1, ids.g.d2, ids.g.d3)
     x = uint384_to_int(ids.x.d0, ids.x.d1, ids.x.d2, ids.x.d3)
+
     rhs = (x**3 + a * x + b) % p
 
-    ids.is_on_curve = is_quad_residue(rhs, p)
-    if ids.is_on_curve == 1:
+    is_on_curve = is_quad_residue(rhs, p)
+    if is_on_curve == 1:
         square_root = sqrt_mod(rhs, p)
         if ids.v % 2 == square_root % 2:
             pass
@@ -72,63 +80,115 @@ def compute_y_from_x_hint(ids: VmConsts, segments: MemorySegmentManager):
         square_root = sqrt_mod(rhs * g, p)
 
     segments.load_data(ids.y_try.address_, int_to_uint384(square_root))
+    segments.load_data(ids.is_on_curve.address_, int_to_uint384(is_on_curve))
 
 
 @register_hint
 def build_msm_hints_and_fill_memory(ids: VmConsts, memory: MemoryDict):
     """
-    Builds MSM hints and fills memory with curve point data for SECP256K1.
+    Builds Multi-Scalar Multiplication (MSM) hints and fills memory with SECP256K1 curve point data.
+
+    This function:
+    1. Constructs curve points and scalars for SECP256K1
+    2. Serializes the data using MSMCalldataBuilder
+    3. Processes the calldata into two parts: points and RLC sum components
+    4. Fills the memory with the processed data
     """
-    from garaga.definitions import CurveID, G1Point
-    from garaga.hints.io import bigint_pack, bigint_split
+    from garaga.definitions import BASE, N_LIMBS, CurveID, G1Point
+    from garaga.hints.io import bigint_pack, fill_felt_ptr
     from garaga.starknet.tests_and_calldata_generators.msm import MSMCalldataBuilder
 
+    # Initialize curve points and scalars
     curve_id = CurveID.SECP256K1
     r_point = (
-        bigint_pack(ids.r_point.x, 4, 2**96),
-        bigint_pack(ids.r_point.y, 4, 2**96),
+        bigint_pack(ids.r_point.x, N_LIMBS, BASE),
+        bigint_pack(ids.r_point.y, N_LIMBS, BASE),
     )
-    points = [G1Point.get_nG(curve_id, 1), G1Point(r_point[0], r_point[1], curve_id)]
+    points = [
+        G1Point.get_nG(curve_id, 1),  # Generator point
+        G1Point(r_point[0], r_point[1], curve_id),  # Signature point
+    ]
     scalars = [ids.u1.low + 2**128 * ids.u1.high, ids.u2.low + 2**128 * ids.u2.high]
+
+    # Generate and process calldata
     builder = MSMCalldataBuilder(curve_id, points, scalars)
-    (msm_hint, derive_point_from_x_hint) = builder.build_msm_hints()
-    Q_low, Q_high, Q_high_shifted, RLCSumDlogDiv = msm_hint.elmts
+    calldata = builder.serialize_to_calldata(
+        include_digits_decomposition=False,
+        include_points_and_scalars=False,
+        serialize_as_pure_felt252_array=False,
+        use_rust=True,
+    )[1:]
 
-    def fill_elmt_at_index(
-        x, ptr: object, memory: object, index: int, static_offset: int = 0
-    ):
-        limbs = bigint_split(x, 4, 2**96)
-        for i in range(4):
-            memory[ptr + index * 4 + i + static_offset] = limbs[i]
+    # Split calldata into points and remaining data
+    points_offset = 3 * 2 * N_LIMBS  # 3 points × 2 coordinates × N_LIMBS
+    Q_low_high_high_shifted = calldata[:points_offset]
+    calldata_rest = calldata[points_offset:]
 
-    def fill_elmts_at_index(
-        x,
-        ptr: object,
-        memory: object,
-        index: int,
-        static_offset: int = 0,
-    ):
-        for i in range(len(x)):
-            fill_elmt_at_index(x[i], ptr + i * 4, memory, index, static_offset)
+    # Process RLC sum dlog div components
+    rlc_components = []
+    for _ in range(4):
+        array_len = calldata_rest.pop(0)
+        array = calldata_rest[: array_len * N_LIMBS]
+        rlc_components.extend(array)
+        calldata_rest = calldata_rest[array_len * N_LIMBS :]
 
-    rlc_sum_dlog_div_coeffs = (
-        RLCSumDlogDiv.a_num
-        + RLCSumDlogDiv.a_den
-        + RLCSumDlogDiv.b_num
-        + RLCSumDlogDiv.b_den
-    )
+    # Verify RLC components length
+    expected_len = (18 + 4 * 2) * N_LIMBS
     assert (
-        len(rlc_sum_dlog_div_coeffs) == 18 + 4 * 2
-    ), f"len(rlc_sum_dlog_div_coeffs) == {len(rlc_sum_dlog_div_coeffs)} != {18 + 4*2}"
+        len(rlc_components) == expected_len
+    ), f"Invalid RLC components length: {len(rlc_components)}"
 
-    offset = 4
-    fill_elmts_at_index(
-        rlc_sum_dlog_div_coeffs, ids.range_check96_ptr, memory, 4, offset
+    # Fill memory with processed data
+    memory_offset = 4
+    fill_felt_ptr(
+        rlc_components, memory, ids.range_check96_ptr + 4 * N_LIMBS + memory_offset
+    )
+    fill_felt_ptr(
+        Q_low_high_high_shifted,
+        memory,
+        ids.range_check96_ptr + 50 * N_LIMBS + memory_offset,
     )
 
-    fill_elmt_at_index(Q_low[0], ids.range_check96_ptr, memory, 50, offset)
-    fill_elmt_at_index(Q_low[1], ids.range_check96_ptr, memory, 51, offset)
-    fill_elmt_at_index(Q_high[0], ids.range_check96_ptr, memory, 52, offset)
-    fill_elmt_at_index(Q_high[1], ids.range_check96_ptr, memory, 53, offset)
-    fill_elmt_at_index(Q_high_shifted[0], ids.range_check96_ptr, memory, 54, offset)
-    fill_elmt_at_index(Q_high_shifted[1], ids.range_check96_ptr, memory, 55, offset)
+
+@register_hint
+def fill_add_mod_mul_mod_builtin_batch_one(
+    ids: VmConsts, memory: MemoryDict, builtin_runners: dict
+):
+    from starkware.cairo.lang.builtins.modulo.mod_builtin_runner import ModBuiltinRunner
+
+    assert builtin_runners["add_mod_builtin"].instance_def.batch_size == 1
+    assert builtin_runners["mul_mod_builtin"].instance_def.batch_size == 1
+
+    add_mod = None
+    try:
+        add_mod = (ids.add_mod_ptr.address_, builtin_runners["add_mod_builtin"], 1)
+    except Exception:
+        add_mod = None
+
+    mul_mod = None
+    try:
+        mul_mod = (ids.mul_mod_ptr.address_, builtin_runners["mul_mod_builtin"], 1)
+    except Exception:
+        mul_mod = None
+
+    ModBuiltinRunner.fill_memory(
+        memory=memory,
+        add_mod=add_mod,
+        mul_mod=mul_mod,
+    )
+
+
+@register_hint
+def fill_add_mod_mul_mod_builtin_batch_117_108(
+    ids: VmConsts, memory: MemoryDict, builtin_runners: dict
+):
+    from starkware.cairo.lang.builtins.modulo.mod_builtin_runner import ModBuiltinRunner
+
+    assert builtin_runners["add_mod_builtin"].instance_def.batch_size == 1
+    assert builtin_runners["mul_mod_builtin"].instance_def.batch_size == 1
+
+    ModBuiltinRunner.fill_memory(
+        memory=memory,
+        add_mod=(ids.add_mod_ptr.address_, builtin_runners["add_mod_builtin"], 117),
+        mul_mod=(ids.mul_mod_ptr.address_, builtin_runners["mul_mod_builtin"], 108),
+    )

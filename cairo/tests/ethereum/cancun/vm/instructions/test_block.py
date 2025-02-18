@@ -1,3 +1,8 @@
+from typing import Tuple
+
+from ethereum.cancun.blocks import Log
+from ethereum.cancun.state import TransientStorage
+from ethereum.cancun.vm import Environment, Evm
 from ethereum.cancun.vm.instructions.block import (
     block_hash,
     chain_id,
@@ -12,8 +17,7 @@ from ethereum_types.numeric import U64, Uint
 from hypothesis import given
 from hypothesis import strategies as st
 
-from tests.utils.args_gen import Environment, Evm, TransientStorage
-from tests.utils.errors import strict_raises
+from cairo_addons.testing.errors import strict_raises
 from tests.utils.evm_builder import EvmBuilder, address_zero
 from tests.utils.strategies import (
     BLOCK_HASHES_LIST,
@@ -151,3 +155,19 @@ class TestBlock:
 
         chain_id(evm)
         assert evm == cairo_result
+
+
+class TestUtils:
+    @given(logs=..., new_logs=...)
+    def test_append_logs(
+        self, cairo_run, logs: Tuple[Log, ...], new_logs: Tuple[Log, ...]
+    ):
+        try:
+            cairo_result = cairo_run("_append_logs", logs, new_logs)
+        except EthereumException as cairo_error:
+            with strict_raises(type(cairo_error)):
+                logs += new_logs
+            return
+
+        logs += new_logs
+        assert logs == cairo_result

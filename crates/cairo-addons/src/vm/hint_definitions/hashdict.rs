@@ -29,7 +29,6 @@ use crate::vm::hints::Hint;
 
 pub const HINTS: &[fn() -> Hint] = &[
     hashdict_read,
-    hashdict_get,
     hashdict_write,
     hashdict_read_from_key,
     get_preimage_for_key,
@@ -50,8 +49,8 @@ pub fn hashdict_read() -> Hint {
             // Get dictionary pointer and setup tracker
             let dict_ptr = get_ptr_from_var_name("dict_ptr", vm, ids_data, ap_tracking)?;
             let dict_manager_ref = exec_scopes.get_dict_manager()?;
-            let mut dict = dict_manager_ref.borrow_mut();
-            let tracker = dict.get_tracker_mut(dict_ptr)?;
+            let mut dict_manager = dict_manager_ref.borrow_mut();
+            let tracker = dict_manager.get_tracker_mut(dict_ptr)?;
             tracker.current_ptr.offset += DICT_ACCESS_SIZE;
 
             let key = get_ptr_from_var_name("key", vm, ids_data, ap_tracking)?;
@@ -66,40 +65,11 @@ pub fn hashdict_read() -> Hint {
 
             tracker.get_value(&dict_key).and_then(|value| {
                 insert_value_from_var_name("value", value.clone(), vm, ids_data, ap_tracking)
-            })
-        },
-    )
-}
+            })?;
 
-/// Same as above, but returns 0 if the key is not found and the dict is NOT a defaultdict.
-pub fn hashdict_get() -> Hint {
-    Hint::new(
-        String::from("hashdict_get"),
-        |vm: &mut VirtualMachine,
-         exec_scopes: &mut ExecutionScopes,
-         ids_data: &HashMap<String, HintReference>,
-         ap_tracking: &ApTracking,
-         _constants: &HashMap<String, Felt252>|
-         -> Result<(), HintError> {
-            // Get dictionary pointer and setup tracker
-            let dict_ptr = get_ptr_from_var_name("dict_ptr", vm, ids_data, ap_tracking)?;
-            let dict_manager_ref = exec_scopes.get_dict_manager()?;
-            let mut dict = dict_manager_ref.borrow_mut();
-            let tracker = dict.get_tracker_mut(dict_ptr)?;
-            tracker.current_ptr.offset += DICT_ACCESS_SIZE;
-
-            let key = get_ptr_from_var_name("key", vm, ids_data, ap_tracking)?;
-            let key_len_felt: Felt252 =
-                get_integer_from_var_name("key_len", vm, ids_data, ap_tracking)?;
-            let key_len: usize = key_len_felt
-                .try_into()
-                .map_err(|_| MathError::Felt252ToUsizeConversion(Box::new(key_len_felt)))?;
-
-            // Build and process compound key
-            let dict_key = build_compound_key(vm, &key, key_len)?;
-            let default_value = MaybeRelocatable::Int(0.into());
-            let prev_value = tracker.get_value(&dict_key).unwrap_or(&default_value);
-            insert_value_from_var_name("value", prev_value.clone(), vm, ids_data, ap_tracking)
+            let hashed_key = compute_hash_key(&dict_key, key_len);
+            dict_manager.preimages.insert(hashed_key.into(), dict_key);
+            Ok(())
         },
     )
 }
@@ -116,8 +86,8 @@ pub fn hashdict_write() -> Hint {
             // Get dictionary pointer and setup tracker
             let dict_ptr = get_ptr_from_var_name("dict_ptr", vm, ids_data, ap_tracking)?;
             let dict_manager_ref = exec_scopes.get_dict_manager()?;
-            let mut dict = dict_manager_ref.borrow_mut();
-            let tracker = dict.get_tracker_mut(dict_ptr)?;
+            let mut dict_manager = dict_manager_ref.borrow_mut();
+            let tracker = dict_manager.get_tracker_mut(dict_ptr)?;
             tracker.current_ptr.offset += DICT_ACCESS_SIZE;
 
             let key = get_ptr_from_var_name("key", vm, ids_data, ap_tracking)?;
@@ -134,12 +104,15 @@ pub fn hashdict_write() -> Hint {
             let dict_ptr_prev_value = (dict_ptr + 1_i32)?;
 
             // Update tracker and memory
-            let tracker_dict = tracker.get_dictionary_ref();
-            let prev_value =
-                tracker_dict.get(&dict_key).cloned().unwrap_or(MaybeRelocatable::Int(0.into()));
+            tracker.get_value(&dict_key).cloned().and_then(|value| {
+                vm.insert_value(dict_ptr_prev_value, value).map_err(|_| {
+                    HintError::Memory(MemoryError::UnknownMemoryCell(Box::new(dict_ptr_prev_value)))
+                })
+            })?;
             tracker.insert_value(&dict_key, &new_value);
-            vm.insert_value(dict_ptr_prev_value, prev_value)?;
 
+            let hashed_key = compute_hash_key(&dict_key, key_len);
+            dict_manager.preimages.insert(hashed_key.into(), dict_key);
             Ok(())
         },
     )
@@ -250,14 +223,16 @@ pub fn hashdict_read_from_key() -> Hint {
             // Get dictionary tracker
             let dict_ptr = get_ptr_from_var_name("dict_ptr_stop", vm, ids_data, ap_tracking)?;
             let dict_manager_ref = exec_scopes.get_dict_manager()?;
-            let mut dict = dict_manager_ref.borrow_mut();
-            let tracker = dict.get_tracker_mut(dict_ptr)?;
+            let mut dict_manager = dict_manager_ref.borrow_mut();
+            let preimages = &dict_manager.preimages.clone();
+            let tracker = dict_manager.get_tracker_mut(dict_ptr)?;
 
             // Find matching preimage and get its value. This hint can also be called on non-hashed
             // keys.
             let simple_key = DictKey::Simple(hashed_key.into());
-            let preimage =
-                _get_preimage_for_hashed_key(hashed_key, tracker).unwrap_or(&simple_key).clone();
+            let preimage = _get_preimage_for_hashed_key(hashed_key.into(), preimages)
+                .unwrap_or(&simple_key)
+                .clone();
             let value = tracker
                 .get_value(&preimage)
                 .map_err(|_| {
@@ -286,13 +261,12 @@ pub fn get_preimage_for_key() -> Hint {
             let hashed_key = get_integer_from_var_name("key", vm, ids_data, ap_tracking)?;
 
             // Get dictionary tracker
-            let dict_ptr = get_ptr_from_var_name("dict_ptr_stop", vm, ids_data, ap_tracking)?;
             let dict_manager_ref = exec_scopes.get_dict_manager()?;
-            let dict = dict_manager_ref.borrow();
-            let tracker = dict.get_tracker(dict_ptr)?;
+            let dict_manager = dict_manager_ref.borrow();
+            let preimages = &dict_manager.preimages;
 
             // Find matching preimage
-            let preimage = _get_preimage_for_hashed_key(hashed_key, tracker)?;
+            let preimage = _get_preimage_for_hashed_key(hashed_key.into(), preimages)?;
 
             // Write preimage data to memory
             let preimage_data_ptr =
@@ -330,13 +304,14 @@ pub fn copy_hashdict_tracker_entry() -> Hint {
                 get_ptr_from_var_name("source_ptr_stop", vm, ids_data, ap_tracking)?;
             let dest_ptr = get_ptr_from_var_name("dest_ptr", vm, ids_data, ap_tracking)?;
             let dict_manager_ref = exec_scopes.get_dict_manager()?;
-            let mut dict = dict_manager_ref.borrow_mut();
+            let mut dict_manager = dict_manager_ref.borrow_mut();
+            let preimages = &dict_manager.preimages.clone();
 
-            let source_tracker = dict.get_tracker_mut(source_ptr_stop)?;
+            let source_tracker = dict_manager.get_tracker_mut(source_ptr_stop)?;
 
             // Find matching preimage from source tracker data
             let key_hash = get_integer_from_var_name("source_key", vm, ids_data, ap_tracking)?;
-            let preimage = _get_preimage_for_hashed_key(key_hash, source_tracker)?.clone();
+            let preimage = _get_preimage_for_hashed_key(key_hash.into(), preimages)?.clone();
             let value = source_tracker
                 .get_value(&preimage)
                 .map_err(|_| {
@@ -347,7 +322,7 @@ pub fn copy_hashdict_tracker_entry() -> Hint {
                 .clone();
 
             // Update destination tracker
-            let dest_tracker = dict.get_tracker_mut(dest_ptr)?;
+            let dest_tracker = dict_manager.get_tracker_mut(dest_ptr)?;
             dest_tracker.current_ptr.offset += DICT_ACCESS_SIZE;
             dest_tracker.insert_value(&preimage, &value.clone());
 
@@ -368,18 +343,24 @@ pub fn track_precompiles() -> Hint {
             // Get dictionary pointer and setup tracker
             let dict_ptr = get_ptr_from_var_name("dict_ptr", vm, ids_data, ap_tracking)?;
             let dict_manager_ref = exec_scopes.get_dict_manager()?;
-            let mut dict = dict_manager_ref.borrow_mut();
-            let tracker = dict.get_tracker_mut(dict_ptr)?;
+            let mut dict_manager = dict_manager_ref.borrow_mut();
+            let tracker = dict_manager.get_tracker_mut(dict_ptr)?;
 
             let precompiles = Precompiles::cancun().addresses().collect::<Vec<_>>();
-            for address in &precompiles {
-                let preimage =
-                    vec![MaybeRelocatable::Int(Felt252::from_bytes_le_slice(&address.0 .0))];
-                tracker
-                    .insert_value(&DictKey::Compound(preimage), &MaybeRelocatable::Int(1.into()));
+            tracker.current_ptr.offset += precompiles.len() * DICT_ACCESS_SIZE;
+
+            let mut preimage_entries = Vec::new();
+            for precompile_address in &precompiles {
+                let address_felt = Felt252::from_bytes_le_slice(&precompile_address.0 .0);
+                let preimage = vec![MaybeRelocatable::Int(address_felt)];
+                let dict_key = DictKey::Compound(preimage);
+                tracker.insert_value(&dict_key, &MaybeRelocatable::Int(1.into()));
+                preimage_entries.push((address_felt, dict_key));
             }
 
-            tracker.current_ptr.offset += precompiles.len() * DICT_ACCESS_SIZE;
+            for (address_felt, dict_key) in preimage_entries {
+                dict_manager.preimages.insert(address_felt.into(), dict_key);
+            }
 
             Ok(())
         },
@@ -404,24 +385,28 @@ fn build_compound_key(
 
 /// Helper function to find a preimage in a tracker's dictionary given a hashed key
 fn _get_preimage_for_hashed_key(
-    hashed_key: Felt252,
-    tracker: &DictTracker,
+    hashed_key: MaybeRelocatable,
+    preimages: &HashMap<MaybeRelocatable, DictKey>,
 ) -> Result<&DictKey, HintError> {
-    tracker
-        .get_dictionary_ref()
-        .keys()
-        .find(|key| match key {
+    preimages.get(&hashed_key).ok_or_else(|| {
+        HintError::CustomHint(format!("No preimage found for hashed key {}", hashed_key).into())
+    })
+}
+
+/// Helper function to compute the hash key from a DictKey
+fn compute_hash_key(dict_key: &DictKey, key_len: usize) -> Felt252 {
+    if key_len != 1 {
+        match dict_key {
             DictKey::Compound(values) => {
-                let felt_values: Vec<Felt252> = values.iter().filter_map(|v| v.get_int()).collect();
-                if felt_values.len() == 1 {
-                    felt_values[0] == hashed_key
-                } else {
-                    poseidon_hash_many(felt_values.iter()) == hashed_key
-                }
+                let ints: Vec<Felt252> = values.iter().map(|v| v.get_int().unwrap()).collect();
+                poseidon_hash_many(&ints)
             }
-            _ => false,
-        })
-        .ok_or_else(|| {
-            HintError::CustomHint(format!("No preimage found for hashed key {}", hashed_key).into())
-        })
+            DictKey::Simple(_) => panic!("Unreachable"),
+        }
+    } else {
+        match dict_key {
+            DictKey::Compound(values) => values[0].get_int().unwrap(),
+            DictKey::Simple(value) => value.get_int().unwrap(),
+        }
+    }
 }

@@ -2,11 +2,11 @@ from ethereum.cancun.vm.precompiled_contracts.mapping import (
     ECRECOVER_ADDRESS,
     PRE_COMPILED_CONTRACTS,
 )
-from hypothesis import example, given
+from hypothesis import Verbosity, example, given, settings
 from hypothesis import strategies as st
 
+from cairo_addons.testing.errors import cairo_error
 from cairo_addons.testing.hints import patch_hint
-from tests.utils.errors import cairo_error
 
 
 class TestPrecompileMapping:
@@ -27,13 +27,14 @@ class TestPrecompileMapping:
         assert table_address == 0
 
     @given(address=st.sampled_from(list(PRE_COMPILED_CONTRACTS.keys())))
+    @settings(verbosity=Verbosity.quiet)
     def test_precompile_table_lookup_hint_index_out_of_bounds(
-        self, cairo_program, cairo_run_py, address
+        self, cairo_programs, cairo_run_py, address
     ):
         address_int = int.from_bytes(address, "little")
         with (
             patch_hint(
-                cairo_program,
+                cairo_programs,
                 "precompile_index_from_address",
                 f"ids.index = {len(PRE_COMPILED_CONTRACTS)*3 + 1}",
             ),
@@ -42,13 +43,14 @@ class TestPrecompileMapping:
             cairo_run_py("precompile_table_lookup", address_int)
 
     @given(address=st.sampled_from(list(PRE_COMPILED_CONTRACTS.keys())))
+    @settings(verbosity=Verbosity.quiet)
     def test_precompile_table_lookup_hint_index_different_address(
-        self, cairo_program, cairo_run_py, address
+        self, cairo_programs, cairo_run_py, address
     ):
         address_int = int.from_bytes(address, "little")
         with (
             patch_hint(
-                cairo_program,
+                cairo_programs,
                 "precompile_index_from_address",
                 f"ids.index = {0 if address != ECRECOVER_ADDRESS else 1}",
             ),
