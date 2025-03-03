@@ -75,7 +75,6 @@ class TestEcOps:
                 p=[*int_to_uint384(int(p.x)), *int_to_uint384(int(p.y))],
                 q=[*int_to_uint384(int(q.x)), *int_to_uint384(int(q.y))],
                 a=int_to_uint384(int(curve.A)),
-                g=int_to_uint384(int(curve.G)),
                 modulus=int_to_uint384(int(curve.FIELD.PRIME)),
             )
             assert p + q == curve(
@@ -91,7 +90,6 @@ class TestEcOps:
                 p=[*int_to_uint384(int(p.x)), *int_to_uint384(int(p.y))],
                 q=[*int_to_uint384(int(q.x)), *int_to_uint384(int(q.y))],
                 a=int_to_uint384(int(curve.A)),
-                g=int_to_uint384(int(curve.G)),
                 modulus=int_to_uint384(int(curve.FIELD.PRIME)),
             )
             assert p + q == curve(
@@ -107,9 +105,52 @@ class TestEcOps:
                 p=[*int_to_uint384(int(p.x)), *int_to_uint384(int(p.y))],
                 q=[*int_to_uint384(int(q.x)), *int_to_uint384(int(q.y))],
                 a=int_to_uint384(int(curve.A)),
-                g=int_to_uint384(int(curve.G)),
                 modulus=int_to_uint384(int(curve.FIELD.PRIME)),
             )
             assert p + q == curve(
                 *[curve.FIELD(uint384_to_int(**i)) for i in res.values()]
             )
+
+        @given(
+            curve=curve,
+            scenario=st.sampled_from(
+                [
+                    "on_curve_plus_infinity",
+                    "infinity_plus_on_curve",
+                    "infinity_plus_infinity",
+                ]
+            ),
+        )
+        def test_ec_add_with_point_at_infinity(self, cairo_run, curve, scenario):
+            p = curve.random_point()
+
+            if scenario == "on_curve_plus_infinity":
+                p1, p2 = [*int_to_uint384(int(p.x)), *int_to_uint384(int(p.y))], [
+                    *int_to_uint384(int(0)),
+                    *int_to_uint384(int(0)),
+                ]
+                expected = p
+            elif scenario == "infinity_plus_on_curve":
+                p1, p2 = [*int_to_uint384(int(0)), *int_to_uint384(int(0))], [
+                    *int_to_uint384(int(p.x)),
+                    *int_to_uint384(int(p.y)),
+                ]
+                expected = p
+            else:
+                p1, p2 = [*int_to_uint384(int(0)), *int_to_uint384(int(0))], [
+                    *int_to_uint384(int(0)),
+                    *int_to_uint384(int(0)),
+                ]
+                expected = curve(curve.FIELD(0), curve.FIELD(0))
+
+            res = cairo_run(
+                "test__ec_add",
+                p=p1,
+                q=p2,
+                a=int_to_uint384(int(curve.A)),
+                modulus=int_to_uint384(int(curve.FIELD.PRIME)),
+            )
+
+            result = curve(*[curve.FIELD(uint384_to_int(**i)) for i in res.values()])
+
+            assert result == expected

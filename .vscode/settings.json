@@ -72,12 +72,14 @@
     "workercount",
     "workerid",
     "workerinput",
-    "xxhash"
+    "xxhash",
+    "zkpig"
   ],
   "python.testing.pytestArgs": ["."],
   "python.testing.unittestEnabled": false,
   "python.testing.pytestEnabled": true,
   "jupyter.notebookFileRoot": "${workspaceFolder}/cairo",
   "githubPullRequests.remotes": ["kakarot", "upstream"],
-  "cairols.sourceDir": "cairo"
+  "cairols.sourceDir": "cairo",
+  "rust-analyzer.cargo.features": "all"
 }

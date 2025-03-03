@@ -22,13 +22,16 @@ num-traits = "0.2.18"
 num-bigint = "0.4.6"
 starknet-crypto = "0.7.4"
 revm = "19.4.0"
-revm-precompile = "16.0.0"
+revm-precompile = "17.0.0-alpha.1"
 lazy_static = "1.5.0"
 starknet-types-core = "0.1.7"
 nybbles = "0.3.4"
 garaga_rs = { git = "https://github.com/keep-starknet-strange/garaga.git", tag = "v0.15.3", features = [
   "python",
 ] }
+polars = { version = "0.46" }
+pyo3-polars = "0.20.0"
+thiserror = "2.0"
 
 [build-dependencies]
 pyo3-build-config = "0.23.3" # Should match pyo3 version
@@ -36,3 +39,5 @@ pyo3-build-config = "0.23.3" # Should match pyo3 version
 [features]
 extension-module = ["pyo3/extension-module"]
 default = ["extension-module", "pyo3/experimental-inspect"]
+# Dynamic hints feature - not enabled by default
+dynamic-hints = []

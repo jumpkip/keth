@@ -1,4 +1,9 @@
-from starkware.cairo.common.cairo_builtins import BitwiseBuiltin, KeccakBuiltin, PoseidonBuiltin
+from starkware.cairo.common.cairo_builtins import (
+    BitwiseBuiltin,
+    KeccakBuiltin,
+    PoseidonBuiltin,
+    ModBuiltin,
+)
 from starkware.cairo.common.registers import get_label_location
 
 from ethereum.cancun.vm.instructions.system import (
@@ -15,13 +20,16 @@ from ethereum.cancun.vm.interpreter import process_create_message, process_messa
 from ethereum_types.numeric import U256, Uint, bool
 from ethereum.cancun.fork_types import Address
 from ethereum.cancun.vm.exceptions import EthereumException
-from ethereum.cancun.vm import Evm
+from ethereum.cancun.vm.evm_impl import Evm
 
 func test_generic_create{
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }(
     endowment: U256,
@@ -42,10 +50,17 @@ func test_create{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }() -> EthereumException* {
     let (process_create_message_label) = get_label_location(process_create_message);
-    let res = create{process_create_message_label=process_create_message_label}();
+    let (process_message_label) = get_label_location(process_message);
+    let res = create{
+        process_create_message_label=process_create_message_label,
+        process_message_label=process_message_label,
+    }();
     return res;
 }
 
@@ -54,10 +69,17 @@ func test_create2{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }() -> EthereumException* {
     let (process_create_message_label) = get_label_location(process_create_message);
-    let res = create2{process_create_message_label=process_create_message_label, evm=evm}();
+    let (process_message_label) = get_label_location(process_message);
+    let res = create2{
+        process_create_message_label=process_create_message_label,
+        process_message_label=process_message_label,
+    }();
     return res;
 }
 
@@ -66,6 +88,9 @@ func test_generic_call{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }(
     gas: Uint,
@@ -102,6 +127,9 @@ func test_call{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }() -> EthereumException* {
     let (process_message_label) = get_label_location(process_message);
@@ -114,6 +142,9 @@ func test_callcode{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }() -> EthereumException* {
     let (process_message_label) = get_label_location(process_message);
@@ -126,6 +157,9 @@ func test_delegatecall{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }() -> EthereumException* {
     let (process_message_label) = get_label_location(process_message);
@@ -138,6 +172,9 @@ func test_staticcall{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }() -> EthereumException* {
     let (process_message_label) = get_label_location(process_message);

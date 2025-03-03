@@ -2,12 +2,21 @@ from starkware.cairo.common.cairo_builtins import BitwiseBuiltin, KeccakBuiltin,
 from starkware.cairo.common.registers import get_label_location
 from starkware.cairo.common.math_cmp import is_le_felt
 from starkware.cairo.common.math import split_felt
-from ethereum.cancun.vm import Evm
+from ethereum.cancun.vm.evm_impl import Evm
 from ethereum.utils.numeric import divmod
 from ethereum.cancun.vm.precompiled_contracts.identity import identity
 from ethereum.cancun.vm.precompiled_contracts.sha256 import sha256
+from ethereum.cancun.vm.precompiled_contracts.modexp import modexp
+from ethereum.cancun.vm.precompiled_contracts.alt_bn128 import (
+    alt_bn128_pairing_check,
+    alt_bn128_add,
+    alt_bn128_mul,
+)
+from ethereum.cancun.vm.precompiled_contracts.ecrecover import ecrecover
+from ethereum.cancun.vm.precompiled_contracts.blake2f import blake2f
+from ethereum.cancun.vm.precompiled_contracts.point_evaluation import point_evaluation
+from ethereum.cancun.vm.precompiled_contracts.ripemd160 import ripemd160
 from cairo_core.control_flow import raise
-
 // currently 10 precompiles.
 const N_PRECOMPILES = 10;
 const HIGHEST_PRECOMPILE_LEADING_BYTE = 0x0a;
@@ -30,8 +39,12 @@ func precompile_table_lookup{range_check_ptr}(address: felt) -> (felt, felt) {
     if (address_low != 0) {
         return (0, 0);
     }
-    let (leading_byte, _) = divmod(address_high, 2 ** (3 * 8));
+    let (leading_byte, remaining) = divmod(address_high, 2 ** (3 * 8));
+    // Only the leading byte should be non-zero
     if (leading_byte == 0) {
+        return (0, 0);
+    }
+    if (remaining != 0) {
         return (0, 0);
     }
     let addr_too_high = is_le_felt(HIGHEST_PRECOMPILE_LEADING_BYTE + 1, leading_byte);
@@ -74,25 +87,25 @@ func precompile_table_lookup{range_check_ptr}(address: felt) -> (felt, felt) {
     // - index i+2 is the function pointer of the precompiled contract
     PRE_COMPILED_CONTRACTS:
     dw 0x100000000000000000000000000000000000000;
-    call invalid_precompile;  // ECRECOVER
+    call ecrecover;  // ECRECOVER
     dw 0x200000000000000000000000000000000000000;
     call sha256;  // SHA256
     dw 0x300000000000000000000000000000000000000;
-    call invalid_precompile;  // RIPEMD160
+    call ripemd160;  // RIPEMD160
     dw 0x400000000000000000000000000000000000000;
     call identity;  // IDENTITY
     dw 0x500000000000000000000000000000000000000;
-    call invalid_precompile;  // MODEXP
+    call modexp;  // MODEXP
     dw 0x600000000000000000000000000000000000000;
-    call invalid_precompile;  // ECADD
+    call alt_bn128_add;  // ECADD
     dw 0x700000000000000000000000000000000000000;
-    call invalid_precompile;  // ECMUL
+    call alt_bn128_mul;  // ECMUL
     dw 0x800000000000000000000000000000000000000;
-    call invalid_precompile;  // ECPAIRING
+    call alt_bn128_pairing_check;  // ECPAIRING
     dw 0x900000000000000000000000000000000000000;
-    call invalid_precompile;  // BLAKE2F
+    call blake2f;  // BLAKE2F
     dw 0xa00000000000000000000000000000000000000;
-    call invalid_precompile;  // POINT_EVALUATION
+    call point_evaluation;  // POINT_EVALUATION
     // not reached.
     ret;
 }

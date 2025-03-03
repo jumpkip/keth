@@ -1,19 +1,17 @@
 // SPDX-License-Identifier: MIT
 
-from starkware.cairo.common.cairo_builtins import BitwiseBuiltin, KeccakBuiltin, PoseidonBuiltin
+from starkware.cairo.common.cairo_builtins import (
+    BitwiseBuiltin,
+    KeccakBuiltin,
+    PoseidonBuiltin,
+    ModBuiltin,
+)
 from starkware.cairo.common.registers import get_fp_and_pc
 from starkware.cairo.common.math_cmp import is_le
 from ethereum.cancun.vm.stack import pop, push
-from ethereum.cancun.vm import (
-    Evm,
-    EvmImpl,
-    EvmStruct,
-    EnvImpl,
-    Message,
-    MessageStruct,
-    incorporate_child_on_error,
-    incorporate_child_on_success,
-)
+from ethereum.cancun.vm import incorporate_child_on_error, incorporate_child_on_success
+from ethereum.cancun.vm.evm_impl import Evm, EvmStruct, EvmImpl, Message, MessageStruct
+from ethereum.cancun.vm.env_impl import Environment, EnvironmentStruct, EnvImpl
 from ethereum.cancun.utils.address import to_address
 from starkware.cairo.common.dict_access import DictAccess
 from ethereum.cancun.vm.exceptions import Revert, OutOfGasError, WriteInStaticContext
@@ -75,12 +73,21 @@ from starkware.cairo.common.alloc import alloc
 from legacy.utils.dict import hashdict_read
 from cairo_core.comparison import is_zero
 
+from ethereum.utils.hash_dicts import (
+    set_address_contains,
+    set_address_contains_or_add,
+    set_address_add,
+)
+
 func generic_call{
     process_message_label: felt*,
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }(
     gas: Uint,
@@ -133,25 +140,27 @@ func generic_call{
 
     let is_static = bool(is_staticcall.value + evm.value.message.value.is_static.value);
 
-    // TODO: this could be optimized using a non-copy mechanism.
-    let (accessed_addresses_copy_start, accessed_addresses_copy) = dict_copy(
-        cast(evm.value.accessed_addresses.value.dict_ptr_start, DictAccess*),
-        cast(evm.value.accessed_addresses.value.dict_ptr, DictAccess*),
-    );
-    let (accessed_storage_keys_copy_start, accessed_storage_keys_copy) = dict_copy(
-        cast(evm.value.accessed_storage_keys.value.dict_ptr_start, DictAccess*),
-        cast(evm.value.accessed_storage_keys.value.dict_ptr, DictAccess*),
-    );
+    // Fork the accessed_addresses dict segment
+    local new_dict_ptr: DictAccess*;
+    tempvar parent_dict_end = cast(evm.value.accessed_addresses.value.dict_ptr, DictAccess*);
+    %{ copy_tracker_to_new_ptr %}
     tempvar child_accessed_addresses = SetAddress(
         new SetAddressStruct(
-            cast(accessed_addresses_copy_start, SetAddressDictAccess*),
-            cast(accessed_addresses_copy, SetAddressDictAccess*),
+            cast(new_dict_ptr, SetAddressDictAccess*), cast(new_dict_ptr, SetAddressDictAccess*)
         ),
     );
+
+    // Fork the accessed_storage_keys dict segment
+    local new_dict_ptr: DictAccess*;
+    // TODO(refactor): remove the requirement for a cast
+    // explicit cast because our named variables must always be of the same type as previous
+    // variables
+    tempvar parent_dict_end = cast(evm.value.accessed_storage_keys.value.dict_ptr, DictAccess*);
+    %{ copy_tracker_to_new_ptr %}
     tempvar child_accessed_storage_keys = SetTupleAddressBytes32(
         new SetTupleAddressBytes32Struct(
-            cast(accessed_storage_keys_copy_start, SetTupleAddressBytes32DictAccess*),
-            cast(accessed_storage_keys_copy, SetTupleAddressBytes32DictAccess*),
+            cast(new_dict_ptr, SetTupleAddressBytes32DictAccess*),
+            cast(new_dict_ptr, SetTupleAddressBytes32DictAccess*),
         ),
     );
 
@@ -176,19 +185,26 @@ func generic_call{
     );
 
     // prepare arguments to jump to process_message
+    // MARK: args assignment
     [ap] = range_check_ptr, ap++;
     [ap] = bitwise_ptr, ap++;
     [ap] = keccak_ptr, ap++;
     [ap] = poseidon_ptr, ap++;
+    [ap] = range_check96_ptr, ap++;
+    [ap] = add_mod_ptr, ap++;
+    [ap] = mul_mod_ptr, ap++;
     [ap] = child_message.value, ap++;
     [ap] = env.value, ap++;
 
     call abs process_message_label;
 
-    let range_check_ptr = [ap - 5];
-    let bitwise_ptr = cast([ap - 4], BitwiseBuiltin*);
-    let keccak_ptr = cast([ap - 3], KeccakBuiltin*);
-    let poseidon_ptr = cast([ap - 2], PoseidonBuiltin*);
+    let range_check_ptr = [ap - 8];
+    let bitwise_ptr = cast([ap - 7], BitwiseBuiltin*);
+    let keccak_ptr = cast([ap - 6], KeccakBuiltin*);
+    let poseidon_ptr = cast([ap - 5], PoseidonBuiltin*);
+    let range_check96_ptr = cast([ap - 4], felt*);
+    let add_mod_ptr = cast([ap - 3], ModBuiltin*);
+    let mul_mod_ptr = cast([ap - 2], ModBuiltin*);
     let child_evm_ = cast([ap - 1], EvmStruct*);
     tempvar child_evm = Evm(child_evm_);
 
@@ -267,8 +283,11 @@ func call_{
     process_message_label: felt*,
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
-    poseidon_ptr: PoseidonBuiltin*,
     keccak_ptr: KeccakBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }() -> EthereumException* {
     alloc_locals;
@@ -335,35 +354,20 @@ func call_{
     let extend_memory = calculate_gas_extend_memory(evm.value.memory, extensions_list);
 
     tempvar address_u256_ = UnionUintU256(new UnionUintU256Enum(cast(0, Uint*), _to));
-    let address_ = to_address(address_u256_);
-    tempvar to = new Address(address_.value);
-
+    let to = to_address(address_u256_);
     let accessed_addresses = evm.value.accessed_addresses;
-    let accessed_addresses_end = cast(accessed_addresses.value.dict_ptr, DictAccess*);
-    let (is_warm) = hashdict_read{dict_ptr=accessed_addresses_end}(1, &to.value);
+    let is_warm = set_address_contains_or_add{set_address=accessed_addresses}(to);
     if (is_warm != 0) {
         tempvar access_gas_cost = Uint(GasConstants.GAS_WARM_ACCESS);
-        tempvar accessed_addresses_end = accessed_addresses_end;
-        tempvar poseidon_ptr = poseidon_ptr;
     } else {
-        hashdict_write{dict_ptr=accessed_addresses_end}(1, &to.value, 1);
         tempvar access_gas_cost = Uint(GasConstants.GAS_COLD_ACCOUNT_ACCESS);
-        tempvar accessed_addresses_end = accessed_addresses_end;
-        tempvar poseidon_ptr = poseidon_ptr;
     }
     let access_gas_cost = access_gas_cost;
-
-    tempvar new_accessed_addresses = SetAddress(
-        new SetAddressStruct(
-            accessed_addresses.value.dict_ptr_start,
-            cast(accessed_addresses_end, SetAddressDictAccess*),
-        ),
-    );
-    EvmImpl.set_accessed_addresses(new_accessed_addresses);
+    EvmImpl.set_accessed_addresses(accessed_addresses);
 
     let env = evm.value.env;
     let state = env.value.state;
-    let _is_account_alive = is_account_alive{state=state}([to]);
+    let _is_account_alive = is_account_alive{state=state}(to);
     let is_value_zero = U256__eq__(value, U256(new U256Struct(0, 0)));
     let is_account_alive_or_value_zero = _is_account_alive.value + is_value_zero.value;
     if (is_account_alive_or_value_zero != 0) {
@@ -429,8 +433,8 @@ func call_{
         message_call_gas.value.stipend,
         value,
         evm.value.message.value.current_target,
-        [to],
-        [to],
+        to,
+        to,
         bool(1),
         bool(0),
         memory_input_start_position,
@@ -452,6 +456,9 @@ func callcode{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }() -> EthereumException* {
     alloc_locals;
@@ -508,32 +515,16 @@ func callcode{
     let extend_memory = calculate_gas_extend_memory(evm.value.memory, extensions_list);
 
     tempvar address_u256_ = UnionUintU256(new UnionUintU256Enum(cast(0, Uint*), _code_address));
-    let code_address_ = to_address(address_u256_);
-    tempvar code_address = new Address(code_address_.value);
-
+    let code_address = to_address(address_u256_);
     let accessed_addresses = evm.value.accessed_addresses;
-    let accessed_addresses_end = cast(accessed_addresses.value.dict_ptr, DictAccess*);
-    let (is_warm) = hashdict_read{dict_ptr=accessed_addresses_end}(1, &code_address.value);
+    let is_warm = set_address_contains_or_add{set_address=accessed_addresses}(code_address);
     if (is_warm != 0) {
         tempvar access_gas_cost = Uint(GasConstants.GAS_WARM_ACCESS);
-        tempvar accessed_addresses_end = accessed_addresses_end;
-        tempvar poseidon_ptr = poseidon_ptr;
     } else {
-        hashdict_write{dict_ptr=accessed_addresses_end}(1, &code_address.value, 1);
         tempvar access_gas_cost = Uint(GasConstants.GAS_COLD_ACCOUNT_ACCESS);
-        tempvar accessed_addresses_end = accessed_addresses_end;
-        tempvar poseidon_ptr = poseidon_ptr;
     }
     let access_gas_cost = access_gas_cost;
-    let poseidon_ptr = poseidon_ptr;
-
-    tempvar new_accessed_addresses = SetAddress(
-        new SetAddressStruct(
-            accessed_addresses.value.dict_ptr_start,
-            cast(accessed_addresses_end, SetAddressDictAccess*),
-        ),
-    );
-    EvmImpl.set_accessed_addresses(new_accessed_addresses);
+    EvmImpl.set_accessed_addresses(accessed_addresses);
 
     let high_not_zero = is_not_zero(_gas.value.high);
     let low_too_high = is_le(2 ** 64, _gas.value.low);
@@ -597,7 +588,7 @@ func callcode{
         value,
         sender_address,
         sender_address,
-        [code_address],
+        code_address,
         bool(1),
         bool(0),
         memory_input_start_position,
@@ -620,6 +611,9 @@ func delegatecall{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }() -> EthereumException* {
     alloc_locals;
@@ -671,32 +665,16 @@ func delegatecall{
     let extend_memory = calculate_gas_extend_memory(evm.value.memory, extensions_list);
 
     tempvar address_u256_ = UnionUintU256(new UnionUintU256Enum(cast(0, Uint*), _code_address));
-    let code_address_ = to_address(address_u256_);
-    tempvar code_address = new Address(code_address_.value);
-
+    let code_address = to_address(address_u256_);
     let accessed_addresses = evm.value.accessed_addresses;
-    let accessed_addresses_end = cast(accessed_addresses.value.dict_ptr, DictAccess*);
-    let (is_warm) = hashdict_read{dict_ptr=accessed_addresses_end}(1, &code_address.value);
+    let is_warm = set_address_contains_or_add{set_address=accessed_addresses}(code_address);
     if (is_warm != 0) {
         tempvar access_gas_cost = Uint(GasConstants.GAS_WARM_ACCESS);
-        tempvar accessed_addresses_end = accessed_addresses_end;
-        tempvar poseidon_ptr = poseidon_ptr;
     } else {
-        hashdict_write{dict_ptr=accessed_addresses_end}(1, &code_address.value, 1);
         tempvar access_gas_cost = Uint(GasConstants.GAS_COLD_ACCOUNT_ACCESS);
-        tempvar accessed_addresses_end = accessed_addresses_end;
-        tempvar poseidon_ptr = poseidon_ptr;
     }
     let access_gas_cost = access_gas_cost;
-    let poseidon_ptr = poseidon_ptr;
-
-    tempvar new_accessed_addresses = SetAddress(
-        new SetAddressStruct(
-            accessed_addresses.value.dict_ptr_start,
-            cast(accessed_addresses_end, SetAddressDictAccess*),
-        ),
-    );
-    EvmImpl.set_accessed_addresses(new_accessed_addresses);
+    EvmImpl.set_accessed_addresses(accessed_addresses);
 
     let high_not_zero = is_not_zero(_gas.value.high);
     let low_too_high = is_le(2 ** 64, _gas.value.low);
@@ -732,7 +710,7 @@ func delegatecall{
         evm.value.message.value.value,
         evm.value.message.value.caller,
         evm.value.message.value.current_target,
-        [code_address],
+        code_address,
         bool(0),
         bool(0),
         memory_input_start_position,
@@ -755,6 +733,9 @@ func staticcall{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }() -> EthereumException* {
     alloc_locals;
@@ -806,31 +787,16 @@ func staticcall{
     let extend_memory = calculate_gas_extend_memory(evm.value.memory, extensions_list);
 
     tempvar address_u256_ = UnionUintU256(new UnionUintU256Enum(cast(0, Uint*), _to));
-    let to_ = to_address(address_u256_);
-    tempvar to = new Address(to_.value);
-
+    let to = to_address(address_u256_);
     let accessed_addresses = evm.value.accessed_addresses;
-    let accessed_addresses_end = cast(accessed_addresses.value.dict_ptr, DictAccess*);
-    let (is_warm) = hashdict_read{dict_ptr=accessed_addresses_end}(1, &to.value);
+    let is_warm = set_address_contains_or_add{set_address=accessed_addresses}(to);
     if (is_warm != 0) {
         tempvar access_gas_cost = Uint(GasConstants.GAS_WARM_ACCESS);
-        tempvar accessed_addresses_end = accessed_addresses_end;
-        tempvar poseidon_ptr = poseidon_ptr;
     } else {
-        hashdict_write{dict_ptr=accessed_addresses_end}(1, &to.value, 1);
         tempvar access_gas_cost = Uint(GasConstants.GAS_COLD_ACCOUNT_ACCESS);
-        tempvar accessed_addresses_end = accessed_addresses_end;
-        tempvar poseidon_ptr = poseidon_ptr;
     }
     let access_gas_cost = access_gas_cost;
-    let poseidon_ptr = poseidon_ptr;
-    tempvar new_accessed_addresses = SetAddress(
-        new SetAddressStruct(
-            accessed_addresses.value.dict_ptr_start,
-            cast(accessed_addresses_end, SetAddressDictAccess*),
-        ),
-    );
-    EvmImpl.set_accessed_addresses(new_accessed_addresses);
+    EvmImpl.set_accessed_addresses(accessed_addresses);
 
     let high_not_zero = is_not_zero(_gas.value.high);
     let low_too_high = is_le(2 ** 64, _gas.value.low);
@@ -865,8 +831,8 @@ func staticcall{
         message_call_gas.value.stipend,
         U256(new U256Struct(0, 0)),
         evm.value.message.value.current_target,
-        [to],
-        [to],
+        to,
+        to,
         bool(1),
         bool(1),
         memory_input_start_position,
@@ -889,6 +855,9 @@ func revert{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }() -> EthereumException* {
     alloc_locals;
@@ -946,6 +915,9 @@ func return_{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }() -> EthereumException* {
     alloc_locals;
@@ -1007,6 +979,9 @@ func generic_create{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }(
     endowment: U256,
@@ -1103,27 +1078,30 @@ func generic_create{
     EnvImpl.set_state{env=env}(state);
     EvmImpl.set_env(env);
 
-    // TODO: this could be optimized using a non-copy mechanism.
-    let (accessed_addresses_copy_start, accessed_addresses_copy) = dict_copy(
-        cast(evm.value.accessed_addresses.value.dict_ptr_start, DictAccess*),
-        cast(evm.value.accessed_addresses.value.dict_ptr, DictAccess*),
-    );
-    let (accessed_storage_keys_copy_start, accessed_storage_keys_copy) = dict_copy(
-        cast(evm.value.accessed_storage_keys.value.dict_ptr_start, DictAccess*),
-        cast(evm.value.accessed_storage_keys.value.dict_ptr, DictAccess*),
-    );
+    // Fork the accessed_addresses dict segment
+    local new_dict_ptr: DictAccess*;
+    tempvar parent_dict_end = cast(evm.value.accessed_addresses.value.dict_ptr, DictAccess*);
+    %{ copy_tracker_to_new_ptr %}
     tempvar child_accessed_addresses = SetAddress(
         new SetAddressStruct(
-            cast(accessed_addresses_copy_start, SetAddressDictAccess*),
-            cast(accessed_addresses_copy, SetAddressDictAccess*),
+            cast(new_dict_ptr, SetAddressDictAccess*), cast(new_dict_ptr, SetAddressDictAccess*)
         ),
     );
+
+    // Fork the accessed_storage_keys dict segment
+    local new_dict_ptr: DictAccess*;
+    // TODO(refactor): remove the requirement for a cast
+    // explicit cast because our named variables must always be of the same type as previous
+    // variables
+    tempvar parent_dict_end = cast(evm.value.accessed_storage_keys.value.dict_ptr, DictAccess*);
+    %{ copy_tracker_to_new_ptr %}
     tempvar child_accessed_storage_keys = SetTupleAddressBytes32(
         new SetTupleAddressBytes32Struct(
-            cast(accessed_storage_keys_copy_start, SetTupleAddressBytes32DictAccess*),
-            cast(accessed_storage_keys_copy, SetTupleAddressBytes32DictAccess*),
+            cast(new_dict_ptr, SetTupleAddressBytes32DictAccess*),
+            cast(new_dict_ptr, SetTupleAddressBytes32DictAccess*),
         ),
     );
+
     tempvar to = To(new ToStruct(new Bytes0(0), cast(0, Address*)));
     tempvar child_message = Message(
         new MessageStruct(
@@ -1144,19 +1122,26 @@ func generic_create{
         ),
     );
 
+    // MARK: args assignment
     [ap] = range_check_ptr, ap++;
     [ap] = bitwise_ptr, ap++;
     [ap] = keccak_ptr, ap++;
     [ap] = poseidon_ptr, ap++;
+    [ap] = range_check96_ptr, ap++;
+    [ap] = add_mod_ptr, ap++;
+    [ap] = mul_mod_ptr, ap++;
     [ap] = child_message.value, ap++;
     [ap] = env.value, ap++;
 
     call abs process_create_message_label;
 
-    let range_check_ptr = [ap - 5];
-    let bitwise_ptr = cast([ap - 4], BitwiseBuiltin*);
-    let keccak_ptr = cast([ap - 3], KeccakBuiltin*);
-    let poseidon_ptr = cast([ap - 2], PoseidonBuiltin*);
+    let range_check_ptr = [ap - 8];
+    let bitwise_ptr = cast([ap - 7], BitwiseBuiltin*);
+    let keccak_ptr = cast([ap - 6], KeccakBuiltin*);
+    let poseidon_ptr = cast([ap - 5], PoseidonBuiltin*);
+    let range_check96_ptr = cast([ap - 4], felt*);
+    let add_mod_ptr = cast([ap - 3], ModBuiltin*);
+    let mul_mod_ptr = cast([ap - 2], ModBuiltin*);
     let child_evm_ = cast([ap - 1], EvmStruct*);
     tempvar child_evm = Evm(child_evm_);
 
@@ -1199,10 +1184,14 @@ func generic_create{
 // @notice Creates a new account with associated code
 func create{
     process_create_message_label: felt*,
+    process_message_label: felt*,
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }() -> EthereumException* {
     alloc_locals;
@@ -1268,7 +1257,7 @@ func create{
     EvmImpl.set_env(env);
     let contract_address = compute_contract_address(current_target, sender.value.nonce);
 
-    let err = generic_create{process_create_message_label=process_create_message_label}(
+    let err = generic_create(
         endowment, contract_address, memory_start_position, memory_size, init_code_gas
     );
     if (cast(err, felt) != 0) {
@@ -1287,10 +1276,14 @@ func create{
 // Similar to CREATE but the address depends on the init_code instead of sender nonce
 func create2{
     process_create_message_label: felt*,
+    process_message_label: felt*,
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }() -> EthereumException* {
     alloc_locals;
@@ -1370,7 +1363,7 @@ func create2{
         current_target, salt_bytes32, call_data
     );
 
-    let err = generic_create{process_create_message_label=process_create_message_label}(
+    let err = generic_create(
         endowment, contract_address, memory_start_position, memory_size, init_code_gas
     );
     if (cast(err, felt) != 0) {
@@ -1391,6 +1384,9 @@ func selfdestruct{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }() -> EthereumException* {
     alloc_locals;
@@ -1407,41 +1403,21 @@ func selfdestruct{
         }
     }
 
-    // Convert beneficiary to address
+    // GAS
     tempvar beneficiary_u256_ = UnionUintU256(
         new UnionUintU256Enum(cast(0, Uint*), beneficiary_u256)
     );
-    let beneficiary_ = to_address(beneficiary_u256_);
-    tempvar beneficiary = new Address(beneficiary_.value);
-
-    // GAS
-    // Calculate gas cost based on access and account status
+    let beneficiary = to_address(beneficiary_u256_);
     let accessed_addresses = evm.value.accessed_addresses;
-    let accessed_addresses_end = cast(accessed_addresses.value.dict_ptr, DictAccess*);
-    let (is_warm) = hashdict_read{dict_ptr=accessed_addresses_end}(1, &beneficiary.value);
-
+    let is_warm = set_address_contains_or_add{set_address=accessed_addresses}(beneficiary);
     tempvar base_gas_cost = Uint(GasConstants.GAS_SELF_DESTRUCT);
-
-    // Add cold access cost if beneficiary not in accessed_addresses
     if (is_warm != 0) {
         tempvar gas_cost = base_gas_cost;
-        tempvar accessed_addresses_end = accessed_addresses_end;
-        tempvar poseidon_ptr = poseidon_ptr;
     } else {
-        hashdict_write{dict_ptr=accessed_addresses_end}(1, &beneficiary.value, 1);
         tempvar gas_cost = Uint(base_gas_cost.value + GasConstants.GAS_COLD_ACCOUNT_ACCESS);
-        tempvar accessed_addresses_end = accessed_addresses_end;
-        tempvar poseidon_ptr = poseidon_ptr;
     }
-    let gas_cost = Uint([ap - 3]);
-
-    tempvar new_accessed_addresses = SetAddress(
-        new SetAddressStruct(
-            accessed_addresses.value.dict_ptr_start,
-            cast(accessed_addresses_end, SetAddressDictAccess*),
-        ),
-    );
-    EvmImpl.set_accessed_addresses(new_accessed_addresses);
+    let gas_cost = gas_cost;
+    EvmImpl.set_accessed_addresses(accessed_addresses);
 
     // Check if beneficiary account is alive and originator has balance
     let env = evm.value.env;
@@ -1452,7 +1428,7 @@ func selfdestruct{
     let originator_balance_zero_low = is_zero(originator_balance.value.low);
     let originator_balance_zero_high = is_zero(originator_balance.value.high);
     let originator_balance_zero = originator_balance_zero_low * originator_balance_zero_high;
-    let beneficiary_is_alive = is_account_alive{state=state}([beneficiary]);
+    let beneficiary_is_alive = is_account_alive{state=state}(beneficiary);
 
     // Add additional gas cost if beneficiary not alive and originator has balance
     let is_new_account = (1 - beneficiary_is_alive.value) * (1 - originator_balance_zero);
@@ -1480,22 +1456,16 @@ func selfdestruct{
         return err;
     }
 
-    move_ether{state=state}(originator, [beneficiary], originator_balance);
+    move_ether{state=state}(originator, beneficiary, originator_balance);
 
     // Register account for deletion if created in same transaction
     let created_accounts = env.value.state.value.created_accounts;
-    let created_accounts_end = cast(created_accounts.value.dict_ptr, DictAccess*);
-    let (is_created) = hashdict_read{dict_ptr=created_accounts_end}(1, &originator);
-    tempvar new_created_accounts = SetAddress(
-        new SetAddressStruct(
-            created_accounts.value.dict_ptr_start, cast(created_accounts_end, SetAddressDictAccess*)
-        ),
-    );
+    let is_created = set_address_contains{set=created_accounts}(originator);
     tempvar state = State(
         new StateStruct(
             _main_trie=state.value._main_trie,
             _storage_tries=state.value._storage_tries,
-            created_accounts=new_created_accounts,
+            created_accounts=created_accounts,
             original_storage_tries=state.value.original_storage_tries,
         ),
     );
@@ -1507,15 +1477,8 @@ func selfdestruct{
 
         // Add to accounts to delete
         let accounts_to_delete = evm.value.accounts_to_delete;
-        let accounts_to_delete_end = cast(accounts_to_delete.value.dict_ptr, DictAccess*);
-        hashdict_write{dict_ptr=accounts_to_delete_end}(1, &originator, 1);
-        tempvar new_accounts_to_delete = SetAddress(
-            new SetAddressStruct(
-                accounts_to_delete.value.dict_ptr_start,
-                cast(accounts_to_delete_end, SetAddressDictAccess*),
-            ),
-        );
-        EvmImpl.set_accounts_to_delete(new_accounts_to_delete);
+        set_address_add{set_address=accounts_to_delete}(originator);
+        EvmImpl.set_accounts_to_delete(accounts_to_delete);
         tempvar evm = evm;
         tempvar state = state;
         tempvar poseidon_ptr = poseidon_ptr;
@@ -1527,18 +1490,11 @@ func selfdestruct{
     let evm = Evm(cast([ap - 3], EvmStruct*));
 
     // Mark beneficiary as touched if empty
-    let is_empty = account_exists_and_is_empty{state=state}([beneficiary]);
+    let is_empty = account_exists_and_is_empty{state=state}(beneficiary);
     if (is_empty.value != 0) {
         let touched_accounts = evm.value.touched_accounts;
-        let touched_accounts_end = cast(touched_accounts.value.dict_ptr, DictAccess*);
-        hashdict_write{dict_ptr=touched_accounts_end}(1, &beneficiary.value, 1);
-        tempvar new_touched_accounts = SetAddress(
-            new SetAddressStruct(
-                touched_accounts.value.dict_ptr_start,
-                cast(touched_accounts_end, SetAddressDictAccess*),
-            ),
-        );
-        EvmImpl.set_touched_accounts(new_touched_accounts);
+        set_address_add{set_address=touched_accounts}(beneficiary);
+        EvmImpl.set_touched_accounts(touched_accounts);
         tempvar evm = evm;
         tempvar state = state;
         tempvar poseidon_ptr = poseidon_ptr;

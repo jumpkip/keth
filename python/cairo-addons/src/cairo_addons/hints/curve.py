@@ -139,14 +139,15 @@ def build_msm_hints_and_fill_memory(ids: VmConsts, memory: MemoryDict):
     ), f"Invalid RLC components length: {len(rlc_components)}"
 
     # Fill memory with processed data
-    memory_offset = 4
-    fill_felt_ptr(
-        rlc_components, memory, ids.range_check96_ptr + 4 * N_LIMBS + memory_offset
-    )
+    rlc_coeff_u384_cast_offset = 4
+    ecip_circuit_constants_offset = 20
+    memory_offset = rlc_coeff_u384_cast_offset + ecip_circuit_constants_offset
+    ecip_circuit_q_offset = 46 * N_LIMBS
+    fill_felt_ptr(rlc_components, memory, ids.range_check96_ptr + memory_offset)
     fill_felt_ptr(
         Q_low_high_high_shifted,
         memory,
-        ids.range_check96_ptr + 50 * N_LIMBS + memory_offset,
+        ids.range_check96_ptr + memory_offset + ecip_circuit_q_offset,
     )
 
 
@@ -156,18 +157,17 @@ def fill_add_mod_mul_mod_builtin_batch_one(
 ):
     from starkware.cairo.lang.builtins.modulo.mod_builtin_runner import ModBuiltinRunner
 
-    assert builtin_runners["add_mod_builtin"].instance_def.batch_size == 1
-    assert builtin_runners["mul_mod_builtin"].instance_def.batch_size == 1
-
     add_mod = None
     try:
         add_mod = (ids.add_mod_ptr.address_, builtin_runners["add_mod_builtin"], 1)
+        assert builtin_runners["add_mod_builtin"].instance_def.batch_size == 1
     except Exception:
         add_mod = None
 
     mul_mod = None
     try:
         mul_mod = (ids.mul_mod_ptr.address_, builtin_runners["mul_mod_builtin"], 1)
+        assert builtin_runners["mul_mod_builtin"].instance_def.batch_size == 1
     except Exception:
         mul_mod = None
 
@@ -192,3 +192,32 @@ def fill_add_mod_mul_mod_builtin_batch_117_108(
         add_mod=(ids.add_mod_ptr.address_, builtin_runners["add_mod_builtin"], 117),
         mul_mod=(ids.mul_mod_ptr.address_, builtin_runners["mul_mod_builtin"], 108),
     )
+
+
+@register_hint
+def is_point_on_curve(ids: VmConsts):
+    x = (
+        ids.point.x.d0
+        + ids.point.x.d1 * 2**96
+        + ids.point.x.d2 * 2**192
+        + ids.point.x.d3 * 2**288
+    )
+    y = (
+        ids.point.y.d0
+        + ids.point.y.d1 * 2**96
+        + ids.point.y.d2 * 2**192
+        + ids.point.y.d3 * 2**288
+    )
+    a = ids.a.d0 + ids.a.d1 * 2**96 + ids.a.d2 * 2**192 + ids.a.d3 * 2**288
+    b = ids.b.d0 + ids.b.d1 * 2**96 + ids.b.d2 * 2**192 + ids.b.d3 * 2**288
+    modulus = (
+        ids.modulus.d0
+        + ids.modulus.d1 * 2**96
+        + ids.modulus.d2 * 2**192
+        + ids.modulus.d3 * 2**288
+    )
+
+    rhs = (x**3 + a * x + b) % modulus
+    lhs = y**2 % modulus
+    is_on_curve = rhs == lhs
+    ids.is_on_curve = is_on_curve

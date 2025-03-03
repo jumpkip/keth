@@ -40,6 +40,7 @@ pub const HINTS: &[fn() -> Hint] = &[
     fill_add_mod_mul_mod_builtin_batch_one,
     decompose_scalar_to_neg3_base,
     fill_add_mod_mul_mod_builtin_batch_117_108,
+    is_point_on_curve,
 ];
 
 /// Builds Multi-Scalar Multiplication (MSM) hints and fills memory for elliptic curve operations.
@@ -140,12 +141,16 @@ pub fn build_msm_hints_and_fill_memory() -> Hint {
             // Fill memory
             let range_check96_ptr =
                 get_ptr_from_var_name("range_check96_ptr", vm, ids_data, ap_tracking)?;
-            let memory_offset = 4;
+            let rlc_coeff_u384_cast_offset = 4;
+            let ecip_circuit_constants_offset = 20;
+            let memory_offset = rlc_coeff_u384_cast_offset + ecip_circuit_constants_offset;
+            let ecip_circuit_q_offset = 46 * N_LIMBS;
 
-            let offset = range_check96_ptr + (4 * N_LIMBS + memory_offset);
-            write_collection_to_addr(offset.unwrap(), &rlc_components, vm)?;
+            let offset =
+                (range_check96_ptr.segment_index, range_check96_ptr.offset + memory_offset).into();
+            write_collection_to_addr(offset, &rlc_components, vm)?;
 
-            let offset = range_check96_ptr + (50 * N_LIMBS + memory_offset);
+            let offset = range_check96_ptr + (memory_offset + ecip_circuit_q_offset);
             write_collection_to_addr(offset.unwrap(), &q_low_high_high_shifted, vm)?;
             Ok(())
         },
@@ -291,6 +296,38 @@ pub fn decompose_scalar_to_neg3_base() -> Hint {
 
             write_result_to_ap(true, 0, vm)?;
 
+            Ok(())
+        },
+    )
+}
+
+pub fn is_point_on_curve() -> Hint {
+    Hint::new(
+        String::from("is_point_on_curve"),
+        |vm: &mut VirtualMachine,
+         _exec_scopes: &mut ExecutionScopes,
+         ids_data: &HashMap<String, HintReference>,
+         ap_tracking: &ApTracking,
+         _constants: &HashMap<String, Felt252>|
+         -> Result<(), HintError> {
+            let point_addr = get_relocatable_from_var_name("point", vm, ids_data, ap_tracking)?;
+            let x = Uint384::from_base_addr(point_addr, "point.x", vm)?.pack();
+            let y = Uint384::from_base_addr((point_addr + 4_usize).unwrap(), "point.y", vm)?.pack();
+            let a = Uint384::from_var_name("a", vm, ids_data, ap_tracking)?.pack();
+            let b = Uint384::from_var_name("b", vm, ids_data, ap_tracking)?.pack();
+            let modulus = Uint384::from_var_name("modulus", vm, ids_data, ap_tracking)?.pack();
+
+            let rhs = (pow(x.clone(), 3) + a * x + b) % modulus.clone();
+            let lhs = (pow(y.clone(), 2)) % modulus;
+            let is_on_curve = rhs == lhs;
+
+            insert_value_from_var_name(
+                "is_on_curve",
+                Felt252::from(is_on_curve),
+                vm,
+                ids_data,
+                ap_tracking,
+            )?;
             Ok(())
         },
     )

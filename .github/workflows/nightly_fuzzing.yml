@@ -9,13 +9,17 @@ permissions: read-all
 
 jobs:
   tests-unit:
-    runs-on: ubuntu-latest-16-cores
+    runs-on: ubuntu-latest-64-cores
     timeout-minutes: 1440
     env:
       HYPOTHESIS_PROFILE: nightly
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        run: rustup show
+
       - uses: astral-sh/setup-uv@v2
         with:
           enable-cache: true
@@ -40,7 +44,7 @@ jobs:
         id: tests
         continue-on-error: true # To send a notification if the tests fail
         run: |
-          uv run --reinstall pytest -n logical --durations=0 -v -s --log-cli-level=DEBUG --no-skip-cached-tests
+          uv run --reinstall pytest -n logical --durations=0 -v -s --log-cli-level=DEBUG --no-skip-cached-tests --ignore-glob=cairo/tests/ef_tests/
 
       - name: Upload coverage
         uses: codecov/codecov-action@v5

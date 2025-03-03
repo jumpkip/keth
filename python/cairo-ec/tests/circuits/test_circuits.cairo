@@ -12,6 +12,11 @@ from cairo_ec.circuits.mod_ops import (
     sum_ratio,
     inv,
     assert_is_quad_residue,
+    assert_eq,
+    assert_neq,
+    neg,
+    assert_neg,
+    assert_not_neg,
 )
 from cairo_ec.circuits.mod_ops_compiled import (
     add as add_compiled,
@@ -22,12 +27,29 @@ from cairo_ec.circuits.mod_ops_compiled import (
     sum_ratio as sum_ratio_compiled,
     inv as inv_compiled,
     assert_is_quad_residue as assert_is_quad_residue_compiled,
+    assert_eq as assert_eq_compiled,
+    assert_neq as assert_neq_compiled,
+    neg as neg_compiled,
+    assert_neg as assert_neg_compiled,
+    assert_not_neg as assert_not_neg_compiled,
 )
-from cairo_ec.circuits.ec_ops import ec_add, ec_double, assert_is_on_curve
+from cairo_ec.circuits.ec_ops import (
+    ec_add,
+    ec_double,
+    assert_x_is_on_curve,
+    assert_not_on_curve,
+    assert_on_curve,
+    ecip_2p,
+    ecip_1p,
+)
 from cairo_ec.circuits.ec_ops_compiled import (
     ec_add as ec_add_compiled,
     ec_double as ec_double_compiled,
-    assert_is_on_curve as assert_is_on_curve_compiled,
+    assert_x_is_on_curve as assert_x_is_on_curve_compiled,
+    assert_not_on_curve as assert_not_on_curve_compiled,
+    assert_on_curve as assert_on_curve_compiled,
+    ecip_2p as ecip_2p_compiled,
+    ecip_1p as ecip_1p_compiled,
 )
 
 func test__circuit{range_check96_ptr: felt*, add_mod_ptr: ModBuiltin*, mul_mod_ptr: ModBuiltin*}(

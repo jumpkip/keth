@@ -1,6 +1,11 @@
 from starkware.cairo.common.alloc import alloc
 from starkware.cairo.common.bool import TRUE, FALSE
-from starkware.cairo.common.cairo_builtins import BitwiseBuiltin, KeccakBuiltin, PoseidonBuiltin
+from starkware.cairo.common.cairo_builtins import (
+    BitwiseBuiltin,
+    KeccakBuiltin,
+    PoseidonBuiltin,
+    ModBuiltin,
+)
 from starkware.cairo.common.default_dict import default_dict_new
 from starkware.cairo.common.dict_access import DictAccess
 from starkware.cairo.common.math_cmp import is_nn
@@ -18,15 +23,10 @@ from ethereum.cancun.fork_types import (
     SetAddressDictAccess,
     SetTupleAddressBytes32DictAccess,
 )
-from ethereum.cancun.vm import (
-    Evm,
-    EvmStruct,
-    Message,
-    Environment,
-    EnvironmentStruct,
-    EvmImpl,
-    EnvImpl,
-)
+
+from ethereum.cancun.vm.evm_impl import Evm, EvmStruct, Message
+from ethereum.cancun.vm.env_impl import Environment, EnvironmentStruct, EnvImpl
+
 from ethereum.cancun.utils.constants import STACK_DEPTH_LIMIT, MAX_CODE_SIZE
 from ethereum.cancun.vm.exceptions import (
     EthereumException,
@@ -59,6 +59,8 @@ from ethereum.cancun.state import (
     touch_account,
 )
 
+from ethereum.cancun.vm.evm_impl import EvmImpl
+
 from legacy.utils.dict import hashdict_write, default_dict_finalize, dict_squash
 
 struct MessageCallOutput {
@@ -79,6 +81,9 @@ func process_create_message{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
 }(message: Message, env: Environment) -> Evm {
     alloc_locals;
 
@@ -107,10 +112,13 @@ func process_create_message{
     EnvImpl.set_transient_storage{env=env}(transient_storage);
     let evm = process_message(message, env);
 
+    // Rebind variables mutated in environment
+    let env = evm.value.env;
+    let state = env.value.state;
+    let transient_storage = env.value.transient_storage;
+
     if (cast(evm.value.error, felt) != 0) {
         // Error case
-        let env = evm.value.env;
-        let state = env.value.state;
         rollback_transaction{state=state, transient_storage=transient_storage}();
         EnvImpl.set_state{env=env}(state);
         EnvImpl.set_transient_storage{env=env}(transient_storage);
@@ -137,14 +145,12 @@ func process_create_message{
         _process_create_message_error{evm=evm}(err);
         return evm;
     }
-    let is_max_code_size_exceeded = is_nn(contract_code.value.len - MAX_CODE_SIZE);
+    let is_max_code_size_exceeded = is_nn(contract_code.value.len - (MAX_CODE_SIZE + 1));
     if (is_max_code_size_exceeded != FALSE) {
         tempvar err = new EthereumException(OutOfGasError);
         _process_create_message_error{evm=evm}(err);
         return evm;
     }
-    let env = evm.value.env;
-    let state = env.value.state;
     set_code{state=state}(message.value.current_target, contract_code);
     commit_transaction{state=state, transient_storage=transient_storage}();
     EnvImpl.set_state{env=env}(state);
@@ -180,6 +186,9 @@ func process_message{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
 }(message: Message, env: Environment) -> Evm {
     alloc_locals;
 
@@ -237,6 +246,9 @@ func execute_code{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
 }(message: Message, env: Environment) -> Evm {
     alloc_locals;
 
@@ -316,17 +328,25 @@ func execute_code{
         // Addresses that are not precompiles return 0.
         if (precompile_address != 0) {
             // Prepare arguments
-            [ap] = range_check_ptr, ap++;
+            // MARK: args assignment
             [ap] = range_check_ptr, ap++;
             [ap] = bitwise_ptr, ap++;
             [ap] = keccak_ptr, ap++;
+            [ap] = poseidon_ptr, ap++;
+            [ap] = range_check96_ptr, ap++;
+            [ap] = add_mod_ptr, ap++;
+            [ap] = mul_mod_ptr, ap++;
             [ap] = evm.value, ap++;
 
             call abs precompile_fn;
 
-            let range_check_ptr = [ap - 5];
-            let bitwise_ptr = cast([ap - 4], BitwiseBuiltin*);
-            let keccak_ptr = cast([ap - 3], KeccakBuiltin*);
+            let range_check_ptr = [ap - 9];
+            let bitwise_ptr = cast([ap - 8], BitwiseBuiltin*);
+            let keccak_ptr = cast([ap - 7], KeccakBuiltin*);
+            let poseidon_ptr = cast([ap - 6], PoseidonBuiltin*);
+            let range_check96_ptr = cast([ap - 5], felt*);
+            let add_mod_ptr = cast([ap - 4], ModBuiltin*);
+            let mul_mod_ptr = cast([ap - 3], ModBuiltin*);
             let evm = Evm(cast([ap - 2], EvmStruct*));
             let err = cast([ap - 1], EthereumException*);
 
@@ -362,6 +382,9 @@ func _execute_code{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
 }(evm: Evm) -> Evm {
     alloc_locals;
 
@@ -407,6 +430,9 @@ func process_message_call{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     env: Environment,
 }(message: Message) -> MessageCallOutput {
     alloc_locals;
@@ -433,6 +459,9 @@ func process_message_call{
         tempvar bitwise_ptr = bitwise_ptr;
         tempvar keccak_ptr = keccak_ptr;
         tempvar poseidon_ptr = poseidon_ptr;
+        tempvar range_check96_ptr = range_check96_ptr;
+        tempvar add_mod_ptr = add_mod_ptr;
+        tempvar mul_mod_ptr = mul_mod_ptr;
         tempvar evm = evm;
     } else {
         // Regular message call path
@@ -458,16 +487,23 @@ func process_message_call{
             );
 
             EvmImpl.set_touched_accounts{evm=evm}(new_touched_accounts);
+
             tempvar range_check_ptr = range_check_ptr;
             tempvar bitwise_ptr = bitwise_ptr;
             tempvar keccak_ptr = keccak_ptr;
             tempvar poseidon_ptr = poseidon_ptr;
+            tempvar range_check96_ptr = range_check96_ptr;
+            tempvar add_mod_ptr = add_mod_ptr;
+            tempvar mul_mod_ptr = mul_mod_ptr;
             tempvar evm = evm;
         } else {
             tempvar range_check_ptr = range_check_ptr;
             tempvar bitwise_ptr = bitwise_ptr;
             tempvar keccak_ptr = keccak_ptr;
             tempvar poseidon_ptr = poseidon_ptr;
+            tempvar range_check96_ptr = range_check96_ptr;
+            tempvar add_mod_ptr = add_mod_ptr;
+            tempvar mul_mod_ptr = mul_mod_ptr;
             tempvar evm = evm;
         }
         EnvImpl.set_state{env=env}(state);
@@ -476,12 +512,18 @@ func process_message_call{
         tempvar bitwise_ptr = bitwise_ptr;
         tempvar keccak_ptr = keccak_ptr;
         tempvar poseidon_ptr = poseidon_ptr;
+        tempvar range_check96_ptr = range_check96_ptr;
+        tempvar add_mod_ptr = add_mod_ptr;
+        tempvar mul_mod_ptr = mul_mod_ptr;
         tempvar evm = evm;
     }
-    let range_check_ptr = [ap - 5];
-    let bitwise_ptr = cast([ap - 4], BitwiseBuiltin*);
-    let keccak_ptr = cast([ap - 3], KeccakBuiltin*);
-    let poseidon_ptr = cast([ap - 2], PoseidonBuiltin*);
+    let range_check_ptr = [ap - 8];
+    let bitwise_ptr = cast([ap - 7], BitwiseBuiltin*);
+    let keccak_ptr = cast([ap - 6], KeccakBuiltin*);
+    let poseidon_ptr = cast([ap - 5], PoseidonBuiltin*);
+    let range_check96_ptr = cast([ap - 4], felt*);
+    let add_mod_ptr = cast([ap - 3], ModBuiltin*);
+    let mul_mod_ptr = cast([ap - 2], ModBuiltin*);
     let evm_struct = cast([ap - 1], EvmStruct*);
     tempvar evm = Evm(evm_struct);
     let env = evm.value.env;
@@ -599,7 +641,7 @@ func squash_evm{range_check_ptr, evm: Evm}() {
         0,
         squashed_valid_jump_destinations_start,
         squashed_valid_jump_destinations_end,
-        evm.value.message.value.code.value.data,
+        evm.value.message.value.code,
     );
     tempvar new_valid_jump_destinations = SetUint(
         new SetUintStruct(

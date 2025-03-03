@@ -203,7 +203,9 @@ def run_python_vm(
             allow_missing_builtins=False,
         )
         dict_manager = DictManager()
-        serde = serde_cls(runner.segments, cairo_program, dict_manager, cairo_file)
+        serde = serde_cls(
+            runner.segments, cairo_program.identifiers, dict_manager, cairo_file
+        )
 
         runner.program_base = runner.segments.add()
         runner.execution_base = runner.segments.add()
@@ -464,17 +466,19 @@ def run_rust_vm(
         # Create runner
         runner = RustCairoRunner(
             program=rust_program,
+            py_identifiers=cairo_program.identifiers,
             layout=getattr(LAYOUTS, request.config.getoption("layout")).layout_name,
             proof_mode=False,
             allow_missing_builtins=False,
         )
+
         # Must be done right after runner creation to make sure the execution base is 1
         # See https://github.com/lambdaclass/cairo-vm/issues/1908
         runner.initialize_segments()
 
         # Fill runner's memory for args
         serde = serde_cls(
-            runner.segments, cairo_program, runner.dict_manager, cairo_file
+            runner.segments, cairo_program.identifiers, runner.dict_manager, cairo_file
         )
         stack = []
         # Handle other args, (implicit, explicit)
@@ -503,23 +507,22 @@ def run_rust_vm(
             runner.run_until_pc(end, RustRunResources())
         except Exception as e:
             runner.relocate()
-            trace = pl.DataFrame(
-                [{"pc": x.pc, "ap": x.ap, "fp": x.fp} for x in runner.relocated_trace]
-            )
             if coverage is not None:
-                coverage(trace, PROGRAM_BASE)
+                coverage(runner.trace_df, PROGRAM_BASE)
             map_to_python_exception(e)
 
         cumulative_retdata_offsets = serde.get_offsets(return_data_types)
         first_return_data_offset = (
             cumulative_retdata_offsets[0] if cumulative_retdata_offsets else 0
         )
-        runner.verify_and_relocate(offset=first_return_data_offset)
-        trace = pl.DataFrame(
-            [{"pc": x.pc, "ap": x.ap, "fp": x.fp} for x in runner.relocated_trace]
-        )
+        runner.verify_auto_deductions()
+        runner.read_return_values(first_return_data_offset)
+        runner.verify_secure_runner()
+        runner.relocate()
+        print(len(runner.trace_df))
+
         if coverage is not None:
-            coverage(trace, PROGRAM_BASE)
+            coverage(runner.trace_df, PROGRAM_BASE)
 
         # Create a unique output stem for the given test by using the test file name, the entrypoint and the kwargs
         displayed_args = ""
@@ -539,7 +542,7 @@ def run_rust_vm(
         )
         if request.config.getoption("profile_cairo"):
             stats, prof_dict = profile_from_trace(
-                program=cairo_program, trace=trace, program_base=PROGRAM_BASE
+                program=cairo_program, trace=runner.trace_df, program_base=PROGRAM_BASE
             )
             stats = stats[
                 "scope",

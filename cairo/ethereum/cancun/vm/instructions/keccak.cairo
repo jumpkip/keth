@@ -1,8 +1,13 @@
-from starkware.cairo.common.cairo_builtins import BitwiseBuiltin, KeccakBuiltin, PoseidonBuiltin
+from starkware.cairo.common.cairo_builtins import (
+    BitwiseBuiltin,
+    KeccakBuiltin,
+    PoseidonBuiltin,
+    ModBuiltin,
+)
 from starkware.cairo.common.uint256 import uint256_reverse_endian
 
 from ethereum.cancun.vm.stack import pop, push
-from ethereum.cancun.vm import Evm, EvmImpl
+from ethereum.cancun.vm.evm_impl import Evm, EvmImpl
 from ethereum.exceptions import EthereumException
 from ethereum.cancun.vm.exceptions import OutOfGasError
 from ethereum.cancun.vm.memory import memory_read_bytes, expand_by
@@ -23,6 +28,9 @@ func keccak{
     bitwise_ptr: BitwiseBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    range_check96_ptr: felt*,
+    add_mod_ptr: ModBuiltin*,
+    mul_mod_ptr: ModBuiltin*,
     evm: Evm,
 }() -> EthereumException* {
     alloc_locals;

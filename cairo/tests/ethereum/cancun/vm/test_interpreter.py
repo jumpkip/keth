@@ -17,13 +17,7 @@ from tests.utils.strategies import environment_lite
 # TODO: enable execution of these precompiles
 unimplemented_precompiles = [
     1,
-    3,
-    5,
-    6,
-    7,
     8,
-    9,
-    10,
 ]
 
 message_without_precompile = (
