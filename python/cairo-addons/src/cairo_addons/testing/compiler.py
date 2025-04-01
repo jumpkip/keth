@@ -13,6 +13,7 @@ Automatic Test File Resolution is implemented as follows:
 
 import logging
 import pickle
+import re
 from pathlib import Path
 from time import perf_counter
 from typing import List, Optional, Tuple
@@ -102,17 +103,30 @@ def resolve_cairo_file(
     return files
 
 
-def get_main_path(cairo_file: Optional[str]) -> Optional[Tuple[str]]:
+def get_main_path(cairo_file: Optional[Path]) -> Optional[Tuple[str, ...]]:
     """
     Resolve the __main__ part of the cairo scope path.
+
+    The cairo_file is relative to the current working directory - either in `cairo` or in `python`.
+    If in `python`, we want to have a path relative to the cairo source - e.g. `python/package/src/<path>`.
+    As such we strip the python/**/src prefix from the main_path, which will be used when filling the program identifiers.
+
+    This enables using for example `mpt.trie_diff.AccountNode` instead of `python.mpt.src.mpt.trie_diff.AccountNode`,
     """
     if not cairo_file:
         return None
-    return tuple(
-        "/".join(cairo_file.relative_to(Path.cwd()).with_suffix("").parts)
-        .replace("cairo/", "")
-        .split("/")
-    )
+
+    # Get the relative path from current working directory
+    rel_path = cairo_file.relative_to(Path.cwd()).with_suffix("")
+
+    # Remove python/package/src/ prefix if present (so as to only work with identifiers relative to `cairo`)
+    rel_path_str = str(rel_path)
+    rel_path_str = re.sub(r"python/.*?/src/", "", rel_path_str)
+
+    # Remove cairo/ prefix if present
+    rel_path_str = rel_path_str.replace("cairo/", "")
+
+    return tuple(rel_path_str.split("/"))
 
 
 def get_cairo_program(
@@ -121,19 +135,32 @@ def get_cairo_program(
     dump_path: Optional[Path] = None,
     prime: int = DEFAULT_PRIME,
 ):
+    """
+    Compile a cairo file and return the program.
+
+    Dumps the program to a pickle file if it doesn't exist yet, so as to avoid recompiling the
+    same file multiple times.
+
+    We add custom identifiers to the program, so as to be able to use identifiers relative to the
+    cairo source - instead of the default __main__ file when running a function from the file
+    compiled (as opposed to a dependency)
+    """
     start = perf_counter()
     if dump_path is not None and dump_path.is_file():
         logger.info(f"Loading program from {dump_path}")
         with dump_path.open("rb") as f:
             program = pickle.load(f)
     else:
+        logger.info(f"dump path was not found for: {cairo_file} at path: {dump_path}")
         logger.info(f"Compiling {cairo_file}")
         program = cairo_compile(
             str(cairo_file), debug_info=True, proof_mode=False, prime=prime
         )
         if dump_path is not None:
             dump_path.parent.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Dumping program to {dump_path}")
             with dump_path.with_suffix(".lock").open("wb") as f:
+                logger.info(f"Dumping program to {dump_path.with_suffix('.lock')}")
                 pickle.dump(program, f)
             dump_path.with_suffix(".lock").rename(dump_path)
 

@@ -28,6 +28,8 @@ from ethereum_spec_tools.evm_tools.loaders.transaction_loader import Transaction
 from ethereum_types.bytes import Bytes, Bytes0
 from ethereum_types.numeric import U64, U256
 
+from eth_rpc import EthereumRPC
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -46,15 +48,39 @@ def convert_accounts(
     EMPTY_STORAGE_ROOT = (
         "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
     )
-    state = {}
+    EMPTY_CODE_HASH = "0x" + keccak256(b"").hex()
+    EMPTY_ACCOUNT = {
+        "balance": "0x0",
+        "nonce": "0x0",
+        "code": "0x",
+        "storage": {},
+    }
 
+    state = {}
+    eth = EthereumRPC.from_env()
     for account_proof in zkpi_data["preStateProofs"]:
+        code = code_hashes.get(account_proof["codeHash"], "0x")
+        if code == "0x" and account_proof["codeHash"] not in (
+            EMPTY_CODE_HASH,
+            f"0x{0:064x}",
+        ):
+            logger.info(
+                f"Code hash {account_proof['codeHash']} not found in zkpi data for address {account_proof['address']}, fetching from node"
+            )
+            code = (
+                "0x" + eth.get_code(Address.fromhex(account_proof["address"][2:])).hex()
+            )
+            code_hashes[account_proof["codeHash"]] = code
+
         account_state = {
             "balance": account_proof["balance"],
             "nonce": hex(account_proof.get("nonce", 0)),
-            "code": code_hashes.get(account_proof["codeHash"], "0x"),
+            "code": code,
             "storage": {},
         }
+
+        if account_state == EMPTY_ACCOUNT:
+            continue
 
         if account_proof["storageHash"] != EMPTY_STORAGE_ROOT:
             for storage_proof in account_proof.get("storageProof", []):
@@ -155,6 +181,7 @@ def process_zkpi_file(zkpi_file: Path, do_check: bool = False) -> None:
         "newBlockParameters": create_eels_block_parameters(zkpi_data["block"]),
         "pre": convert_accounts(zkpi_data, code_hashes),
         "chainId": zkpi_data["chainConfig"].get("chainId", 1),
+        "newBlockHash": zkpi_data["block"]["hash"],
         "ancestors": zkpi_data["ancestors"][::-1],
     }
 

@@ -4,7 +4,7 @@ from starkware.cairo.common.math_cmp import is_le, is_not_zero
 from starkware.cairo.common.math import assert_not_zero, split_int
 from starkware.cairo.common.memcpy import memcpy
 
-from ethereum_types.numeric import Bool, U256, Uint, U64, U256Struct
+from ethereum_types.numeric import Bool, U256, Uint, U64, U256Struct, bool
 from ethereum_types.bytes import (
     Bytes,
     Bytes0,
@@ -59,7 +59,7 @@ from ethereum.utils.numeric import (
     Uint_from_be_bytes,
     U64_from_be_bytes,
 )
-from ethereum.utils.bytes import Bytes8_to_Bytes
+from ethereum.utils.bytes import Bytes8_to_Bytes, Bytes__eq__
 from cairo_core.comparison import is_zero
 from legacy.utils.array import reverse
 from legacy.utils.bytes import (
@@ -220,6 +220,99 @@ namespace ExtendedImpl {
         );
         return extended;
     }
+}
+
+// Partial equality check for Extended, only for bytes and sequence variants
+func Extended__eq__(left: Extended, right: Extended) -> bool {
+    // None case
+    if (cast(left.value, felt) == 0 and cast(right.value, felt) == 0) {
+        let res = bool(1);
+        return res;
+    }
+    if (cast(right.value, felt) == 0) {
+        let res = bool(0);
+        return res;
+    }
+
+    // Sequence case
+    if (left.value.sequence.value != 0 and right.value.sequence.value != 0) {
+        let res = SequenceExtended__eq__(left.value.sequence, right.value.sequence);
+        return res;
+    }
+
+    // Bytearray case
+    if (left.value.bytearray.value != 0) {
+        if (right.value.bytearray.value != 0) {
+            let res = Bytes__eq__(left.value.bytearray, right.value.bytearray);
+            return res;
+        }
+        let res = bool(0);
+        return res;
+    }
+
+    // Bytes case
+    if (left.value.bytes.value != 0) {
+        if (right.value.bytes.value != 0) {
+            let res = Bytes__eq__(left.value.bytes, right.value.bytes);
+            return res;
+        }
+        let res = bool(0);
+        return res;
+    }
+
+    // Uint case
+    if (left.value.uint != 0 and right.value.uint != 0) {
+        let res_ = is_zero(left.value.uint.value - right.value.uint.value);
+        let res = bool(res_);
+        return res;
+    }
+
+    // Fixed uint case
+    if (left.value.fixed_uint != 0 and right.value.fixed_uint != 0) {
+        let res_ = is_zero(left.value.fixed_uint.value - right.value.fixed_uint.value);
+        let res = bool(res_);
+        return res;
+    }
+
+    // String case
+    if (left.value.str.value != 0 and right.value.str.value != 0) {
+        let res = Bytes__eq__(left.value.str, right.value.str);
+        return res;
+    }
+
+    // Bool case
+    if (left.value.bool != 0 and right.value.bool != 0) {
+        let res_ = is_zero(left.value.bool.value - right.value.bool.value);
+        let res = bool(res_);
+        return res;
+    }
+
+    // Reached when left and right are different types.
+    let res = bool(0);
+    return res;
+}
+
+// @notice Recursively compares two SequenceExtended. Compares each element of the sequence
+// and returns false upon finding two elements that are not equal.
+func SequenceExtended__eq__(left: SequenceExtended, right: SequenceExtended) -> bool {
+    if (left.value.len != right.value.len) {
+        let res = bool(0);
+        return res;
+    }
+    let len = left.value.len;
+    if (len == 0) {
+        let res = bool(1);
+        return res;
+    }
+    let res = Extended__eq__(left.value.data[0], right.value.data[0]);
+    if (res.value == 0) {
+        let res = bool(0);
+        return res;
+    }
+    tempvar left = SequenceExtended(new SequenceExtendedStruct(left.value.data + 1, len - 1));
+    tempvar right = SequenceExtended(new SequenceExtendedStruct(right.value.data + 1, len - 1));
+    let res = SequenceExtended__eq__(left, right);
+    return res;
 }
 
 //
@@ -1069,7 +1162,7 @@ func decode_to_blob_transaction{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
     let items = decoded.value.sequence.value.data;
 
     // EIP-4844 transactions must have 14 fields (11 transaction fields + 3 signature fields)
-    with_attr error_message("Invalid blob transaction: wrong number of fields") {
+    with_attr error_message("DecodingError") {
         assert items_len = 14;
     }
 
@@ -2089,4 +2182,14 @@ func encode_header{range_check_ptr}(header: Header) -> Bytes {
 
     tempvar result = Bytes(new BytesStruct(body_ptr - prefix_len, prefix_len + body_len));
     return result;
+}
+
+func U256_from_rlp{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(encoding: Bytes) -> U256 {
+    alloc_locals;
+
+    let decoded = decode(encoding);
+    let decoded_bytes = decoded.value.bytes;
+
+    let res = U256_from_be_bytes(decoded_bytes);
+    return res;
 }

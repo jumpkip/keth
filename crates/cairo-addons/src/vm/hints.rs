@@ -20,15 +20,13 @@ use std::{collections::HashMap, fmt, rc::Rc};
 
 use super::{
     hint_definitions::{
-        BYTES_HINTS, CIRCUITS_HINTS, CURVE_HINTS, DICT_HINTS, ETHEREUM_HINTS, HASHDICT_HINTS,
-        MATHS_HINTS, PRECOMPILES_HINTS, UTILS_HINTS,
+        BYTES_HINTS, CIRCUITS_HINTS, CRYPTO_HINTS, CURVE_HINTS, DICT_HINTS, ETHEREUM_HINTS,
+        HASHDICT_HINTS, MATHS_HINTS, PRECOMPILES_HINTS, UTILS_HINTS,
     },
     hint_loader::load_python_hints,
 };
 
-#[cfg(feature = "dynamic-hints")]
-use super::dynamic_hint::generic_python_hint;
-#[cfg(feature = "dynamic-hints")]
+use super::pythonic_hint::generic_python_hint;
 use cairo_vm::hint_processor::builtin_hint_processor::builtin_hint_processor_definition::HintProcessorData;
 
 /// A struct representing a hint.
@@ -63,10 +61,10 @@ pub struct HintProcessor {
     python_hints: HashMap<String, String>,
     /// A fallback function that will be used if the hint is not found
     /// and will interpret the hint code as Python code.
-    #[cfg(feature = "dynamic-hints")]
-    dynamic_hint_executor: Option<Rc<HintFunc>>,
-    #[cfg(not(feature = "dynamic-hints"))]
-    dynamic_hint_executor: Option<()>,
+    pythonic_hint_executor: Option<Rc<HintFunc>>,
+    /// Whether to enable execution of hints containing log traces.
+    /// Enabling this considerably slows down the execution speed.
+    enable_traces: bool,
 }
 
 impl HintProcessor {
@@ -78,18 +76,25 @@ impl HintProcessor {
         Self {
             inner: BuiltinHintProcessor::new(HashMap::new(), run_resources),
             python_hints,
-            dynamic_hint_executor: None,
+            pythonic_hint_executor: None,
+            enable_traces: false,
         }
     }
 
+    /// Add hints to the hint processor
+    ///
+    /// If map_python_code is true, the hint code will be mapped to the expanded python code, not
+    /// the id string.
     #[must_use]
     pub fn with_hints(mut self, hints: Vec<fn() -> Hint>) -> Self {
         for fn_hint in hints {
             let hint = fn_hint();
-            self.inner.add_hint(
-                self.python_hints.get(&hint.id).unwrap_or(&hint.id).to_string(),
-                hint.func.clone(),
-            );
+            // map hint_id -> hint_func
+            self.inner.add_hint(hint.id.clone(), hint.func.clone());
+            // map pythonic_hint_code -> hint_func
+            if let Some(hint_code) = self.python_hints.get(&hint.id) {
+                self.inner.add_hint(hint_code.clone(), hint.func.clone());
+            }
         }
         self
     }
@@ -99,23 +104,19 @@ impl HintProcessor {
         Self {
             inner: BuiltinHintProcessor::new(self.inner.extra_hints, run_resources),
             python_hints: self.python_hints,
-            dynamic_hint_executor: self.dynamic_hint_executor,
+            pythonic_hint_executor: self.pythonic_hint_executor,
+            enable_traces: self.enable_traces,
         }
     }
 
     /// Add support for dynamic Python hints
-    #[cfg(feature = "dynamic-hints")]
+    /// If enable_traces is true, the hint processor will be able to execute hints with log-specific
+    /// context, like `ids` data, `serialize`, and `logger.trace`.
     #[must_use]
-    pub fn with_dynamic_python_hints(mut self) -> Self {
+    pub fn with_dynamic_python_hints(mut self, enable_traces: bool) -> Self {
         // Store the generic Python hint executor for fallback
-        self.dynamic_hint_executor = Some(generic_python_hint().func.clone());
-        self
-    }
-
-    /// No-op version for when dynamic hints are disabled
-    #[cfg(not(feature = "dynamic-hints"))]
-    #[must_use]
-    pub fn with_dynamic_python_hints(self) -> Self {
+        self.enable_traces = enable_traces;
+        self.pythonic_hint_executor = Some(generic_python_hint().func.clone());
         self
     }
 
@@ -124,14 +125,16 @@ impl HintProcessor {
         HintProcessor {
             inner: self.inner,
             python_hints: self.python_hints,
-            dynamic_hint_executor: self.dynamic_hint_executor,
+            pythonic_hint_executor: self.pythonic_hint_executor,
+            enable_traces: self.enable_traces,
         }
     }
 }
 
 impl HintProcessorLogic for HintProcessor {
-    /// Executes a hint. If the hint is not found, it will try to execute the hint as Python code
-    /// using the dynamic hint executor.
+    /// Executes a hint. If the hint is not found and dynamic hints are enabled, it will try to
+    /// execute the hint as Python code. If dynamic hints are disabled, it will silently ignore
+    /// unknown hints.
     fn execute_hint(
         &mut self,
         vm: &mut VirtualMachine,
@@ -144,10 +147,9 @@ impl HintProcessorLogic for HintProcessor {
 
         match result {
             Ok(_) => Ok(()),
-            #[cfg(feature = "dynamic-hints")]
             Err(HintError::UnknownHint(_hint_str)) => {
-                // If the hint is unknown, try the dynamic hint executor
-                if let Some(dynamic_hint_func) = &self.dynamic_hint_executor {
+                // If the hint is unknown and we have a dynamic hint executor, try it
+                if let Some(pythonic_hint_func) = &self.pythonic_hint_executor {
                     // Extract the hint code from the hint_data
                     let hint_data = match hint_data.downcast_ref::<HintProcessorData>() {
                         Some(data) => data,
@@ -158,11 +160,16 @@ impl HintProcessorLogic for HintProcessor {
                         }
                     };
                     let hint_code = hint_data.code.clone();
+                    if hint_code.contains("logger.trace") && !self.enable_traces {
+                        // Skip execution of hints containing log traces
+                        // This significantly improves performance when running in production
+                        return Ok(())
+                    }
                     exec_scopes.assign_or_update_variable("__hint_code__", Box::new(hint_code));
 
                     // Execute the dynamic hint
-                    let dynamic_hint_func = dynamic_hint_func.0.as_ref();
-                    let dynamic_result = dynamic_hint_func(
+                    let pythonic_hint_func = pythonic_hint_func.0.as_ref();
+                    let dynamic_result = pythonic_hint_func(
                         vm,
                         exec_scopes,
                         &hint_data.ids_data,
@@ -178,22 +185,9 @@ impl HintProcessorLogic for HintProcessor {
                         )))
                     })
                 } else {
-                    // If no dynamic hint executor is available, return the original error
-                    let hint_data = match hint_data.downcast_ref::<HintProcessorData>() {
-                        Some(data) => data,
-                        None => {
-                            return Err(HintError::CustomHint(Box::from(
-                                "Failed to downcast hint_data to HintProcessorData".to_string(),
-                            )))
-                        }
-                    };
-                    Err(HintError::UnknownHint(hint_data.code.clone().into_boxed_str()))
+                    // If dynamic hints are disabled, silently ignore unknown hints
+                    Ok(())
                 }
-            }
-            #[cfg(not(feature = "dynamic-hints"))]
-            Err(HintError::UnknownHint(hint_str)) => {
-                // When dynamic hints are disabled, just return the original error
-                Err(HintError::UnknownHint(hint_str))
             }
             Err(err) => Err(err),
         }
@@ -203,6 +197,15 @@ impl HintProcessorLogic for HintProcessor {
 impl ResourceTracker for HintProcessor {
     fn consumed(&self) -> bool {
         self.inner.consumed()
+    }
+    fn get_n_steps(&self) -> Option<usize> {
+        self.inner.get_n_steps()
+    }
+    fn consume_step(&mut self) {
+        self.inner.consume_step()
+    }
+    fn run_resources(&self) -> &RunResources {
+        self.inner.run_resources()
     }
 }
 
@@ -217,8 +220,9 @@ impl Default for HintProcessor {
         hints.extend_from_slice(ETHEREUM_HINTS);
         hints.extend_from_slice(CURVE_HINTS);
         hints.extend_from_slice(CIRCUITS_HINTS);
+        hints.extend_from_slice(CRYPTO_HINTS);
         hints.extend_from_slice(PRECOMPILES_HINTS);
-        Self::new(RunResources::default()).with_hints(hints).with_dynamic_python_hints()
+        Self::new(RunResources::default()).with_hints(hints)
     }
 }
 

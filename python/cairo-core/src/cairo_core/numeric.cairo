@@ -1,4 +1,5 @@
 from starkware.cairo.common.uint256 import Uint256
+from starkware.cairo.common.cairo_builtins import UInt384
 
 // Int types
 struct bool {
@@ -42,4 +43,10 @@ struct SetUintStruct {
 
 struct SetUint {
     value: SetUintStruct*,
+}
+
+using U384Struct = UInt384;
+
+struct U384 {
+    value: U384Struct*,
 }

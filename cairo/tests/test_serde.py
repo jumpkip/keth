@@ -30,6 +30,7 @@ from ethereum.cancun.vm.exceptions import (
 )
 from ethereum.cancun.vm.gas import ExtendMemory, MessageCallGas
 from ethereum.cancun.vm.interpreter import MessageCallOutput
+from ethereum.crypto.alt_bn128 import BNF, BNF2, BNF12, BNP, BNP2, BNP12
 from ethereum.crypto.hash import Hash32
 from ethereum.exceptions import (
     EthereumException,
@@ -44,7 +45,8 @@ from starkware.cairo.lang.cairo_constants import DEFAULT_PRIME
 from starkware.cairo.lang.vm.memory_dict import MemoryDict
 from starkware.cairo.lang.vm.memory_segments import MemorySegmentManager
 
-from tests.utils.args_gen import Memory, Stack, _cairo_struct_to_python_type
+from mpt.utils import AccountNode
+from tests.utils.args_gen import U384, Memory, Stack, _cairo_struct_to_python_type
 from tests.utils.args_gen import gen_arg as _gen_arg
 from tests.utils.args_gen import to_cairo_type as _to_cairo_type
 from tests.utils.serde import Serde
@@ -103,6 +105,9 @@ def get_type(instance: Any) -> Type:
 
     if not isinstance(instance, (tuple, list)):
         return type(instance)
+
+    if isinstance(instance, (BNF2, BNF12, BNF, BNP, BNP2, BNP12)):
+        return instance.__class__
 
     # Empty sequence
     if not instance:
@@ -234,6 +239,7 @@ class TestSerde:
             BranchNode,
             InternalNode,
             Optional[InternalNode],
+            Mapping[Hash32, Optional[InternalNode]],
             Node,
             Mapping[Bytes, Bytes],
             Tuple[Mapping[Bytes, Bytes], ...],
@@ -284,6 +290,18 @@ class TestSerde:
             Trie[Bytes, Optional[Union[Bytes, Receipt]]],
             Trie[Bytes, Optional[Union[Bytes, Withdrawal]]],
             ApplyBodyOutput,
+            U384,
+            BNF12,
+            Tuple[BNF12, ...],
+            BNP12,
+            BNF2,
+            BNF,
+            BNP,
+            BNP2,
+            AccountNode,
+            Mapping[Bytes32, Address],
+            Mapping[Hash32, Optional[InternalNode]],
+            Mapping[Bytes32, Bytes32],
         ],
     ):
         assume(no_empty_sequence(b))

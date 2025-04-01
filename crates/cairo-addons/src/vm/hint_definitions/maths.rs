@@ -18,13 +18,8 @@ use num_bigint::BigUint;
 
 use crate::vm::hints::Hint;
 
-pub const HINTS: &[fn() -> Hint] = &[
-    felt252_to_bytes_le,
-    felt252_to_bytes_be,
-    value_len_mod_two,
-    is_positive_hint,
-    value_len_mod_two,
-];
+pub const HINTS: &[fn() -> Hint] =
+    &[felt252_to_bytes_le, felt252_to_bytes_be, value_len_mod_two, is_positive_hint];
 
 pub fn felt252_to_bytes_le() -> Hint {
     Hint::new(
@@ -45,7 +40,9 @@ pub fn felt252_to_bytes_le() -> Hint {
 
             let truncated_value = if len < 32 {
                 // Create mask for truncation: (1 << (len * 8)) - 1
-                let mask = (1_u128 << (len * 8)) - 1;
+                let one = BigUint::from(1u32);
+                let shifted = one.clone() << (len * 8);
+                let mask = shifted - one;
                 felt252_bit_and(value, mask.into())?
             } else {
                 value
@@ -84,7 +81,9 @@ pub fn felt252_to_bytes_be() -> Hint {
 
             let truncated_value = if len < 32 {
                 // Create mask for truncation: (1 << (len * 8)) - 1
-                let mask = (1_u128 << (len * 8)) - 1;
+                let one = BigUint::from(1u32);
+                let shifted = one.clone() << (len * 8);
+                let mask = shifted - one;
                 felt252_bit_and(value, mask.into())?
             } else {
                 value

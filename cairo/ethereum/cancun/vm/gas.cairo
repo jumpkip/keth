@@ -95,6 +95,7 @@ struct MessageCallGas {
 // @param amount The amount of gas the current operation requires.
 // @return EVM The pointer to the updated execution context.
 func charge_gas{range_check_ptr, evm: Evm}(amount: Uint) -> EthereumException* {
+    %{ logger.trace_cairo(f"GasAndRefund: {serialize(ids.amount)}") %}
     let is_in_range = is_le_felt(evm.value.gas_left.value, 2 ** 128 - 1);
     if (is_in_range == 0) {
         tempvar err = new EthereumException(OutOfGasError);
@@ -280,16 +281,16 @@ func calculate_total_blob_gas{range_check_ptr}(tx: Transaction) -> Uint {
     return total_blob_gas;
 }
 
-// @dev: Saturates at 2**64 - 1
+// @dev: Saturates at 2**128 - 1
 func calculate_blob_gas_price{range_check_ptr}(excess_blob_gas: U64) -> Uint {
     let blob_gas_price = taylor_exponential(
         Uint(GasConstants.MIN_BLOB_GASPRICE),
         Uint(excess_blob_gas.value),
         Uint(GasConstants.BLOB_GASPRICE_UPDATE_FRACTION),
     );
-    let saturate = is_le_felt(2 ** 64, blob_gas_price.value);
+    let saturate = is_le_felt(2 ** 128, blob_gas_price.value);
     if (saturate != 0) {
-        tempvar res = Uint(2 ** 64 - 1);
+        tempvar res = Uint(2 ** 128 - 1);
         return res;
     }
     return blob_gas_price;
@@ -299,9 +300,14 @@ func calculate_data_fee{range_check_ptr}(excess_blob_gas: U64, tx: Transaction) 
     alloc_locals;
     // saturate at 2**64 - 1
     let total_blob_gas = calculate_total_blob_gas(tx);
-    // saturate at 2**64 - 1
+    // saturate at 2**128 - 1
     let blob_gas_price = calculate_blob_gas_price(excess_blob_gas);
-    // fits in (2**128-1)
+    // mul fits in 251 bits
+    let saturate = is_le_felt(2 ** 128, total_blob_gas.value * blob_gas_price.value);
+    if (saturate != 0) {
+        tempvar res = Uint(2 ** 128 - 1);
+        return res;
+    }
     let data_fee = Uint(total_blob_gas.value * blob_gas_price.value);
     return data_fee;
 }

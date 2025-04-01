@@ -1,10 +1,10 @@
+import json
 from functools import partial
 from pathlib import Path
 from typing import Dict
 
 import pytest
 
-from tests.conftest import cairo_run as cairo_run_ethereum_tests  # noqa
 from tests.ef_tests.helpers import TEST_FIXTURES
 from tests.ef_tests.helpers.load_state_tests import (
     Load,
@@ -13,7 +13,10 @@ from tests.ef_tests.helpers.load_state_tests import (
     run_blockchain_st_test,
 )
 
-pytestmark = pytest.mark.cairo_file(f"{Path().cwd()}/cairo/ethereum/cancun/fork.cairo")
+pytestmark = [
+    pytest.mark.cairo_file(f"{Path().cwd()}/cairo/ethereum/cancun/fork.cairo"),
+    pytest.mark.max_steps(100_000_000),
+]
 
 fetch_cancun_tests = partial(fetch_state_test_files, network="Cancun")
 
@@ -43,6 +46,14 @@ SLOW_TESTS = (
     # InvalidBlockTest
     "bcUncleHeaderValidity/nonceWrong.json",
     "bcUncleHeaderValidity/wrongMixHash.json",
+    # Big loops
+    "stStaticCall/static_LoopCallsThenRevert.json",
+    "stStaticCall/static_LoopCallsDepthThenRevert.json",
+    "stStaticCall/static_LoopCallsDepthThenRevert2.json",
+    "stStaticCall/static_LoopCallsDepthThenRevert3.json",
+    "stStaticCall/LoopDelegateCallsDepthThenRevertFiller.json",
+    # Lots of transactions / blocks
+    "bcWalletTest/walletReorganizeOwners.json",
 )
 
 # These are tests that are considered to be incorrect,
@@ -72,19 +83,28 @@ BIG_MEMORY_TESTS = (
     "stStaticCall/",
 )
 
+
+# Modexp test that use exponent_head > 31 bytes
+with open(f"{Path().cwd()}/skip-ef-tests.json", "r") as f:
+    SKIPPED_TESTS = tuple(json.load(f))
+
+
 fetch_state_tests = partial(
     fetch_cancun_tests,
     test_dir,
-    ignore_list=IGNORE_TESTS,
+    ignore_list=IGNORE_TESTS + SKIPPED_TESTS,
     slow_list=SLOW_TESTS,
     big_memory_list=BIG_MEMORY_TESTS,
 )
 
 
 @pytest.fixture(scope="module")
-def cairo_state_transition(cairo_run_ethereum_tests):  # noqa
+def cairo_state_transition(cairo_run, request: pytest.FixtureRequest):  # noqa
     return partial(
-        run_blockchain_st_test, load=FIXTURES_LOADER, cairo_run=cairo_run_ethereum_tests
+        run_blockchain_st_test,
+        load=FIXTURES_LOADER,
+        cairo_run=cairo_run,
+        request=request,
     )
 
 

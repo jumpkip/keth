@@ -48,3 +48,13 @@ cairo/tests/ef_tests/fixtures/
 
 # zk-pig default output directory
 data
+!python/mpt/tests/data
+
+# prover input files
+*.trace
+*.air_public_input.json
+*.air_private_input.json
+*.memory
+*.trace.bin
+*.memory.bin
+output/

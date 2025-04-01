@@ -1,13 +1,18 @@
 import json
 import os.path
 import re
+import traceback
 from collections import defaultdict
 from glob import glob
 from typing import Any, Dict, Generator, Tuple, Union
 
 import pytest
 from _pytest.mark.structures import ParameterSet
+from ethereum.cancun.fork import state_transition
+from ethereum.cancun.fork_types import Account
 from ethereum.cancun.state import State
+from ethereum.cancun.trie import root as compute_root
+from ethereum.cancun.trie import trie_get, trie_set
 from ethereum.crypto.hash import keccak256
 from ethereum.exceptions import EthereumException
 from ethereum.utils.hexadecimal import hex_to_bytes
@@ -17,11 +22,20 @@ from ethereum_spec_tools.evm_tools.loaders.fixture_loader import Load
 from ethereum_types.numeric import U64, U256
 
 
-def convert_defaultdict(state: State) -> State:
+def prepare_state(state: State) -> State:
     for address in state._storage_tries:
         state._storage_tries[address]._data = defaultdict(
             lambda: defaultdict(lambda: U256(0)), state._storage_tries[address]._data
         )
+        storage_root = compute_root(state._storage_tries[address])
+        account = trie_get(state._main_trie, address)
+        account = Account(
+            balance=account.balance,
+            nonce=account.nonce,
+            code=account.code,
+            storage_root=storage_root,
+        )
+        trie_set(state._main_trie, address, account)
     state._main_trie._data = defaultdict(lambda: None, state._main_trie._data)
 
     for snap in state._snapshots:
@@ -41,7 +55,9 @@ class NoTestsFound(Exception):
     """
 
 
-def run_blockchain_st_test(test_case: Dict, load: Load, cairo_run) -> None:
+def run_blockchain_st_test(
+    test_case: Dict, load: Load, cairo_run, request: pytest.FixtureRequest
+) -> None:
     test_file = test_case["test_file"]
     test_key = test_case["test_key"]
 
@@ -82,16 +98,16 @@ def run_blockchain_st_test(test_case: Dict, load: Load, cairo_run) -> None:
                 block_exception = value
                 break
 
-        chain.state = convert_defaultdict(chain.state)
+        chain.state = prepare_state(chain.state)
         if block_exception:
             # TODO: Once all the specific exception types are thrown,
             #       only `pytest.raises` the correct exception type instead of
             #       all of them.
             with pytest.raises((EthereumException, RLPException)):
-                add_block_to_chain(chain, json_block, load, cairo_run)
+                add_block_to_chain(chain, json_block, load, cairo_run, request)
             return
         else:
-            add_block_to_chain(chain, json_block, load, cairo_run)
+            add_block_to_chain(chain, json_block, load, cairo_run, request)
 
     last_block_hash = hex_to_bytes(json_data["lastblockhash"])
     assert keccak256(rlp.encode(chain.blocks[-1].header)) == last_block_hash
@@ -102,7 +118,9 @@ def run_blockchain_st_test(test_case: Dict, load: Load, cairo_run) -> None:
     load.fork.close_state(expected_post_state)
 
 
-def add_block_to_chain(chain: Any, json_block: Any, load: Load, cairo_run) -> None:
+def add_block_to_chain(
+    chain: Any, json_block: Any, load: Load, cairo_run, request: pytest.FixtureRequest
+) -> None:
     (
         block,
         block_header_hash,
@@ -112,9 +130,24 @@ def add_block_to_chain(chain: Any, json_block: Any, load: Load, cairo_run) -> No
     assert keccak256(rlp.encode(block.header)) == block_header_hash
     assert rlp.encode(block) == block_rlp
 
-    cairo_chain = cairo_run("state_transition", chain, block)
-    chain.blocks = cairo_chain.blocks
-    chain.state = cairo_chain.state
+    try:
+        cairo_chain = cairo_run("state_transition", chain, block)
+        if request.config.getoption("--log-cli-level") == "TRACE":
+            # In trace mode, run EELS as well to get a side-by-side comparison
+            state_transition(chain, block)
+        chain.blocks = cairo_chain.blocks
+        chain.state = cairo_chain.state
+    except Exception as e:
+        err_traceback = traceback.format_exc()
+        if "RunResources has no remaining steps" in str(err_traceback):
+            raise pytest.skip("Step limit reached")
+        # Run EELS to get its trace, then raise.
+        if request.config.getoption("--log-cli-level") == "TRACE":
+            try:
+                state_transition(chain, block)
+            except Exception as e2:
+                print(e2)
+        raise e
 
 
 # Functions that fetch individual test cases

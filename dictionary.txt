@@ -9,6 +9,7 @@ assertrepr
 asyncio
 autoflake
 autouse
+Barreto
 BASEFEE
 behaviour
 bigend
@@ -40,6 +41,8 @@ cdylib
 CHAINID
 Clément
 clippy
+cofactor
+COFACTOR
 codecopy
 CODECOPY
 codesize
@@ -48,9 +51,11 @@ codespell
 codespellignore
 coeff
 coeffs
+colorama
 collectonly
 conftest
 conftests
+cumul
 dataclass
 dataframe
 defaultdict
@@ -68,6 +73,7 @@ ECADD
 ecip
 ECMUL
 ECPAIRING
+elems
 elmt
 elmts
 elts
@@ -90,6 +96,8 @@ fixturedef
 fixturemanager
 fixturenames
 flatmap
+frob
+Frobenius
 fromhex
 frozendict
 fspath
@@ -102,8 +110,10 @@ getcwd
 getfixturedefs
 getitem
 gitpython
+gnark
 gpgsign
 gprof
+GQUADDIVISOR
 GRUMPKIN
 hashdict
 HASHDICT
@@ -131,6 +141,7 @@ lambdaclass
 lastblockhash
 levelname
 libpython
+linefunc
 lllcversion
 makereport
 maturin
@@ -146,6 +157,7 @@ modexp
 MODEXP
 modifyitems
 modpow
+modsize
 msize
 MSIZE
 mstore
@@ -154,6 +166,7 @@ mswlen
 mulmod
 MULMOD
 mult
+Naehrig
 natspec
 nbits
 negone
@@ -175,6 +188,7 @@ pinentry
 pkey
 pointee
 preaccessed
+Precomps
 preimage
 preimages
 PREVRANDAO
@@ -213,6 +227,7 @@ rustup
 sdiv
 SDIV
 secp
+selectattr
 SELFBALANCE
 selfdestruct
 serde
@@ -232,6 +247,7 @@ SSTORE
 starknet
 starkware
 Starkware
+startswith
 Statetest
 staticcall
 staticmethod
@@ -243,6 +259,7 @@ tfile
 thiserror
 tload
 TLOAD
+Tonelli
 tryfirst
 tstore
 TSTORE
@@ -253,6 +270,7 @@ Unflatten
 unhashed
 unrequired
 unsendable
+venv
 VERIF
 Weil
 workercount
@@ -275,3 +293,11 @@ pathlib
 kwargs
 pythonic
 functools
+setattr
+pyfunction
+chrono
+stwo
+modelcontextprotocol
+equalto
+codehash
+PYTHONUNBUFFERED

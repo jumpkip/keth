@@ -7,6 +7,7 @@ from typing import (
     Generic,
     Optional,
     Tuple,
+    Type,
     TypeVar,
     Union,
     get_args,
@@ -15,16 +16,34 @@ from typing import (
 
 from eth_keys.datatypes import PrivateKey
 from ethereum.cancun.blocks import Header, Log, Receipt, Withdrawal
-from ethereum.cancun.fork_types import Account, Address, Bloom, Root
+from ethereum.cancun.fork_types import Address, Bloom, Root
 from ethereum.cancun.transactions import (
     AccessListTransaction,
     BlobTransaction,
     FeeMarketTransaction,
     LegacyTransaction,
 )
-from ethereum.cancun.trie import BranchNode, ExtensionNode, LeafNode, Trie, copy_trie
+from ethereum.cancun.trie import (
+    BranchNode,
+    ExtensionNode,
+    LeafNode,
+    Trie,
+    copy_trie,
+)
+from ethereum.cancun.trie import root as compute_root
 from ethereum.cancun.vm import Environment, Evm, Message
+from ethereum.crypto.alt_bn128 import (
+    BNF,
+    BNF2,
+    BNF12,
+    BNP,
+    BNP2,
+    BNP12,
+    bnp_to_bnp12,
+    twist,
+)
 from ethereum.crypto.elliptic_curve import SECP256K1N
+from ethereum.crypto.finite_field import GaloisField
 from ethereum.crypto.hash import Hash32
 from ethereum.exceptions import EthereumException
 from ethereum_types.bytes import (
@@ -40,8 +59,19 @@ from ethereum_types.numeric import U64, U256, FixedUnsigned, Uint
 from hypothesis import strategies as st
 from starkware.cairo.lang.cairo_constants import DEFAULT_PRIME
 
-from tests.utils.args_gen import (
+from cairo_ec.curve import AltBn128
+
+# Note: I have noticed that even if we patch the imports in conftests.py, because hypothesis runs before these patches are applied,
+# this file would still be working with the old types. Thus, we _explicitly_ import our patched types from args_gen.py here.
+from tests.utils.args_gen import (  # noqa
+    EMPTY_STORAGE_ROOT,
+    U384,
+    Account,
+    Environment,
+    Evm,
     Memory,
+    Message,
+    MessageCallOutput,
     MutableBloom,
     Stack,
     State,
@@ -60,8 +90,10 @@ uint24 = st.integers(min_value=0, max_value=2**24 - 1)
 uint64 = st.integers(min_value=0, max_value=2**64 - 1).map(U64)
 uint = uint64.map(Uint)
 uint128 = st.integers(min_value=0, max_value=2**128 - 1)
-felt = st.integers(min_value=0, max_value=DEFAULT_PRIME - 1)
+felt = st.integers(min_value=-DEFAULT_PRIME // 2, max_value=DEFAULT_PRIME // 2)
+positive_felt = st.integers(min_value=0, max_value=DEFAULT_PRIME - 1)
 uint256 = st.integers(min_value=0, max_value=2**256 - 1).map(U256)
+uint384 = st.integers(min_value=0, max_value=2**384 - 1).map(U384)
 nibble = st.lists(uint4, max_size=64).map(bytes)
 
 bytes0 = st.binary(min_size=0, max_size=0).map(Bytes0)
@@ -306,7 +338,9 @@ transient_storage = st.sets(
 )
 
 # Fork
-environment_lite = st.integers(min_value=0).flatmap(  # Generate block number first
+environment_lite = st.integers(
+    min_value=0, max_value=2**64 - 1
+).flatmap(  # Generate block number first
     lambda number: st.builds(
         Environment,
         caller=address,
@@ -380,7 +414,7 @@ evm = st.builds(
     env=st.from_type(Environment),
     valid_jump_destinations=st.sets(st.from_type(Uint)),
     logs=st.from_type(Tuple[Log, ...]),
-    refund_counter=st.integers(min_value=0),
+    refund_counter=felt,
     running=st.booleans(),
     message=message,
     output=small_bytes,
@@ -393,7 +427,14 @@ evm = st.builds(
 )
 
 
-account_strategy = st.builds(Account, nonce=uint, balance=uint256, code=code)
+# Take the EMPTY_STORAGE_ROOT value by default. This will be built in the state strategy, based on the storage tries.
+account_strategy = st.builds(
+    Account,
+    nonce=uint,
+    balance=uint256,
+    code=code,
+    storage_root=st.just(EMPTY_STORAGE_ROOT),
+)
 
 # Fork
 # A strategy for an empty state - the tries have no data.
@@ -439,49 +480,60 @@ BEACON_ROOTS_CODE = bytes.fromhex(
 SYSTEM_ACCOUNT = Account(balance=U256(0), nonce=Uint(0), code=bytes())
 BEACON_ROOTS_ACCOUNT = Account(balance=U256(0), nonce=Uint(1), code=BEACON_ROOTS_CODE)
 
-state = st.lists(address, max_size=MAX_ADDRESS_SET_SIZE, unique=True).flatmap(
-    lambda addresses: st.builds(
-        State,
-        _main_trie=st.builds(
-            Trie[Address, Optional[Account]],
-            secured=st.just(True),
-            default=st.none(),
-            _data=st.fixed_dictionaries(
-                {address: st.from_type(Account) for address in addresses}
-            ).map(lambda x: defaultdict(lambda: None, x)),
-        ),
-        # Storage tries are not always present for existing accounts
-        # Thus we generate a subset of addresses from the existing accounts
-        _storage_tries=st.integers(max_value=len(addresses)).flatmap(
+
+@st.composite
+def state_strategy(draw):
+    addresses = draw(st.lists(address, max_size=MAX_ADDRESS_SET_SIZE, unique=True))
+
+    # Storage tries are not always present for existing accounts
+    # Thus we generate a subset of addresses from the existing accounts
+    _storage_tries = draw(
+        st.integers(max_value=len(addresses)).flatmap(
             lambda i: st.fixed_dictionaries(
                 {
                     address: trie_strategy(Trie[Bytes32, U256], min_size=1)
                     for address in addresses[:i]
                 }
             )
-        ),
-        _snapshots=st.builds(list, st.just([])),
-        created_accounts=st.sets(address, max_size=10),
-    ).map(
-        # Create the original state snapshot using copies of the tries
-        lambda state: State(
-            _main_trie=state._main_trie,
-            _storage_tries=state._storage_tries,
-            # Create deep copies of the tries for the snapshot,
-            # because otherwise mutating the main trie will also mutate the snapshot
-            _snapshots=[
-                (
-                    copy_trie(state._main_trie),
-                    {
-                        addr: copy_trie(trie)
-                        for addr, trie in state._storage_tries.items()
-                    },
-                )
-            ],
-            created_accounts=state.created_accounts,
         )
-    ),
-)
+    )
+
+    # Ensure the storage root of each account is consistent with the storage tries
+    _main_trie = draw(
+        st.builds(
+            Trie[Address, Optional[Account]],
+            secured=st.just(True),
+            default=st.none(),
+            _data=st.fixed_dictionaries(
+                {
+                    address: (
+                        st.builds(
+                            Account,
+                            storage_root=st.just(compute_root(_storage_tries[address])),
+                        )
+                        if address in _storage_tries.keys()
+                        else account_strategy
+                    )
+                    for address in addresses
+                }
+            ).map(lambda x: defaultdict(lambda: None, x)),
+        )
+    )
+
+    _snapshots = [
+        (
+            copy_trie(_main_trie),
+            {addr: copy_trie(trie) for addr, trie in _storage_tries.items()},
+        )
+    ]
+
+    return State(
+        _main_trie=_main_trie,
+        _storage_tries=_storage_tries,
+        _snapshots=_snapshots,
+        created_accounts=draw(st.sets(address, max_size=10)),
+    )
+
 
 header = st.builds(
     Header,
@@ -511,11 +563,83 @@ private_key = (
 )
 
 
+def bnfN_strategy(field: Type[GaloisField], N: int):
+    return st.builds(
+        field,
+        st.lists(
+            st.integers(min_value=0, max_value=field.PRIME - 1), min_size=N, max_size=N
+        ).map(tuple),
+    )
+
+
+bnf_strategy = st.builds(BNF, st.integers(min_value=0, max_value=BNF.PRIME - 1))
+bnf2_strategy = bnfN_strategy(BNF2, 2)
+bnf12_strategy = bnfN_strategy(BNF12, 12)
+
+# Point at infinity for BNP12
+bnp12_infinity = BNP12(
+    BNF12((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)),
+    BNF12((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)),
+)
+
+
+def bnp_generate_valid_point(x):
+    g = BNP(1, 2)
+    return g.mul_by(x)
+
+
+# Strategy for BNP points on the curve
+bnp_strategy = st.integers(min_value=0, max_value=BNF.PRIME - 1).map(
+    lambda x: bnp_generate_valid_point(x)
+)
+
+
+def bnp12_from_bnp_random_point():
+    point = AltBn128.random_point()
+    return bnp_to_bnp12(BNP(point.x, point.y))
+
+
+bnp12_from_twist_strategy = st.integers(min_value=0, max_value=BNF2.PRIME - 1).map(
+    lambda x: twist(bnp2_generate_valid_point(x))
+)
+# Strategy for BNP12 points on the curve
+bnp12_strategy = st.one_of(
+    st.just(bnp12_from_bnp_random_point()),
+    st.just(bnp12_infinity),
+    bnp12_from_twist_strategy,
+)
+
+
+# Use the the generator for BNP2 with scalar multiplication
+# https://eips.ethereum.org/EIPS/eip-197#definition-of-the-groups
+def bnp2_generate_valid_point(random_scalar: int):
+    g2_x = BNF2(
+        (
+            10857046999023057135944570762232829481370756359578518086990519993285655852781,
+            11559732032986387107991004021392285783925812861821192530917403151452391805634,
+        )
+    )
+    g2_y = BNF2(
+        (
+            8495653923123431417604973247489272438418190587263600148770280649306958101930,
+            4082367875863433681332203403145435568316851327593401208105741076214120093531,
+        )
+    )
+    generator = BNP2(g2_x, g2_y)
+    return generator.mul_by(random_scalar)
+
+
+bnp2_strategy = st.integers(min_value=0, max_value=BNF2.PRIME - 1).map(
+    lambda x: bnp2_generate_valid_point(x)
+)
+
+
 def register_type_strategies():
     st.register_type_strategy(U64, uint64)
     st.register_type_strategy(Uint, uint)
     st.register_type_strategy(FixedUnsigned, uint)
     st.register_type_strategy(U256, uint256)
+    st.register_type_strategy(U384, uint384)
     st.register_type_strategy(Bytes0, bytes0)
     st.register_type_strategy(Bytes4, bytes4)
     st.register_type_strategy(Bytes8, bytes8)
@@ -591,7 +715,7 @@ def register_type_strategies():
     st.register_type_strategy(tuple, tuple_strategy)
     st.register_type_strategy(dict, dict_strategy)
     st.register_type_strategy(ChainMap, dict_strategy)
-    st.register_type_strategy(State, state)
+    st.register_type_strategy(State, state_strategy())
     st.register_type_strategy(TransientStorage, transient_storage)
     st.register_type_strategy(MutableBloom, bloom.map(MutableBloom))
     st.register_type_strategy(Environment, environment_lite)
@@ -600,3 +724,9 @@ def register_type_strategies():
         VersionedHash,
         st.binary(min_size=31, max_size=31).map(lambda x: VersionedHash(b"\x01" + x)),
     )
+    st.register_type_strategy(BNF12, bnf12_strategy)
+    st.register_type_strategy(BNP12, bnp12_strategy)
+    st.register_type_strategy(BNF2, bnf2_strategy)
+    st.register_type_strategy(BNF, bnf_strategy)
+    st.register_type_strategy(BNP, bnp_strategy)
+    st.register_type_strategy(BNP2, bnp2_strategy)

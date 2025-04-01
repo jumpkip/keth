@@ -3,14 +3,8 @@ from starkware.cairo.lang.compiler.lib.registers import get_fp_and_pc
 from starkware.cairo.common.uint256 import Uint256
 
 from cairo_core.maths import unsigned_div_rem
-from cairo_ec.circuits.mod_ops_compiled import (
-    assert_eq,
-    assert_neq,
-    neg,
-    assert_neg,
-    assert_not_neg,
-    div,
-)
+from cairo_ec.circuits.mod_ops_compiled import assert_eq, assert_neg, assert_neq, assert_not_neg
+from cairo_core.numeric import U384, U384Struct
 
 const STARK_MIN_ONE_D2 = 0x800000000000011;
 
@@ -82,26 +76,18 @@ func uint384_assert_le{range_check96_ptr: felt*}(a: UInt384, b: UInt384) {
     return ();
 }
 
-// Returns 1 if X == Y, 0 otherwise.
-func uint384_eq{range_check96_ptr: felt*}(x: UInt384, y: UInt384) -> felt {
-    if (x.d0 == y.d0 and x.d1 == y.d1 and x.d2 == y.d2 and x.d3 == y.d3) {
-        return 1;
-    }
-    return 0;
-}
-
 // Returns 1 if X == Y mod p, 0 otherwise.
 func uint384_eq_mod_p{range_check96_ptr: felt*, add_mod_ptr: ModBuiltin*, mul_mod_ptr: ModBuiltin*}(
-    x: UInt384, y: UInt384, p: UInt384
+    x: U384, y: U384, p: U384
 ) -> felt {
     tempvar x_mod_p_eq_y_mod_p;
     %{ x_mod_p_eq_y_mod_p_hint %}
 
     if (x_mod_p_eq_y_mod_p != 0) {
-        assert_eq(new x, new y, new p);
+        assert_eq(x, y, p);
         return 1;
     } else {
-        assert_neq(new x, new y, new p);
+        assert_neq(x, y, p);
         return 0;
     }
 }
@@ -109,14 +95,14 @@ func uint384_eq_mod_p{range_check96_ptr: felt*, add_mod_ptr: ModBuiltin*, mul_mo
 // Returns 1 if X == -Y mod p, 0 otherwise.
 func uint384_is_neg_mod_p{
     range_check96_ptr: felt*, add_mod_ptr: ModBuiltin*, mul_mod_ptr: ModBuiltin*
-}(x: UInt384, y: UInt384, p: UInt384) -> felt {
+}(x: U384, y: U384, p: U384) -> felt {
     tempvar x_is_neg_y_mod_p;
     %{ x_is_neg_y_mod_p_hint %}
     if (x_is_neg_y_mod_p != 0) {
-        assert_neg(new x, new y, new p);
+        assert_neg(x, y, p);
         return 1;
     } else {
-        assert_not_neg(new x, new y, new p);
+        assert_not_neg(x, y, p);
         return 0;
     }
 }

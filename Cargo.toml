@@ -50,12 +50,18 @@ serde_json = "1"
 thiserror = "1.0"
 url = "2.5"
 reqwest = { version = "0.12", features = ["json", "multipart"] }
-
+stwo-cairo-adapter = { version = "*", features = ["std"] }
+stwo_cairo_prover = "*"
+cairo-air = "*"
 cairo-vm = { git = "https://github.com/lambdaclass/cairo-vm.git", tag = "v2.0.0-rc5", features = [
   "test_utils",
   "mod_builtin",
 ] }
 
-
 [patch."https://github.com/lambdaclass/cairo-vm.git"]
-cairo-vm = { git = "https://github.com/kkrt-labs/cairo-vm", rev = "016fc91e5c45f2baa7250e908593588f8bd900c2" }
+cairo-vm = { git = "https://github.com/kkrt-labs/cairo-vm", rev = "d101ee86d21a80db7b2dd17ffeca12025371cc1e" }
+
+[patch.crates-io]
+stwo-cairo-adapter = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "c9a4ea197077c07df218bf0e088a636db052525d" }
+stwo_cairo_prover = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "c9a4ea197077c07df218bf0e088a636db052525d" }
+cairo-air = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "c9a4ea197077c07df218bf0e088a636db052525d" }

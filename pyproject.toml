@@ -9,6 +9,8 @@ dependencies = [
   "cairo-addons",
   "cairo-ec",
   "cairo-core",
+  "eth-rpc",
+  "mpt",
   "cairo-lang>=0.13.2",
   "marshmallow-dataclass>=8.6.1",
   "python-dotenv>=1.0.1",
@@ -16,7 +18,12 @@ dependencies = [
   "web3>=7.2.0",
   "xxhash>=3.5.0",
   "garaga",
+  "colorama>=0.4.6",
+  "pytest-timeout>=2.3.1",
+  "pytest-randomly>=3.16.0",
+  "pytest-timeout>=2.3.1",
   "ethereum",
+  "garaga-zero",
 ]
 
 [tool.uv]
@@ -44,7 +51,9 @@ garaga = { git = "https://github.com/keep-starknet-strange/garaga.git", rev = "h
 cairo-addons = { workspace = true }
 cairo-ec = { workspace = true }
 cairo-core = { workspace = true }
-ethereum = { git = "https://github.com/ethereum/execution-specs.git" }
+eth-rpc = { workspace = true }
+mpt = { workspace = true }
+garaga-zero = { git = "https://github.com/kkrt-labs/garaga-zero" }
 
 [tool.uv.workspace]
 members = ["python/*"]
@@ -61,6 +70,7 @@ filterwarnings = [
 ]
 asyncio_default_fixture_loop_scope = 'session'
 markers = [
+  "max_steps(n): Run tests with a maximum number of steps",
   "python_vm:      Run tests in the python VM",
   "ArithmeticOperations",
   "ADD:            Opcode Value 0x01 - Addition operation",
@@ -164,6 +174,7 @@ markers = [
   "NoCI",
   "slow",
   "cairo_file(path): mark test with cairo source file path to compile",
+  "bigmem",
 ]
 norecursedirs = ".* cairo/tests/ef_tests/fixtures"
 addopts = [
@@ -176,7 +187,7 @@ addopts = [
 profile = "black"
 src_paths = ["cairo/src", "cairo/tests"]
 known_third_party = ["ethereum", "ethereum_rlp", "ethereum_types"]
-known_first_party = ["cairo_ec", "cairo_core", "cairo_addons"]
+known_first_party = ["cairo_ec", "cairo_core", "cairo_addons", "eth_rpc", "mpt"]
 
 [tool.autoflake]
 in_place = true
@@ -200,6 +211,10 @@ build-backend = "hatchling.build"
 packages = ["cairo/src", "cairo/tests", "cairo/scripts"]
 
 [project.scripts]
-compile_os = "scripts.compile_cairo:compile_os"
-compile_fibonacci = "scripts.compile_cairo:compile_fibonacci"
+compile = "scripts.compile_cairo:main"
+compile_keth = "scripts.compile_cairo:compile_keth"
 zkpi_to_eels = "scripts.zkpi_to_eels:main"
+prove-block = "scripts.prove_block:main"
+test-fast = "scripts.test:test_fast"
+test-unit = "scripts.test:test_unit"
+test-ef = "scripts.test:test_ef"

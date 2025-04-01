@@ -11,14 +11,18 @@ from starkware.cairo.lang.compiler.lib.registers import get_fp_and_pc
 
 from cairo_core.bytes import Bytes32, Bytes32Struct
 from cairo_core.maths import assert_uint256_le
+from cairo_core.numeric import U384, U384Struct
 from cairo_ec.circuit_utils import N_LIMBS, hash_full_transcript
 from cairo_ec.circuits.ec_ops_compiled import ecip_2p
 from cairo_ec.curve_utils import scalar_to_epns
-from cairo_ec.curve.g1_point import G1Point
+from cairo_ec.curve.g1_point import G1Point, G1PointStruct
 from cairo_ec.curve.ids import CurveID
 from cairo_ec.ec_ops import ec_add, try_get_point_from_x, get_random_point
 from cairo_ec.circuits.mod_ops_compiled import div, neg
 from cairo_ec.uint384 import uint384_to_uint256, felt_to_uint384
+from starkware.cairo.common.registers import get_label_location
+from ethereum.utils.numeric import U384__eq__, U384_ZERO
+from starkware.cairo.common.memcpy import memcpy
 
 namespace secp256k1 {
     const CURVE_ID = CurveID.SECP256K1;
@@ -60,13 +64,18 @@ namespace secp256k1 {
 //     0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8
 // )
 // @dev Split in 96 bits chunks
-func get_generator_point() -> G1Point* {
+func get_generator_point() -> G1Point {
     let (_, pc) = get_fp_and_pc();
 
     pc_label:
     let generator_ptr = pc + (generator_label - pc_label);
 
-    return cast(generator_ptr, G1Point*);
+    tempvar res = G1Point(
+        new G1PointStruct(
+            x=U384(cast(generator_ptr, U384Struct*)), y=U384(cast(generator_ptr + 4, U384Struct*))
+        ),
+    );
+    return res;
 
     generator_label:
     dw 0x2dce28d959f2815b16f81798;  // x.d0
@@ -120,19 +129,21 @@ func try_recover_public_key{
     alloc_locals;
     let (__fp__, _) = get_fp_and_pc();
 
-    local a: UInt384 = UInt384(secp256k1.A0, secp256k1.A1, secp256k1.A2, secp256k1.A3);
-    local b: UInt384 = UInt384(secp256k1.B0, secp256k1.B1, secp256k1.B2, secp256k1.B3);
-    local g: UInt384 = UInt384(secp256k1.G0, secp256k1.G1, secp256k1.G2, secp256k1.G3);
-    local p: UInt384 = UInt384(secp256k1.P0, secp256k1.P1, secp256k1.P2, secp256k1.P3);
+    tempvar a = U384(new UInt384(secp256k1.A0, secp256k1.A1, secp256k1.A2, secp256k1.A3));
+    tempvar b = U384(new UInt384(secp256k1.B0, secp256k1.B1, secp256k1.B2, secp256k1.B3));
+    tempvar g = U384(new UInt384(secp256k1.G0, secp256k1.G1, secp256k1.G2, secp256k1.G3));
+    tempvar modulus = U384(new UInt384(secp256k1.P0, secp256k1.P1, secp256k1.P2, secp256k1.P3));
 
-    let (y, is_on_curve) = try_get_point_from_x(x=&r, v=y_parity, a=&a, b=&b, g=&g, p=&p);
+    let (y, is_on_curve) = try_get_point_from_x(
+        x=U384(&r), v=y_parity, a=a, b=b, g=g, modulus=modulus
+    );
     if (is_on_curve == 0) {
         tempvar public_key_x = Bytes32(new Bytes32Struct(0, 0));
         tempvar public_key_y = Bytes32(new Bytes32Struct(0, 0));
         return (public_key_x=public_key_x, public_key_y=public_key_y, success=0);
     }
 
-    tempvar r_point = G1Point(x=r, y=[y]);
+    tempvar r_point = G1Point(new G1PointStruct(x=U384(&r), y=y));
 
     // The result is given by
     //   -(msg_hash / r) * gen + (s / r) * r_point
@@ -141,13 +152,13 @@ func try_recover_public_key{
     let N = UInt384(secp256k1.N0, secp256k1.N1, secp256k1.N2, secp256k1.N3);
     let N_min_one = Uint256(secp256k1.N_LOW_128 - 1, secp256k1.N_HIGH_128);
 
-    let _u1 = div(new msg_hash, new r, new N);
-    let _u1 = neg(_u1, new N);
-    let _u2 = div(new s, new r, new N);
+    let _u1 = div(U384(&msg_hash), U384(&r), U384(new N));
+    let _u1 = neg(_u1, U384(new N));
+    let _u2 = div(U384(&s), U384(&r), U384(new N));
 
-    let u1 = uint384_to_uint256([_u1]);
+    let u1 = uint384_to_uint256([_u1.value]);
     assert_uint256_le(u1, N_min_one);
-    let u2 = uint384_to_uint256([_u2]);
+    let u2 = uint384_to_uint256([_u2.value]);
     assert_uint256_le(u2, N_min_one);
 
     let (ep1_low, en1_low, sp1_low, sn1_low) = scalar_to_epns(u1.low);
@@ -179,6 +190,7 @@ func try_recover_public_key{
     // Interaction with Poseidon, protocol is roughly a sequence of hashing:
     // - initial constant 'MSM_G1'
     // - curve ID
+    // - Number of scalars in MSM
     // - curve generator G
     // - user input R point
     //
@@ -196,17 +208,26 @@ func try_recover_public_key{
     tempvar ecip_circuit_constants_offset = 5 * N_LIMBS;
     tempvar ecip_circuit_q_offset = 46 * N_LIMBS;
 
+    let msm_size = 2;
     assert poseidon_ptr[0].input = PoseidonBuiltinState(s0='MSM_G1', s1=0, s2=1);
     assert poseidon_ptr[1].input = PoseidonBuiltinState(
         s0=secp256k1.CURVE_ID + poseidon_ptr[0].output.s0,
-        s1=2 + poseidon_ptr[0].output.s1,
+        s1=msm_size + poseidon_ptr[0].output.s1,
         s2=poseidon_ptr[0].output.s2,
     );
     let poseidon_ptr = poseidon_ptr + 2 * PoseidonBuiltin.SIZE;
 
     let generator_point = get_generator_point();
-    hash_full_transcript(cast(generator_point, felt*), 2);
-    hash_full_transcript(cast(&r_point, felt*), 2);
+    let (generator_point_limbs: felt*) = alloc();
+    memcpy(generator_point_limbs, generator_point.value.x.value, 4);
+    memcpy(generator_point_limbs + 4, generator_point.value.y.value, 4);
+    hash_full_transcript(generator_point_limbs, 2);
+
+    let (r_limbs: felt*) = alloc();
+    memcpy(r_limbs, r_point.value.x.value, 4);
+    memcpy(r_limbs + 4, r_point.value.y.value, 4);
+    hash_full_transcript(r_limbs, 2);
+
     // Q_low, Q_high, Q_high_shifted (filled by prover) (46 - 51).
     hash_full_transcript(
         range_check96_ptr + rlc_coeff_u384_cast_offset + ecip_circuit_constants_offset +
@@ -233,7 +254,7 @@ func try_recover_public_key{
     tempvar range_check96_ptr_init = range_check96_ptr;
     tempvar range_check96_ptr_after_circuit = range_check96_ptr + 1200;
     let random_point = get_random_point{range_check96_ptr=range_check96_ptr_after_circuit}(
-        seed=[cast(poseidon_ptr, felt*) - 3], a=&a, b=&b, g=&g, p=&p
+        seed=[cast(poseidon_ptr, felt*) - 3], a=a, b=b, g=g, modulus=modulus
     );
     let range_check96_ptr = range_check96_ptr_init;
 
@@ -246,83 +267,84 @@ func try_recover_public_key{
 
     // q_low, q_high, q_high_shifted (46 - 51)
 
-    tempvar random_point_x = new random_point.x;
-    tempvar random_point_y = new random_point.y;
-
     ecip_2p(
-        &ecip_input[0],
-        &ecip_input[1],
-        &ecip_input[2],
-        &ecip_input[3],
-        &ecip_input[4],
-        &ecip_input[5],
-        &ecip_input[6],
-        &ecip_input[7],
-        &ecip_input[8],
-        &ecip_input[9],
-        &ecip_input[10],
-        &ecip_input[11],
-        &ecip_input[12],
-        &ecip_input[13],
-        &ecip_input[14],
-        &ecip_input[15],
-        &ecip_input[16],
-        &ecip_input[17],
-        &ecip_input[18],
-        &ecip_input[19],
-        &ecip_input[20],
-        &ecip_input[21],
-        &ecip_input[22],
-        &ecip_input[23],
-        &ecip_input[24],
-        &ecip_input[25],
-        &generator_point.x,
-        &generator_point.y,
-        &r_point.x,
-        &r_point.y,
-        &ep1_low_u384,
-        &en1_low_u384,
-        &sp1_low_u384,
-        &sn1_low_u384,
-        &ep2_low_u384,
-        &en2_low_u384,
-        &sp2_low_u384,
-        &sn2_low_u384,
-        &ep1_high_u384,
-        &en1_high_u384,
-        &sp1_high_u384,
-        &sn1_high_u384,
-        &ep2_high_u384,
-        &en2_high_u384,
-        &sp2_high_u384,
-        &sn2_high_u384,
-        &ecip_input[46],
-        &ecip_input[47],
-        &ecip_input[48],
-        &ecip_input[49],
-        &ecip_input[50],
-        &ecip_input[51],
-        random_point_x,
-        random_point_y,
-        &a,
-        &b,
-        &rlc_coeff_u384,
-        &p,
+        U384(&ecip_input[0]),
+        U384(&ecip_input[1]),
+        U384(&ecip_input[2]),
+        U384(&ecip_input[3]),
+        U384(&ecip_input[4]),
+        U384(&ecip_input[5]),
+        U384(&ecip_input[6]),
+        U384(&ecip_input[7]),
+        U384(&ecip_input[8]),
+        U384(&ecip_input[9]),
+        U384(&ecip_input[10]),
+        U384(&ecip_input[11]),
+        U384(&ecip_input[12]),
+        U384(&ecip_input[13]),
+        U384(&ecip_input[14]),
+        U384(&ecip_input[15]),
+        U384(&ecip_input[16]),
+        U384(&ecip_input[17]),
+        U384(&ecip_input[18]),
+        U384(&ecip_input[19]),
+        U384(&ecip_input[20]),
+        U384(&ecip_input[21]),
+        U384(&ecip_input[22]),
+        U384(&ecip_input[23]),
+        U384(&ecip_input[24]),
+        U384(&ecip_input[25]),
+        generator_point.value,
+        r_point.value,
+        U384(&ep1_low_u384),
+        U384(&en1_low_u384),
+        U384(&sp1_low_u384),
+        U384(&sn1_low_u384),
+        U384(&ep2_low_u384),
+        U384(&en2_low_u384),
+        U384(&sp2_low_u384),
+        U384(&sn2_low_u384),
+        U384(&ep1_high_u384),
+        U384(&en1_high_u384),
+        U384(&sp1_high_u384),
+        U384(&sn1_high_u384),
+        U384(&ep2_high_u384),
+        U384(&en2_high_u384),
+        U384(&sp2_high_u384),
+        U384(&sn2_high_u384),
+        U384(&ecip_input[46]),
+        U384(&ecip_input[47]),
+        U384(&ecip_input[48]),
+        U384(&ecip_input[49]),
+        U384(&ecip_input[50]),
+        U384(&ecip_input[51]),
+        random_point.value,
+        a,
+        b,
+        U384(&rlc_coeff_u384),
+        modulus=modulus,
     );
 
     let range_check96_ptr = range_check96_ptr_after_circuit;
 
-    let res = ec_add(
-        G1Point(x=ecip_input[46], y=ecip_input[47]),
-        G1Point(x=ecip_input[50], y=ecip_input[51]),
-        a,
-        p,
-    );
+    tempvar p0 = G1Point(new G1PointStruct(x=U384(&ecip_input[46]), y=U384(&ecip_input[47])));
+    tempvar p1 = G1Point(new G1PointStruct(x=U384(&ecip_input[50]), y=U384(&ecip_input[51])));
+
+    let res = ec_add(p0, p1, a, modulus);
+
+    let (u384_zero) = get_label_location(U384_ZERO);
+    let point_at_infinity_x = U384__eq__(res.value.x, U384(cast(u384_zero, U384Struct*)));
+    let point_at_infinity_y = U384__eq__(res.value.y, U384(cast(u384_zero, U384Struct*)));
+    if (point_at_infinity_x.value != 0 and point_at_infinity_y.value != 0) {
+        tempvar public_key_x = Bytes32(new Bytes32Struct(0, 0));
+        tempvar public_key_y = Bytes32(new Bytes32Struct(0, 0));
+        return (public_key_x=public_key_x, public_key_y=public_key_y, success=0);
+    }
 
     let max_value = Uint256(secp256k1.P_LOW_128 - 1, secp256k1.P_HIGH_128);
-    let x_uint256 = uint384_to_uint256(res.x);
+    let x_uint256 = uint384_to_uint256([res.value.x.value]);
     assert_uint256_le(x_uint256, max_value);
-    let y_uint256 = uint384_to_uint256(res.y);
+    let y_uint256 = uint384_to_uint256([res.value.y.value]);
     assert_uint256_le(y_uint256, max_value);
 
     let (x_reversed) = uint256_reverse_endian(x_uint256);

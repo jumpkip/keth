@@ -32,6 +32,7 @@ from hypothesis import strategies as st
 
 from cairo_addons.testing.errors import cairo_error, strict_raises
 from cairo_addons.testing.hints import patch_hint
+from mpt.utils import nibble_list_to_bytes
 from tests.utils.args_gen import EthereumTries
 from tests.utils.assertion import sequence_equal
 from tests.utils.strategies import bytes32, nibble, trie_strategy, uint4
@@ -100,6 +101,10 @@ class TestTrie:
         assert nibble_list_to_compact(x, is_leaf) == cairo_run(
             "nibble_list_to_compact", x, is_leaf
         )
+
+    @given(x=nibble)
+    def test_nibble_list_to_bytes(self, cairo_run, x):
+        assert nibble_list_to_bytes(x) == cairo_run("nibble_list_to_bytes", x)
 
     @given(x=nibble.filter(lambda x: len(x) != 0), is_leaf=...)
     @settings(verbosity=Verbosity.quiet)
@@ -449,3 +454,19 @@ class TestTrieOperations:
             copied_trie_py = copy_trie(trie)
             assert original_trie == trie
             assert copied_trie_cairo == copied_trie_py
+
+
+class TestTypes:
+    @given(left=..., right=...)
+    def test_leaf_node_eq(self, cairo_run, left: LeafNode, right: LeafNode):
+        assert (left == right) == cairo_run("LeafNode__eq__", left, right)
+
+    @given(left=..., right=...)
+    def test_extension_node_eq(
+        self, cairo_run, left: ExtensionNode, right: ExtensionNode
+    ):
+        assert (left == right) == cairo_run("ExtensionNode__eq__", left, right)
+
+    @given(left=..., right=...)
+    def test_branch_node_eq(self, cairo_run, left: BranchNode, right: BranchNode):
+        assert (left == right) == cairo_run("BranchNode__eq__", left, right)

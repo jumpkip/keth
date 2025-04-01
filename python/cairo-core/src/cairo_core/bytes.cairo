@@ -49,6 +49,10 @@ struct Bytes32 {
     value: Bytes32Struct*,
 }
 
+struct OptionalBytes32 {
+    value: Bytes32Struct*,
+}
+
 // 256 individual bytes, unpacked.
 struct Bytes256 {
     value: felt*,
@@ -66,13 +70,14 @@ struct Bytes {
 // Some parts of the exec spec use bytes, so just easier to copy/paste
 using bytes = Bytes;
 
-struct StringStruct {
-    data: felt*,
-    len: felt,
+// OptionalBytes is the same type as Bytes, but the possibility of value being Null needs to be handled
+// In function business logic
+struct OptionalBytes {
+    value: BytesStruct*,
 }
-struct String {
-    value: StringStruct*,
-}
+
+using String = Bytes;
+using StringStruct = BytesStruct;
 
 // In Cairo, tuples are not a first-class type, so we need to define a custom
 // struct to represent a tuple of Bytes32.

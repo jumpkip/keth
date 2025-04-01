@@ -13,6 +13,7 @@ from ethereum_types.bytes import (
 from ethereum_types.numeric import bool
 from starkware.cairo.common.alloc import alloc
 from starkware.cairo.common.math import assert_not_equal, split_int
+from starkware.cairo.common.math_cmp import is_le
 from starkware.cairo.common.memcpy import memcpy
 from starkware.cairo.common.memset import memset
 from starkware.cairo.common.cairo_builtins import BitwiseBuiltin
@@ -25,6 +26,36 @@ from cairo_core.maths import unsigned_div_rem, felt252_to_bytes_le, felt252_to_b
 from cairo_core.comparison import is_zero
 from ethereum.utils.numeric import min
 from legacy.utils.bytes import bytes_to_felt_le
+
+// / @notice Creates a deep copy of a Bytes object
+// / @dev Allocates new memory and copies the content of the original Bytes object
+// / @param _self The Bytes object to copy
+// / @return A new Bytes object with the same content but in a different memory location
+func Bytes__copy__(_self: Bytes) -> Bytes {
+    alloc_locals;
+    let (local buffer: felt*) = alloc();
+    memcpy(buffer, _self.value.data, _self.value.len);
+    tempvar copied = Bytes(new BytesStruct(data=buffer, len=_self.value.len));
+    return copied;
+}
+
+func Bytes__add__(_self: Bytes, other: Bytes) -> Bytes {
+    alloc_locals;
+    let (local buffer: felt*) = alloc();
+    memcpy(buffer, _self.value.data, _self.value.len);
+    memcpy(buffer + _self.value.len, other.value.data, other.value.len);
+    tempvar res = Bytes(new BytesStruct(data=buffer, len=_self.value.len + other.value.len));
+    return res;
+}
+
+func Bytes__extend__{self: Bytes}(other: Bytes) {
+    alloc_locals;
+    memcpy(self.value.data + self.value.len, other.value.data, other.value.len);
+    tempvar self = Bytes(
+        new BytesStruct(data=self.value.data, len=self.value.len + other.value.len)
+    );
+    return ();
+}
 
 func Bytes__eq__(_self: Bytes, other: Bytes) -> bool {
     if (_self.value.len != other.value.len) {
@@ -68,6 +99,19 @@ func Bytes__eq__(_self: Bytes, other: Bytes) -> bool {
 
     end:
     let res = bool([ap - 1]);
+    return res;
+}
+
+func Bytes__startswith__{range_check_ptr}(self: Bytes, prefix: Bytes) -> bool {
+    alloc_locals;
+    let len_smaller = is_le(prefix.value.len, self.value.len);
+    if (len_smaller == 0) {
+        tempvar res = bool(0);
+        return res;
+    }
+    // Check whether self.value.data[0:len(prefix)] == prefix
+    tempvar self_slice = Bytes(new BytesStruct(data=self.value.data, len=prefix.value.len));
+    let res = Bytes__eq__(self_slice, prefix);
     return res;
 }
 
@@ -211,6 +255,12 @@ func Bytes8_to_Bytes{range_check_ptr}(src: Bytes8) -> Bytes {
 
 func Bytes_to_Bytes32{range_check_ptr}(src: Bytes) -> Bytes32 {
     alloc_locals;
+    // Assert that the input is at most 32 bytes
+    with_attr error_message("ValueError: got more than 32 bytes") {
+        assert [range_check_ptr] = src.value.len;
+        assert [range_check_ptr + 1] = 32 - src.value.len;
+        let range_check_ptr = range_check_ptr + 2;
+    }
     let (buffer: felt*) = alloc();
     let low_len = min(src.value.len, 16);
     let low = bytes_to_felt_le(low_len, src.value.data);

@@ -53,11 +53,12 @@ import functools
 import inspect
 import sys
 from collections import ChainMap, abc, defaultdict
-from dataclasses import dataclass, fields, is_dataclass, make_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass, make_dataclass
 from functools import partial
 from typing import (
     Annotated,
     Any,
+    ClassVar,
     Dict,
     ForwardRef,
     List,
@@ -76,7 +77,13 @@ from typing import (
 
 from ethereum.cancun.blocks import Block, Header, Log, Receipt, Withdrawal
 from ethereum.cancun.fork import ApplyBodyOutput, BlockChain
-from ethereum.cancun.fork_types import Account, Address, Bloom, Root, VersionedHash
+from ethereum.cancun.fork_types import Account as AccountBase
+from ethereum.cancun.fork_types import (
+    Address,
+    Bloom,
+    Root,
+    VersionedHash,
+)
 from ethereum.cancun.state import State, TransientStorage
 from ethereum.cancun.transactions import (
     AccessListTransaction,
@@ -90,7 +97,6 @@ from ethereum.cancun.trie import (
     ExtensionNode,
     InternalNode,
     LeafNode,
-    Node,
     Trie,
     trie_get,
     trie_set,
@@ -100,6 +106,7 @@ from ethereum.cancun.vm import Evm as EvmBase
 from ethereum.cancun.vm import Message as MessageBase
 from ethereum.cancun.vm.gas import ExtendMemory, MessageCallGas
 from ethereum.cancun.vm.interpreter import MessageCallOutput as MessageCallOutputBase
+from ethereum.crypto.alt_bn128 import BNF, BNF2, BNF12, BNP, BNP2, BNP12
 from ethereum.crypto.hash import Hash32
 from ethereum.exceptions import EthereumException
 from ethereum_rlp.rlp import Extended, Simple
@@ -113,7 +120,8 @@ from ethereum_types.bytes import (
     Bytes32,
     Bytes256,
 )
-from ethereum_types.numeric import U64, U256, Uint
+from ethereum_types.frozen import slotted_freezable
+from ethereum_types.numeric import U64, U256, FixedUnsigned, Uint, _max_value
 from starkware.cairo.common.dict import DictManager, DictTracker
 from starkware.cairo.lang.cairo_constants import DEFAULT_PRIME
 from starkware.cairo.lang.compiler.ast.cairo_types import (
@@ -135,6 +143,8 @@ from starkware.cairo.lang.vm.relocatable import RelocatableValue
 from cairo_addons.vm import DictTracker as RustDictTracker
 from cairo_addons.vm import MemorySegmentManager as RustMemorySegmentManager
 from cairo_addons.vm import Relocatable as RustRelocatable
+from cairo_ec.curve import ECBase
+from mpt.utils import AccountNode
 from tests.utils.helpers import flatten
 
 HASHED_TYPES = [
@@ -149,6 +159,45 @@ HASHED_TYPES = [
     Tuple[Bytes20, Bytes32],
     tuple[Bytes20, Bytes32],
 ]
+
+
+class U384(FixedUnsigned):
+    """
+    Unsigned integer, which can represent `0` to `2 ** 384 - 1`, inclusive.
+    """
+
+    MAX_VALUE: ClassVar["U384"]
+    """
+    Largest value that can be represented by this integer type.
+    """
+
+    def __init__(self, value) -> None:
+        super().__init__(value)
+
+    # All these operator overloads are required for instantiation of Curve points with int values;
+    # because we serialize our types as U384, but the curve
+    def __mod__(self, other: Union[int, "U384"]):
+        if isinstance(other, U384):
+            return U384(self._number % other._number)
+        return U384(self._number % other)
+
+    def __add__(self, other: Union[int, "U384"]):
+        if isinstance(other, U384):
+            return U384(self._number + other._number)
+        return U384(self._number + other)
+
+    def __mul__(self, other: Union[int, "U384"]):
+        if isinstance(other, U384):
+            return U384(self._number * other._number)
+        return U384(self._number * other)
+
+    def __sub__(self, other: Union[int, "U384"]):
+        if isinstance(other, U384):
+            return U384(self._number - other._number)
+        return U384(self._number - other)
+
+
+U384.MAX_VALUE = _max_value(U384, 384)
 
 
 class Memory(bytearray):
@@ -174,6 +223,137 @@ class Stack(List[T]):
         if len(self) + len(values) > self.MAX_SIZE:
             del self[self.MAX_SIZE - len(values) :]
         self.extend(values)
+
+
+# All these classes are auto-patched in test imports in cairo/tests/conftests.py
+@dataclass
+class Environment(
+    make_dataclass(
+        "Environment",
+        [(f.name, f.type, f) for f in fields(EnvironmentBase) if f.name != "traces"],
+        namespace={"__doc__": EnvironmentBase.__doc__},
+    )
+):
+    def __eq__(self, other):
+        return all(
+            getattr(self, field.name) == getattr(other, field.name)
+            for field in fields(self)
+        )
+
+    @functools.wraps(EnvironmentBase.__init__)
+    def __init__(self, *args, **kwargs):
+        if "traces" in kwargs:
+            del kwargs["traces"]
+        super().__init__(*args, **kwargs)
+
+    @property
+    def traces(self):
+        return []
+
+
+@dataclass
+class MessageCallOutput(
+    make_dataclass(
+        "MessageCallOutput",
+        [(f.name, f.type, f) for f in fields(MessageCallOutputBase)],
+        namespace={"__doc__": MessageCallOutputBase.__doc__},
+    )
+):
+    def __eq__(self, other):
+        return all(
+            getattr(self, field.name) == getattr(other, field.name)
+            for field in fields(self)
+            if field.name != "error"
+        ) and type(self.error) is type(other.error)
+
+
+@dataclass
+class Message(
+    make_dataclass(
+        "Message",
+        [
+            (f.name, f.type if f.name != "parent_evm" else Optional["Evm"], f)
+            for f in fields(MessageBase)
+        ],
+        namespace={"__doc__": MessageBase.__doc__},
+    )
+):
+    def __eq__(self, other):
+        common_fields = all(
+            getattr(self, field.name) == getattr(other, field.name)
+            for field in fields(self)
+            if field.name != "parent_evm"
+        )
+        return common_fields and self.parent_evm == other.parent_evm
+
+
+EMPTY_STORAGE_ROOT = Bytes32(
+    (0x56E81F171BCC55A6FF8345E692C0F86E5B48E01B996CADC001622FB5E363B421).to_bytes(
+        32, "big"
+    )
+)
+
+# Separate setup & class definition to apply freezable decorator
+AccountDataclass = make_dataclass(
+    "AccountDataclass",
+    [(f.name, f.type, f) for f in fields(AccountBase)]
+    + [("storage_root", Bytes32, field(default=EMPTY_STORAGE_ROOT))],
+    namespace={"__doc__": AccountBase.__doc__},
+)
+
+
+@slotted_freezable
+@dataclass
+class Account(AccountDataclass):
+    def __eq__(self, other):
+        if not isinstance(other, Account):
+            return False
+        return all(
+            getattr(self, field.name) == getattr(other, field.name)
+            for field in fields(self)
+            if field.name != "storage_root"
+        )
+
+
+EMPTY_ACCOUNT = Account(
+    nonce=Uint(0), balance=U256(0), code=b"", storage_root=EMPTY_STORAGE_ROOT
+)
+
+
+# Re-definition of the Node type to be used in the tests.
+# This is required for the `encode_node` function in `ethereum.cancun.trie` to work.
+Node = Union[Account, Bytes, LegacyTransaction, Receipt, Uint, U256, Withdrawal, None]
+
+_field_mapping = {
+    "stack": Stack[U256],
+    "memory": Memory,
+    "env": Environment,
+    "error": Optional[EthereumException],
+    "message": Message,
+}
+
+
+@dataclass
+class Evm(
+    make_dataclass(
+        "Evm",
+        [(f.name, _field_mapping.get(f.name, f.type), f) for f in fields(EvmBase)],
+        namespace={"__doc__": EvmBase.__doc__},
+    )
+):
+    def __eq__(self, other):
+        common_fields_ok = all(
+            getattr(self, field.name) == getattr(other, field.name)
+            for field in fields(self)
+            if field.name != "error" and field.name != "refund_counter"
+        ) and type(self.error) is type(other.error)
+
+        # The refund_counter is a felt, is serialized as a positive integer `int`, but in this specific case,
+        # we want a felt (that can be either positive or negative)
+        refund_counter_ok = (
+            self.refund_counter % DEFAULT_PRIME == other.refund_counter % DEFAULT_PRIME
+        )
+        return common_fields_ok and refund_counter_ok
 
 
 @dataclass
@@ -265,6 +445,20 @@ class FlatState:
 
 
 @dataclass
+class AddressAccountNodeDiffEntry:
+    key: Address
+    prev_value: AccountNode
+    new_value: AccountNode
+
+
+@dataclass
+class StorageDiffEntry:
+    key: int
+    prev_value: U256
+    new_value: U256
+
+
+@dataclass
 class FlatTransientStorage:
     """A version of the TransientStorage class that has flattened storage tries.
     The keys of the storage tries are of type Tuple[Address, Bytes32]
@@ -340,93 +534,6 @@ class FlatTransientStorage:
         return ts
 
 
-# All these classes are auto-patched in test imports in cairo/tests/conftests.py
-@dataclass
-class Environment(
-    make_dataclass(
-        "Environment",
-        [(f.name, f.type, f) for f in fields(EnvironmentBase) if f.name != "traces"],
-        namespace={"__doc__": EnvironmentBase.__doc__},
-    )
-):
-    def __eq__(self, other):
-        return all(
-            getattr(self, field.name) == getattr(other, field.name)
-            for field in fields(self)
-        )
-
-    @functools.wraps(EnvironmentBase.__init__)
-    def __init__(self, *args, **kwargs):
-        if "traces" in kwargs:
-            del kwargs["traces"]
-        super().__init__(*args, **kwargs)
-
-    @property
-    def traces(self):
-        return []
-
-
-@dataclass
-class Message(
-    make_dataclass(
-        "Message",
-        [
-            (f.name, f.type if f.name != "parent_evm" else Optional["Evm"], f)
-            for f in fields(MessageBase)
-        ],
-        namespace={"__doc__": MessageBase.__doc__},
-    )
-):
-    def __eq__(self, other):
-        common_fields = all(
-            getattr(self, field.name) == getattr(other, field.name)
-            for field in fields(self)
-            if field.name != "parent_evm"
-        )
-        return common_fields and self.parent_evm == other.parent_evm
-
-
-_field_mapping = {
-    "stack": Stack[U256],
-    "memory": Memory,
-    "env": Environment,
-    "error": Optional[EthereumException],
-    "message": Message,
-}
-
-
-@dataclass
-class Evm(
-    make_dataclass(
-        "Evm",
-        [(f.name, _field_mapping.get(f.name, f.type), f) for f in fields(EvmBase)],
-        namespace={"__doc__": EvmBase.__doc__},
-    )
-):
-    def __eq__(self, other):
-        return all(
-            getattr(self, field.name) == getattr(other, field.name)
-            for field in fields(self)
-            if field.name != "error"
-        ) and type(self.error) is type(other.error)
-
-
-@dataclass
-class MessageCallOutput(
-    make_dataclass(
-        "MessageCallOutput",
-        [(f.name, f.type, f) for f in fields(MessageCallOutputBase)],
-        namespace={"__doc__": MessageCallOutputBase.__doc__},
-    )
-):
-    def __eq__(self, other):
-        return all(
-            getattr(self, field.name) == getattr(other, field.name)
-            for field in fields(self)
-            if field.name != "error"
-        ) and type(self.error) is type(other.error)
-
-
 vm_exception_classes = inspect.getmembers(
     sys.modules["ethereum.cancun.vm.exceptions"],
     lambda x: inspect.isclass(x) and issubclass(x, EthereumException),
@@ -476,6 +583,7 @@ _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
     ("cairo_core", "numeric", "U256"): U256,
     ("cairo_core", "numeric", "SetUint"): Set[Uint],
     ("cairo_core", "numeric", "UnionUintU256"): Union[Uint, U256],
+    ("cairo_core", "numeric", "U384"): U384,
     ("cairo_core", "bytes", "Bytes0"): Bytes0,
     ("cairo_core", "bytes", "Bytes1"): Bytes1,
     ("cairo_core", "bytes", "Bytes4"): Bytes4,
@@ -492,6 +600,7 @@ _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
         Mapping[Bytes, Bytes], ...
     ],
     ("cairo_core", "bytes", "ListBytes4"): List[Bytes4],
+    ("cairo_ec", "curve", "g1_point", "G1Point"): ECBase,
     ("ethereum", "cancun", "blocks", "Header"): Header,
     ("ethereum", "cancun", "blocks", "TupleHeader"): Tuple[Header, ...],
     ("ethereum", "cancun", "blocks", "Withdrawal"): Withdrawal,
@@ -593,6 +702,7 @@ _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
         Address, Trie[Bytes32, U256]
     ],
     ("ethereum", "cancun", "trie", "LeafNode"): LeafNode,
+    ("ethereum", "cancun", "trie", "OptionalLeafNode"): Optional[LeafNode],
     ("ethereum", "cancun", "trie", "ExtensionNode"): ExtensionNode,
     ("ethereum", "cancun", "trie", "BranchNode"): BranchNode,
     ("ethereum", "cancun", "trie", "InternalNode"): InternalNode,
@@ -641,6 +751,7 @@ _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
         "trie",
         "TrieBytesOptionalUnionBytesWithdrawal",
     ): Trie[Bytes, Optional[Union[Bytes, Withdrawal]]],
+    ("ethereum", "cancun", "trie", "OptionalInternalNode"): Optional[InternalNode],
     ("ethereum", "cancun", "fork_types", "MappingAddressAccount"): Mapping[
         Address, Account
     ],
@@ -686,6 +797,27 @@ _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
     **ethereum_exception_mappings,
     # For tests only
     ("tests", "legacy", "utils", "test_dict", "MappingUintUint"): Mapping[Uint, Uint],
+    ("ethereum", "crypto", "alt_bn128", "BNF12"): BNF12,
+    ("ethereum", "crypto", "alt_bn128", "TupleBNF12"): Tuple[BNF12, ...],
+    ("ethereum", "crypto", "alt_bn128", "BNP12"): BNP12,
+    ("ethereum", "crypto", "alt_bn128", "BNF2"): BNF2,
+    ("ethereum", "crypto", "alt_bn128", "BNP"): BNP,
+    ("ethereum", "crypto", "alt_bn128", "BNF"): BNF,
+    ("ethereum", "crypto", "alt_bn128", "BNP2"): BNP2,
+    ("mpt", "trie_diff", "MappingBytes32Address"): Mapping[Bytes32, Address],
+    ("mpt", "trie_diff", "MappingBytes32Bytes32"): Mapping[Bytes32, Bytes32],
+    ("mpt", "trie_diff", "AccountNode"): AccountNode,
+    ("mpt", "trie_diff", "NodeStore"): Mapping[Hash32, Optional[InternalNode]],
+    ("cairo_core", "bytes", "HashedBytes32"): int,
+    ("mpt", "trie_diff", "UnionInternalNodeExtended"): Union[InternalNode, Extended],
+    ("mpt", "trie_diff", "OptionalUnionInternalNodeExtended"): Optional[
+        Union[InternalNode, Extended]
+    ],
+    ("mpt", "trie_diff", "AddressAccountNodeDiffEntry"): AddressAccountNodeDiffEntry,
+    ("mpt", "trie_diff", "AccountDiff"): List[AddressAccountNodeDiffEntry],
+    ("mpt", "trie_diff", "StorageDiffEntry"): StorageDiffEntry,
+    ("mpt", "trie_diff", "StorageDiff"): List[StorageDiffEntry],
+    ("ethereum", "cancun", "fork_types", "HashedTupleAddressBytes32"): Uint,
 }
 
 # In the EELS, some functions are annotated with Sequence while it's actually just Bytes.
@@ -725,7 +857,7 @@ def gen_arg(dict_manager, segments):
 def _gen_arg(
     dict_manager,
     segments: Union[MemorySegmentManager, RustMemorySegmentManager],
-    arg_type: Type,
+    arg_type: Optional[Type],
     arg: Any,
     annotations: Optional[Any] = None,
     for_dict_key: Optional[bool] = None,
@@ -745,8 +877,55 @@ def _gen_arg(
     Returns:
         Cairo memory pointer or value
     """
-    if arg_type is type(None):
+
+    if arg_type is None:
+        # Cases where no Python Type was provided.
+        # If arg is list, serialize it as a pointer to a struct with a pointer to the elements and the size.
+        if isinstance(arg, list):
+            instances_ptr = segments.add()
+            data = [
+                _gen_arg(dict_manager, segments, get_args(arg_type)[0], x) for x in arg
+            ]
+            return instances_ptr
+        if isinstance(arg, int):
+            return arg
+        # Any structured data -> sequentially dump the values in the same segment
+        if isinstance(arg, dict):
+            data = [
+                _gen_arg(dict_manager, segments, type(list(arg.values())[0]), v)
+                for v in arg.values()
+            ]
+            return data
+        raise ValueError(f"Cannot serialize {arg} of type {type(arg)}")
+
+    if arg_type is type(None) and arg is None:
         return 0
+
+    # If the arg_type is a RelocatableValue or RustRelocatable, we simply dump the values in a segment
+    if arg_type is RelocatableValue or arg_type is RustRelocatable:
+        # If arg is list, serialize it as a pointer to a struct with a pointer to the elements and the size.
+        if isinstance(arg, list) or isinstance(arg, tuple):
+            instances_ptr = segments.add()
+            if len(arg) == 0:
+                segments.load_data(instances_ptr, [])
+                return instances_ptr
+            data = [_gen_arg(dict_manager, segments, type(arg[0]), x) for x in arg]
+            segments.load_data(instances_ptr, data)
+            return instances_ptr
+        if isinstance(arg, int):
+            base_ptr = segments.add()
+            segments.load_data(base_ptr, [arg])
+            return base_ptr
+        # Any structured data -> sequentially dump the values in the same segment
+        if isinstance(arg, dict):
+            base_ptr = segments.add()
+            data = [
+                _gen_arg(dict_manager, segments, type(list(arg.values())[0]), v)
+                for v in arg.values()
+            ]
+            segments.load_data(base_ptr, data)
+            return base_ptr
+        return arg
 
     arg_type_origin = get_origin(arg_type) or arg_type
     if arg_type_origin is Annotated:
@@ -780,6 +959,20 @@ def _gen_arg(
         segments.load_data(ptr, [value])
         return ptr
 
+    # ⚠️ Union of Unions do not get serialized correctly ⚠️
+    # Example: Union[a, Union[b, c]] will serialize into Union[a, b, c] in Cairo.
+    # Codebase example:
+    ## Cairo struct:
+    #### struct OptionalUnionInternalNodeExtended {
+    ####     value: OptionalUnionInternalNodeExtendedEnum*,
+    #### }
+    #### struct OptionalUnionInternalNodeExtendedEnum {
+    ####     node: InternalNode,
+    ####     extended: Extended,
+    #### }
+    ## Python struct:
+    #### Union[InternalNode, Extended]
+    #### This will get serialized into Union[LeafNode, ExtensionNode, BranchNode, Sequence[Extended], bytearray, bytes...]
     if arg_type_origin is Union:
         # Union are represented as Enum in Cairo, with 0 pointers for all but one variant.
         struct_ptr = segments.add()
@@ -948,6 +1141,46 @@ def _gen_arg(
         segments.load_data(base, felt_values)
         return base
 
+    if arg_type is U384:
+        bytes_value = arg.to_le_bytes()
+        felt_values = [
+            int.from_bytes(bytes_value[i : i + 12], "little") for i in range(0, 48, 12)
+        ]
+
+        base = segments.add()
+        segments.load_data(base, felt_values)
+        return base
+
+    if arg_type is BNF:
+        base = segments.add()
+        coeff = [_gen_arg(dict_manager, segments, U384, U384(arg))]
+        segments.load_data(base, coeff)
+        return base
+
+    if arg_type in (BNF2, BNF12):
+        base = segments.add()
+        # In python, BNF<N> is a tuple of N int but in cairo it's a struct with N U384
+        # Cast int to U384 to be able to serialize
+        coeffs = [
+            _gen_arg(dict_manager, segments, U384, U384(arg[i]))
+            for i in range(len(arg))
+        ]
+        segments.load_data(base, coeffs)
+        return base
+
+    if arg_type in (BNP, BNP2, BNP12):
+        struct_ptr = segments.add()
+
+        # Handle the x and y coordinates recursively
+        x_ptr = _gen_arg(dict_manager, segments, arg_type.FIELD, arg.x)
+        y_ptr = _gen_arg(dict_manager, segments, arg_type.FIELD, arg.y)
+
+        # Store the coordinates in the struct
+        segments.load_data(struct_ptr, [x_ptr])
+        segments.load_data(struct_ptr + 1, [y_ptr])
+
+        return struct_ptr
+
     if arg_type is Bytes256:
         if for_dict_key:
             return tuple(list(arg))
@@ -983,6 +1216,16 @@ def _gen_arg(
         )
 
         return tuple([ret_value]) if for_dict_key else ret_value
+
+    if arg_type is ECBase or (
+        isinstance(arg_type, type) and issubclass(arg_type, ECBase)
+    ):
+        # Any Elliptic Curve class
+        ptr = segments.add()
+        x_ptr = _gen_arg(dict_manager, segments, U384, U384(arg.x))
+        y_ptr = _gen_arg(dict_manager, segments, U384, U384(arg.y))
+        segments.load_data(ptr, [x_ptr, y_ptr])
+        return ptr
 
     if isinstance(arg_type, type) and issubclass(arg_type, Exception):
         # For exceptions, we either return 0 (no error) or the ascii representation of the error message

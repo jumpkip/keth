@@ -41,6 +41,7 @@ from ethereum.cancun.fork_types import Account, Address
 from ethereum.cancun.state import State, TransientStorage
 from ethereum.cancun.trie import Trie
 from ethereum.cancun.vm.exceptions import InvalidOpcode
+from ethereum.crypto.alt_bn128 import BNF, BNF2, BNF12
 from ethereum.crypto.hash import Hash32
 from ethereum_types.bytes import (
     Bytes,
@@ -75,9 +76,10 @@ from starkware.cairo.lang.vm.crypto import poseidon_hash_many
 from starkware.cairo.lang.vm.memory_dict import UnknownMemoryError
 from starkware.cairo.lang.vm.memory_segments import MemorySegmentManager
 
-from cairo_addons.testing.serde import SerdeProtocol
+from cairo_addons.testing.compiler import get_main_path
 from cairo_addons.vm import MemorySegmentManager as RustMemorySegmentManager
 from tests.utils.args_gen import (
+    U384,
     FlatState,
     FlatTransientStorage,
     Memory,
@@ -121,7 +123,7 @@ def get_struct_definition(
     raise ValueError(f"Expected a struct named {path}, found {identifier}")
 
 
-class Serde(SerdeProtocol):
+class Serde:
     def __init__(
         self,
         segments: Union[MemorySegmentManager, RustMemorySegmentManager],
@@ -134,14 +136,6 @@ class Serde(SerdeProtocol):
         self.program_identifiers = program_identifiers
         self.dict_manager = dict_manager
         self.cairo_file = cairo_file or Path()
-
-    @property
-    def main_part(self):
-        """
-        Resolve the __main__ part of the cairo scope path.
-        """
-        parts = self.cairo_file.relative_to(Path.cwd()).with_suffix("").parts
-        return parts[1:] if parts[0] == "cairo" else parts
 
     def serialize_pointers(self, path: Tuple[str, ...], ptr):
         """
@@ -175,7 +169,10 @@ class Serde(SerdeProtocol):
 
         full_path = path
         if "__main__" in full_path:
-            full_path = self.main_part + full_path[full_path.index("__main__") + 1 :]
+            full_path = (
+                get_main_path(self.cairo_file)
+                + full_path[full_path.index("__main__") + 1 :]
+            )
         python_cls = to_python_type(full_path)
         origin_cls = get_origin(python_cls)
         annotations = []
@@ -410,8 +407,29 @@ class Serde(SerdeProtocol):
                 return U256(value)
             return python_cls(value.to_bytes(32, "little"))
 
+        if python_cls == U384:
+            # U384 is represented as a struct with 4 fields: d0, d1, d2, d3
+            # Each field is a felt representing 96 bits
+            d0 = value["d0"]
+            d1 = value["d1"]
+            d2 = value["d2"]
+            d3 = value["d3"]
+
+            # Combine the fields to create the full 384-bit integer
+            combined_value = d0 + (d1 << 96) + (d2 << 192) + (d3 << 288)
+            return U384(combined_value)
         if python_cls in (Bytes0, Bytes1, Bytes4, Bytes8, Bytes20):
             return python_cls(value.to_bytes(python_cls.LENGTH, "little"))
+
+        if python_cls == BNF:
+            # The BNF constructor accepts int only, not tuples or U384.
+            return BNF(int(value["c0"]))
+
+        if python_cls in (BNF2, BNF12):
+            # The BNF<N> constructor doesn't accept named tuples
+            # and values are integers, not U384.
+            values = [int(v) for v in value.values()]
+            return python_cls(tuple(values))
 
         # Because some types are wrapped in a value field, e.g. Account{ value: AccountStruct }
         # this may not work, so that we catch the error and try to fallback.
@@ -425,6 +443,7 @@ class Serde(SerdeProtocol):
             # Adjust int fields if they exceed 2**128 by subtracting DEFAULT_PRIME
             # and filter out the NO_ERROR_FLAG, replacing it with None
 
+            # Note: we skip any `Hashed` types, as they are not represented with negative values
             adjusted_value = {
                 k: (
                     None
@@ -484,7 +503,10 @@ class Serde(SerdeProtocol):
             filtered = [x for x in raw if x is not NO_ERROR_FLAG]
             return filtered[0] if len(filtered) == 1 else filtered
         if isinstance(cairo_type, TypeFelt):
-            return self.memory.get(ptr)
+            pointee = self.memory.get(ptr)
+            if pointee is None:
+                raise UnknownMemoryError(f"Unknown memory at {ptr}")
+            return pointee
         if isinstance(cairo_type, TypeStruct):
             return self.serialize_scope(cairo_type.scope, ptr)
         if isinstance(cairo_type, AliasDefinition):
@@ -891,11 +913,18 @@ class Serde(SerdeProtocol):
         )
         item_size = item_identifier.size if item_identifier is not None else 1
         try:
-            list_len = (
-                list_len * item_size
-                if list_len is not None
-                else self.segments.get_segment_size(segment_ptr.segment_index)
-            )
+            if segment_ptr.segment_index == 1:
+                # edge case:
+                # 1. If the segment_index is `1` then it's a pointer on the main segment,
+                # under which case the length is hardcoded to `1` - we're certain it's not a list
+                list_len = 1
+            elif list_len is not None:
+                list_len = list_len * item_size
+            else:
+                list_len = self.segments.get_segment_size(segment_ptr.segment_index)
+            if not list_len:
+                # In case we were not able to get the list length, we assume it's an arbitrary high value
+                list_len = 2**32
         except AssertionError as e:
             if (
                 "compute_effective_sizes must be called before get_segment_used_size."
@@ -916,10 +945,10 @@ class Serde(SerdeProtocol):
                 raise DictConsistencyError(
                     f"Dict consistency error in {item_path}"
                 ) from e
-            except Exception:
+            except Exception as e2:
+                raise (e2)
                 # TODO: handle this better as only UnknownMemoryError is expected
                 # when accessing invalid memory
-                break
         return output
 
     @staticmethod

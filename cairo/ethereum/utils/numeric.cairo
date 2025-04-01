@@ -1,17 +1,36 @@
-from starkware.cairo.common.math_cmp import is_le, is_not_zero, is_le_felt
-from starkware.cairo.common.math import safe_mult
-from starkware.cairo.common.uint256 import uint256_reverse_endian
-from ethereum_types.numeric import Uint, U256, U256Struct, bool, U64
-from ethereum_types.bytes import Bytes32, Bytes32Struct, Bytes20, Bytes
-from starkware.cairo.common.registers import get_fp_and_pc
+from starkware.cairo.common.alloc import alloc
 from starkware.cairo.common.cairo_builtins import BitwiseBuiltin
-from starkware.cairo.common.math import assert_le_felt
-
+from starkware.cairo.common.cairo_builtins import UInt384
+from starkware.cairo.common.math import assert_le_felt, assert_le
+from starkware.cairo.common.math import safe_mult
 from starkware.cairo.common.math import split_felt
+from starkware.cairo.common.math_cmp import is_le, is_not_zero, is_le_felt
+from starkware.cairo.common.memcpy import memcpy
+from starkware.cairo.common.registers import get_fp_and_pc
+from starkware.cairo.common.uint256 import uint256_reverse_endian, uint256_to_felt
 from starkware.cairo.common.uint256 import word_reverse_endian, Uint256, uint256_le, uint256_mul
+from starkware.cairo.common.memset import memset
+
+from ethereum_types.bytes import Bytes32, Bytes32Struct, Bytes20, Bytes, BytesStruct
+from ethereum_types.numeric import Uint, U256, U256Struct, bool, U64, U384, U384Struct
+from cairo_core.maths import pow2, unsigned_div_rem, felt252_to_bytes_be, felt252_bit_length
+from cairo_core.comparison import is_zero
+from cairo_ec.uint384 import uint256_to_uint384
+from legacy.utils.bytes import bytes_to_felt, uint256_from_bytes_be, felt_to_bytes
 from legacy.utils.uint256 import uint256_add, uint256_sub
 from legacy.utils.utils import Helpers
-from legacy.utils.bytes import bytes_to_felt, uint256_from_bytes_be
+
+U384_ZERO:
+dw 0;
+dw 0;
+dw 0;
+dw 0;
+
+U384_ONE:
+dw 1;
+dw 0;
+dw 0;
+dw 0;
 
 func min{range_check_ptr}(a: felt, b: felt) -> felt {
     alloc_locals;
@@ -313,15 +332,28 @@ func Uint_from_be_bytes{range_check_ptr}(bytes: Bytes) -> Uint {
     return res;
 }
 
-func U256_to_Uint{range_check_ptr}(value: U256) -> Uint {
-    with_attr error_message("ValueError") {
-        // 0x8000000000000110000000000000000 is the high 128 bits of DEFAULT_PRIME
-        assert_le_felt(value.value.high, 0x8000000000000110000000000000000);
-        assert [range_check_ptr] = value.value.low;
-        let range_check_ptr = range_check_ptr + 1;
+func U256_bit_length{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(value: U256) -> felt {
+    alloc_locals;
+
+    tempvar u256_zero = U256(new U256Struct(low=0, high=0));
+    let is_zero_value = U256__eq__(value, u256_zero);
+    if (is_zero_value.value != 0) {
+        return 0;
     }
-    let res = Uint(value.value.low + value.value.high * 2 ** 128);
-    return res;
+
+    if (value.value.high != 0) {
+        let high_bit_length = felt252_bit_length(value.value.high);
+        return high_bit_length + 128;
+    } else {
+        let low_bit_length = felt252_bit_length(value.value.low);
+        return low_bit_length;
+    }
+}
+
+func U256_to_Uint{range_check_ptr}(value: U256) -> Uint {
+    let res = uint256_to_felt([value.value]);
+    tempvar res_uint = Uint(res);
+    return res_uint;
 }
 
 func U256_from_be_bytes{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(bytes: Bytes) -> U256 {
@@ -330,9 +362,197 @@ func U256_from_be_bytes{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(bytes: By
     return res_u256;
 }
 
+func U256_max{range_check_ptr}(a: U256, b: U256) -> U256 {
+    let is_a_le_b = U256_le(a, b);
+    if (is_a_le_b.value == 1) {
+        return b;
+    }
+    return a;
+}
+
 func Bytes32_from_be_bytes{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(bytes: Bytes) -> Bytes32 {
     let res = uint256_from_bytes_be(bytes.value.len, bytes.value.data);
     let (res_reversed) = uint256_reverse_endian(res);
     tempvar res_bytes32 = Bytes32(new Bytes32Struct(res_reversed.low, res_reversed.high));
     return res_bytes32;
+}
+
+func U384_is_zero(num: U384) -> felt {
+    if (num.value.d0 == 0 and num.value.d1 == 0 and num.value.d2 == 0 and num.value.d3 == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+func U384_is_one(num: U384) -> felt {
+    if (num.value.d0 == 1 and num.value.d1 == 0 and num.value.d2 == 0 and num.value.d3 == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+func U384_from_be_bytes{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(bytes: Bytes) -> U384 {
+    alloc_locals;
+
+    with_attr error_message("ValueError") {
+        assert [range_check_ptr] = 48 - bytes.value.len;
+        let range_check_ptr = range_check_ptr + 1;
+    }
+
+    if (bytes.value.len == 0) {
+        tempvar res = U384(new UInt384(d0=0, d1=0, d2=0, d3=0));
+        return res;
+    }
+
+    // Calculate how many bytes go into each 96-bit limb
+    // Each limb can hold up to 12 bytes (96 bits)
+    let d0_len = min(12, bytes.value.len);
+    let max_d1_len = max(0, bytes.value.len - 12);
+    let d1_len = min(12, max_d1_len);
+    let max_d2_len = max(0, bytes.value.len - 24);
+    let d2_len = min(12, max_d2_len);
+    let max_d3_len = max(0, bytes.value.len - 36);
+    let d3_len = min(12, max_d3_len);
+
+    // Extract bytes for each limb
+    // Note: We need to process from the least significant (rightmost) bytes to the most significant
+    let d0_start = bytes.value.len - d0_len;
+    let d1_start = max(0, bytes.value.len - d0_len - d1_len);
+    let d2_start = max(0, bytes.value.len - d0_len - d1_len - d2_len);
+    let d3_start = 0;  // Most significant bytes start at index 0
+
+    // Convert each byte slice to a felt
+    let d0 = bytes_to_felt(d0_len, bytes.value.data + d0_start);
+    let d1 = bytes_to_felt(d1_len, bytes.value.data + d1_start);
+    let d2 = bytes_to_felt(d2_len, bytes.value.data + d2_start);
+    let d3 = bytes_to_felt(d3_len, bytes.value.data + d3_start);
+
+    // Create the U384 value
+    tempvar res = U384(new UInt384(d0=d0, d1=d1, d2=d2, d3=d3));
+    return res;
+}
+
+func U384__eq__{range_check96_ptr: felt*}(lhs: U384, rhs: U384) -> bool {
+    if (lhs.value.d0 == rhs.value.d0 and lhs.value.d1 == rhs.value.d1 and
+        lhs.value.d2 == rhs.value.d2 and lhs.value.d3 == rhs.value.d3) {
+        tempvar res = bool(1);
+        return res;
+    }
+    tempvar res = bool(0);
+    return res;
+}
+
+func U384_to_be_bytes{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
+    value: U384, length: felt
+) -> Bytes {
+    alloc_locals;
+
+    if (length == 0) {
+        tempvar result = Bytes(new BytesStruct(cast(0, felt*), 0));
+        return result;
+    }
+
+    let (bytes_ptr) = alloc();
+
+    // Process each limb in big-endian order (d3 to d0)
+    // Each limb is 96 bits (12 bytes)
+    let remaining_len = length;
+    let is_inf_36 = is_le(remaining_len, 35);
+    if (is_inf_36 != 1) {
+        let d3_len = remaining_len - 36;
+        felt252_to_bytes_be(value.value.d3, d3_len, bytes_ptr);
+        felt252_to_bytes_be(value.value.d2, 12, bytes_ptr + d3_len);
+        felt252_to_bytes_be(value.value.d1, 12, bytes_ptr + d3_len + 12);
+        felt252_to_bytes_be(value.value.d0, 12, bytes_ptr + d3_len + 24);
+        tempvar result = Bytes(new BytesStruct(bytes_ptr, length));
+        return result;
+    }
+    let is_inf_24 = is_le(remaining_len, 23);
+    if (is_inf_24 != 1) {
+        let d2_len = remaining_len - 24;
+        felt252_to_bytes_be(value.value.d2, d2_len, bytes_ptr);
+        felt252_to_bytes_be(value.value.d1, 12, bytes_ptr + d2_len);
+        felt252_to_bytes_be(value.value.d0, 12, bytes_ptr + d2_len + 12);
+        tempvar result = Bytes(new BytesStruct(bytes_ptr, length));
+        return result;
+    }
+    let is_inf_12 = is_le(remaining_len, 11);
+    if (is_inf_12 != 1) {
+        let d1_len = remaining_len - 12;
+        felt252_to_bytes_be(value.value.d1, d1_len, bytes_ptr);
+        felt252_to_bytes_be(value.value.d0, 12, bytes_ptr + d1_len);
+        tempvar result = Bytes(new BytesStruct(bytes_ptr, length));
+        return result;
+    }
+    felt252_to_bytes_be(value.value.d0, remaining_len, bytes_ptr);
+
+    tempvar result = Bytes(new BytesStruct(bytes_ptr, length));
+    return result;
+}
+
+func get_u384_bits_little{range_check_ptr}(num: U384) -> (felt*, felt) {
+    alloc_locals;
+    let (bits_ptr) = alloc();
+    // Process limb0 (d0)
+    let bits_len = extract_limb_bits(num.value.d0, bits_ptr, 0);
+    // Process limb1 (d1)
+    let limb1_not_zero = is_not_zero(num.value.d1);
+    if (limb1_not_zero != 0) {
+        // Use memset to pad with zeros until we reach 96 bits if needed
+        let bits_len_padded = 96;
+        memset(bits_ptr + bits_len, 0, bits_len_padded - bits_len);
+        let bits_len_updated = extract_limb_bits(num.value.d1, bits_ptr, bits_len_padded);
+        tempvar bits_ptr = bits_ptr;
+        tempvar bits_len = bits_len_updated;
+        tempvar range_check_ptr = range_check_ptr;
+    } else {
+        tempvar bits_ptr = bits_ptr;
+        tempvar bits_len = bits_len;
+        tempvar range_check_ptr = range_check_ptr;
+    }
+    // Process limb2 (d2)
+    let limb2_not_zero = is_not_zero(num.value.d2);
+    tempvar bits_ptr = bits_ptr;
+    tempvar range_check_ptr = range_check_ptr;
+    if (limb2_not_zero != 0) {
+        // Use memset to pad with zeros until we reach 192 bits if needed
+        let bits_len_padded = 192;
+        memset(bits_ptr + bits_len, 0, bits_len_padded - bits_len);
+        let bits_len_updated = extract_limb_bits(num.value.d2, bits_ptr, bits_len_padded);
+        tempvar bits_ptr = bits_ptr;
+        tempvar bits_len = bits_len_updated;
+        tempvar range_check_ptr = range_check_ptr;
+    } else {
+        tempvar bits_ptr = bits_ptr;
+        tempvar bits_len = bits_len;
+        tempvar range_check_ptr = range_check_ptr;
+    }
+    // Process limb3 (d3)
+    let limb3_not_zero = is_not_zero(num.value.d3);
+    tempvar bits_ptr = bits_ptr;
+    tempvar range_check_ptr = range_check_ptr;
+    if (limb3_not_zero != 0) {
+        // Use memset to pad with zeros until we reach 288 bits if needed
+        let bits_len_padded = 288;
+        memset(bits_ptr + bits_len, 0, bits_len_padded - bits_len);
+        let bits_len_updated = extract_limb_bits(num.value.d3, bits_ptr, bits_len_padded);
+        return (bits_ptr, bits_len_updated);
+    } else {
+        return (bits_ptr, bits_len);
+    }
+}
+
+func extract_limb_bits{range_check_ptr}(limb: felt, bits_ptr: felt*, current_len: felt) -> felt {
+    // Check if limb is zero
+    let is_limb_zero = is_zero(limb);
+    if (is_limb_zero != 0) {
+        return current_len;
+    }
+
+    // Extract the least significant bit
+    let (q, r) = divmod(limb, 2);
+    assert bits_ptr[current_len] = r;
+
+    // Continue with the remaining bits
+    return extract_limb_bits(q, bits_ptr, current_len + 1);
 }
