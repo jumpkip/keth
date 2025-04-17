@@ -1,4 +1,7 @@
 from ethereum_types.numeric import U256, U256Struct
+from ethereum.exceptions import ValueError
+
+from starkware.cairo.common.registers import get_fp_and_pc, get_label_location
 from starkware.cairo.common.alloc import alloc
 
 func test__ap_accessible() {
@@ -128,5 +131,83 @@ func test__access_let_relocatable() {
         # simple access
         ids.x
     %}
+    ret;
+}
+
+const MY_CONST = 100;
+func test__access_local_const() {
+    %{ assert ids.MY_CONST == 100 %}
+    ret;
+}
+
+func test__access_non_imported_const_should_fail() {
+    %{ ids.HALF_SHIFT %}
+    ret;
+}
+
+func test__access_imported_const() {
+    %{ assert ids.ValueError == int.from_bytes('ValueError'.encode("ascii"), "big") %}
+    ret;
+}
+
+struct MyTestStruct {
+    ptr: felt*,
+    value: felt,
+}
+
+func test_hint_access_ptr_struct_with_pointer_member() {
+    let my_test_struct_ = get_struct_from_program_segment();
+    tempvar my_test_struct = my_test_struct_;
+    %{
+        assert memory[ids.my_test_struct.ptr] == 100, f"my_test_struct.ptr: {ids.my_test_struct.ptr}";
+        assert ids.my_test_struct.value == 200, f"my_test_struct.value: {ids.my_test_struct.value}";
+    %}
+    ret;
+}
+
+func get_struct_from_program_segment() -> MyTestStruct* {
+    alloc_locals;
+    let (__fp__, _) = get_fp_and_pc();
+    let (value_ptr: felt*) = get_label_location(value_loc);
+
+    let constant_value = 200;
+
+    local result: MyTestStruct = MyTestStruct(value_ptr, constant_value);
+    return &result;
+
+    value_loc:
+    dw 100;
+}
+
+struct MyPointerStruct {
+    ptr: felt*,
+}
+
+func test_hint_access_pointer_null_value() {
+    tempvar my_pointer_struct = MyPointerStruct(cast(0, felt*));
+    %{ assert ids.my_pointer_struct.ptr == 0 %}
+    ret;
+}
+
+func test_hint_access_pointer_unassigned_value() {
+    alloc_locals;
+    let (local bytes_ptr: felt*) = alloc();
+    tempvar bytes_len = 0;
+
+    loop:
+    let bytes_ptr = cast([fp], felt*);
+    let bytes_len = [ap - 1];
+    // This will cause the VM to assign a `felt` type to `output_index`, with no associated value
+    let output_index = bytes_ptr + bytes_len;
+    %{ memory[ids.output_index] = 1 %}
+    assert [output_index] = 1;
+    ret;
+}
+
+func test_hint_can_access_debug_info() {
+    alloc_locals;
+    local debug_info;
+    %{ ids.debug_info = int(not debug_info(pc)) %}
+    assert debug_info = 1;
     ret;
 }

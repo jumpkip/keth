@@ -43,6 +43,7 @@ from ethereum.cancun.trie import Trie
 from ethereum.cancun.vm.exceptions import InvalidOpcode
 from ethereum.crypto.alt_bn128 import BNF, BNF2, BNF12
 from ethereum.crypto.hash import Hash32
+from ethereum.crypto.kzg import BLSFieldElement, KZGCommitment, KZGProof
 from ethereum_types.bytes import (
     Bytes,
     Bytes0,
@@ -51,9 +52,15 @@ from ethereum_types.bytes import (
     Bytes8,
     Bytes20,
     Bytes32,
+    Bytes48,
     Bytes256,
 )
 from ethereum_types.numeric import U256
+from py_ecc.fields import optimized_bls12_381_FQ as BLSF
+from py_ecc.fields import optimized_bls12_381_FQ2 as BLSF2
+from py_ecc.fields import optimized_bls12_381_FQ12 as BLSF12
+from py_ecc.optimized_bls12_381.optimized_curve import Z1, Z2, Optimized_Point3D
+from starkware.cairo.common.dict import DictManager
 from starkware.cairo.lang.cairo_constants import DEFAULT_PRIME
 from starkware.cairo.lang.compiler.ast.cairo_types import (
     CairoType,
@@ -72,19 +79,23 @@ from starkware.cairo.lang.compiler.identifier_manager import (
     MissingIdentifierError,
 )
 from starkware.cairo.lang.compiler.scoped_name import ScopedName
-from starkware.cairo.lang.vm.crypto import poseidon_hash_many
 from starkware.cairo.lang.vm.memory_dict import UnknownMemoryError
 from starkware.cairo.lang.vm.memory_segments import MemorySegmentManager
 
 from cairo_addons.testing.compiler import get_main_path
+from cairo_addons.vm import DictManager as RustDictManager
 from cairo_addons.vm import MemorySegmentManager as RustMemorySegmentManager
+from cairo_addons.vm import poseidon_hash_many
 from tests.utils.args_gen import (
     U384,
+    BLSPubkey,
     FlatState,
     FlatTransientStorage,
+    G1Compressed,
     Memory,
     MutableBloom,
     Stack,
+    builtins_exception_classes,
     ethereum_exception_classes,
     to_python_type,
     vm_exception_classes,
@@ -95,7 +106,15 @@ NO_ERROR_FLAG = object()
 
 
 class DictConsistencyError(Exception):
-    pass
+    def __init__(
+        self, dict_access_path: Tuple[str, ...], dict_ptr: int, dict_ptr_value: int
+    ):
+        self.dict_access_path = dict_access_path
+        self.dict_ptr = dict_ptr
+        self.dict_ptr_value = dict_ptr_value
+
+    def __str__(self):
+        return f"Dict consistency error: {self.dict_access_path}, dict_ptr: {self.dict_ptr}, dict_ptr_value: {self.dict_ptr_value}"
 
 
 def get_struct_definition(
@@ -128,7 +147,7 @@ class Serde:
         self,
         segments: Union[MemorySegmentManager, RustMemorySegmentManager],
         program_identifiers: IdentifierManager,
-        dict_manager,
+        dict_manager: Union[DictManager, RustDictManager],
         cairo_file=None,
     ):
         self.segments = segments
@@ -296,6 +315,20 @@ class Serde:
                     self._serialize(member.cairo_type, tuple_struct_ptr + member.offset)
                     for member in members.values()
                 )
+                # Convert from affine space to projective space for BLS12-381 over Fq.
+                if python_cls == Optimized_Point3D[BLSF]:
+                    if result == (BLSF.zero(), BLSF.zero()):
+                        result = Z1
+                    else:
+                        result = (result[0], result[1], BLSF.one())
+
+                # Convert from affine space to projective space for BLS12-381 over Fq2.
+                if python_cls == Optimized_Point3D[BLSF2]:
+                    if result == (BLSF2.zero(), BLSF2.zero()):
+                        result = Z2
+                    else:
+                        result = (result[0], result[1], BLSF2.one())
+
                 if (
                     annotations
                     and len(annotations) == 1
@@ -356,7 +389,9 @@ class Serde:
             actual_error_cls = next(
                 (
                     cls
-                    for name, cls in vm_exception_classes + ethereum_exception_classes
+                    for name, cls in vm_exception_classes
+                    + ethereum_exception_classes
+                    + builtins_exception_classes
                     if name == ascii_value
                 ),
                 None,
@@ -401,13 +436,20 @@ class Serde:
             # A None pointer is valid for pointer types, meaning just that the struct is not present.
             return None
 
-        if python_cls in (U256, Hash32, Bytes32):
+        if python_cls in (U256, Hash32, Bytes32, BLSFieldElement):
             value = value["low"] + value["high"] * 2**128
             if python_cls == U256:
                 return U256(value)
             return python_cls(value.to_bytes(32, "little"))
 
-        if python_cls == U384:
+        if python_cls in (
+            U384,
+            Bytes48,
+            KZGCommitment,
+            G1Compressed,
+            BLSPubkey,
+            KZGProof,
+        ):
             # U384 is represented as a struct with 4 fields: d0, d1, d2, d3
             # Each field is a felt representing 96 bits
             d0 = value["d0"]
@@ -417,16 +459,19 @@ class Serde:
 
             # Combine the fields to create the full 384-bit integer
             combined_value = d0 + (d1 << 96) + (d2 << 192) + (d3 << 288)
-            return U384(combined_value)
+            if python_cls == U384:
+                return U384(combined_value)
+            return python_cls(combined_value.to_bytes(48, "little"))
+
         if python_cls in (Bytes0, Bytes1, Bytes4, Bytes8, Bytes20):
             return python_cls(value.to_bytes(python_cls.LENGTH, "little"))
 
-        if python_cls == BNF:
-            # The BNF constructor accepts int only, not tuples or U384.
-            return BNF(int(value["c0"]))
+        if python_cls in (BNF, BLSF):
+            # The BNF and BLSF constructors accept int only, not tuples or U384.
+            return python_cls(int(value["c0"]))
 
-        if python_cls in (BNF2, BNF12):
-            # The BNF<N> constructor doesn't accept named tuples
+        if python_cls in (BNF2, BNF12, BLSF2, BLSF12):
+            # The BNF<N> and BLSF<N> constructors don't accept named tuples
             # and values are integers, not U384.
             values = [int(v) for v in value.values()]
             return python_cls(tuple(values))
@@ -549,7 +594,11 @@ class Serde:
         # We need to ensure that the last dict_ptr points properly
         # since they might have been updated by reading the `original_storage_trie` field of the state.
         if check_dict_consistency and self.memory.get(pointers["dict_ptr"]) is not None:
-            raise DictConsistencyError()
+            raise DictConsistencyError(
+                dict_access_path,
+                pointers["dict_ptr"],
+                self.memory.get(pointers["dict_ptr"]),
+            )
 
         dict_segment_data = {
             self._serialize(cairo_key_type, dict_ptr + i): self._serialize(
@@ -942,11 +991,10 @@ class Serde:
             except UnknownMemoryError:
                 break
             except DictConsistencyError as e:
-                raise DictConsistencyError(
-                    f"Dict consistency error in {item_path}"
-                ) from e
+                added_info = f"While serializing item {item_path}"
+                raise Exception(f"{e}\n{added_info}")
             except Exception as e2:
-                raise (e2)
+                raise e2
                 # TODO: handle this better as only UnknownMemoryError is expected
                 # when accessing invalid memory
         return output

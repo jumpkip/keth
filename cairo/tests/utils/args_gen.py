@@ -49,16 +49,15 @@ When adding new types, you must:
 - Add the test generation strategy to strategies.py if it's a new type (not required when only doing composition of existing types, e.g. `Union[U256, bool]`)
 """
 
-import functools
 import inspect
 import sys
+import typing
 from collections import ChainMap, abc, defaultdict
-from dataclasses import dataclass, field, fields, is_dataclass, make_dataclass
+from dataclasses import fields, is_dataclass
 from functools import partial
 from typing import (
     Annotated,
     Any,
-    ClassVar,
     Dict,
     ForwardRef,
     List,
@@ -68,7 +67,6 @@ from typing import (
     Set,
     Tuple,
     Type,
-    TypeVar,
     Union,
     _ProtocolMeta,
     get_args,
@@ -77,8 +75,8 @@ from typing import (
 
 from ethereum.cancun.blocks import Block, Header, Log, Receipt, Withdrawal
 from ethereum.cancun.fork import ApplyBodyOutput, BlockChain
-from ethereum.cancun.fork_types import Account as AccountBase
 from ethereum.cancun.fork_types import (
+    Account,
     Address,
     Bloom,
     Root,
@@ -98,16 +96,13 @@ from ethereum.cancun.trie import (
     InternalNode,
     LeafNode,
     Trie,
-    trie_get,
-    trie_set,
 )
-from ethereum.cancun.vm import Environment as EnvironmentBase
-from ethereum.cancun.vm import Evm as EvmBase
-from ethereum.cancun.vm import Message as MessageBase
+from ethereum.cancun.vm import Environment, Evm, Message
 from ethereum.cancun.vm.gas import ExtendMemory, MessageCallGas
-from ethereum.cancun.vm.interpreter import MessageCallOutput as MessageCallOutputBase
-from ethereum.crypto.alt_bn128 import BNF, BNF2, BNF12, BNP, BNP2, BNP12
+from ethereum.cancun.vm.interpreter import MessageCallOutput
+from ethereum.crypto.alt_bn128 import BNF, BNF2, BNF12, BNP, BNP2
 from ethereum.crypto.hash import Hash32
+from ethereum.crypto.kzg import FQ, FQ2, BLSFieldElement, KZGCommitment, KZGProof
 from ethereum.exceptions import EthereumException
 from ethereum_rlp.rlp import Extended, Simple
 from ethereum_types.bytes import (
@@ -118,10 +113,16 @@ from ethereum_types.bytes import (
     Bytes8,
     Bytes20,
     Bytes32,
+    Bytes48,
     Bytes256,
 )
-from ethereum_types.frozen import slotted_freezable
-from ethereum_types.numeric import U64, U256, FixedUnsigned, Uint, _max_value
+from ethereum_types.numeric import U64, U256, Uint
+from py_ecc.bls.typing import G1Uncompressed
+from py_ecc.fields import optimized_bls12_381_FQ as BLSF
+from py_ecc.fields import optimized_bls12_381_FQ2 as BLSF2
+from py_ecc.fields import optimized_bls12_381_FQ12 as BLSF12
+from py_ecc.optimized_bls12_381.optimized_curve import is_inf
+from py_ecc.typing import Optimized_Point3D
 from starkware.cairo.common.dict import DictManager, DictTracker
 from starkware.cairo.lang.cairo_constants import DEFAULT_PRIME
 from starkware.cairo.lang.compiler.ast.cairo_types import (
@@ -136,15 +137,27 @@ from starkware.cairo.lang.compiler.identifier_definition import (
 )
 from starkware.cairo.lang.compiler.program import Program
 from starkware.cairo.lang.compiler.scoped_name import ScopedName
-from starkware.cairo.lang.vm.crypto import poseidon_hash_many
 from starkware.cairo.lang.vm.memory_segments import MemorySegmentManager
 from starkware.cairo.lang.vm.relocatable import RelocatableValue
 
 from cairo_addons.vm import DictTracker as RustDictTracker
 from cairo_addons.vm import MemorySegmentManager as RustMemorySegmentManager
 from cairo_addons.vm import Relocatable as RustRelocatable
+from cairo_addons.vm import poseidon_hash_many
 from cairo_ec.curve import ECBase
-from mpt.utils import AccountNode
+from keth_types.types import (
+    U384,
+    AddressAccountDiffEntry,
+    BLSPubkey,
+    FlatState,
+    FlatTransientStorage,
+    G1Compressed,
+    Memory,
+    MutableBloom,
+    Node,
+    Stack,
+    StorageDiffEntry,
+)
 from tests.utils.helpers import flatten
 
 HASHED_TYPES = [
@@ -161,378 +174,19 @@ HASHED_TYPES = [
 ]
 
 
-class U384(FixedUnsigned):
-    """
-    Unsigned integer, which can represent `0` to `2 ** 384 - 1`, inclusive.
-    """
-
-    MAX_VALUE: ClassVar["U384"]
-    """
-    Largest value that can be represented by this integer type.
-    """
-
-    def __init__(self, value) -> None:
-        super().__init__(value)
-
-    # All these operator overloads are required for instantiation of Curve points with int values;
-    # because we serialize our types as U384, but the curve
-    def __mod__(self, other: Union[int, "U384"]):
-        if isinstance(other, U384):
-            return U384(self._number % other._number)
-        return U384(self._number % other)
-
-    def __add__(self, other: Union[int, "U384"]):
-        if isinstance(other, U384):
-            return U384(self._number + other._number)
-        return U384(self._number + other)
-
-    def __mul__(self, other: Union[int, "U384"]):
-        if isinstance(other, U384):
-            return U384(self._number * other._number)
-        return U384(self._number * other)
-
-    def __sub__(self, other: Union[int, "U384"]):
-        if isinstance(other, U384):
-            return U384(self._number - other._number)
-        return U384(self._number - other)
-
-
-U384.MAX_VALUE = _max_value(U384, 384)
-
-
-class Memory(bytearray):
-    pass
-
-
-class MutableBloom(bytearray):
-    pass
-
-
-T = TypeVar("T")
-
-
-class Stack(List[T]):
-    MAX_SIZE = 1024
-
-    def push_or_replace(self, value: T):
-        if len(self) >= self.MAX_SIZE:
-            self.pop()
-        self.append(value)
-
-    def push_or_replace_many(self, values: List[T]):
-        if len(self) + len(values) > self.MAX_SIZE:
-            del self[self.MAX_SIZE - len(values) :]
-        self.extend(values)
-
-
-# All these classes are auto-patched in test imports in cairo/tests/conftests.py
-@dataclass
-class Environment(
-    make_dataclass(
-        "Environment",
-        [(f.name, f.type, f) for f in fields(EnvironmentBase) if f.name != "traces"],
-        namespace={"__doc__": EnvironmentBase.__doc__},
-    )
-):
-    def __eq__(self, other):
-        return all(
-            getattr(self, field.name) == getattr(other, field.name)
-            for field in fields(self)
-        )
-
-    @functools.wraps(EnvironmentBase.__init__)
-    def __init__(self, *args, **kwargs):
-        if "traces" in kwargs:
-            del kwargs["traces"]
-        super().__init__(*args, **kwargs)
-
-    @property
-    def traces(self):
-        return []
-
-
-@dataclass
-class MessageCallOutput(
-    make_dataclass(
-        "MessageCallOutput",
-        [(f.name, f.type, f) for f in fields(MessageCallOutputBase)],
-        namespace={"__doc__": MessageCallOutputBase.__doc__},
-    )
-):
-    def __eq__(self, other):
-        return all(
-            getattr(self, field.name) == getattr(other, field.name)
-            for field in fields(self)
-            if field.name != "error"
-        ) and type(self.error) is type(other.error)
-
-
-@dataclass
-class Message(
-    make_dataclass(
-        "Message",
-        [
-            (f.name, f.type if f.name != "parent_evm" else Optional["Evm"], f)
-            for f in fields(MessageBase)
-        ],
-        namespace={"__doc__": MessageBase.__doc__},
-    )
-):
-    def __eq__(self, other):
-        common_fields = all(
-            getattr(self, field.name) == getattr(other, field.name)
-            for field in fields(self)
-            if field.name != "parent_evm"
-        )
-        return common_fields and self.parent_evm == other.parent_evm
-
-
-EMPTY_STORAGE_ROOT = Bytes32(
-    (0x56E81F171BCC55A6FF8345E692C0F86E5B48E01B996CADC001622FB5E363B421).to_bytes(
-        32, "big"
-    )
+builtins_exception_classes = inspect.getmembers(
+    sys.modules["builtins"],
+    lambda x: inspect.isclass(x) and issubclass(x, Exception),
 )
 
-# Separate setup & class definition to apply freezable decorator
-AccountDataclass = make_dataclass(
-    "AccountDataclass",
-    [(f.name, f.type, f) for f in fields(AccountBase)]
-    + [("storage_root", Bytes32, field(default=EMPTY_STORAGE_ROOT))],
-    namespace={"__doc__": AccountBase.__doc__},
-)
-
-
-@slotted_freezable
-@dataclass
-class Account(AccountDataclass):
-    def __eq__(self, other):
-        if not isinstance(other, Account):
-            return False
-        return all(
-            getattr(self, field.name) == getattr(other, field.name)
-            for field in fields(self)
-            if field.name != "storage_root"
-        )
-
-
-EMPTY_ACCOUNT = Account(
-    nonce=Uint(0), balance=U256(0), code=b"", storage_root=EMPTY_STORAGE_ROOT
-)
-
-
-# Re-definition of the Node type to be used in the tests.
-# This is required for the `encode_node` function in `ethereum.cancun.trie` to work.
-Node = Union[Account, Bytes, LegacyTransaction, Receipt, Uint, U256, Withdrawal, None]
-
-_field_mapping = {
-    "stack": Stack[U256],
-    "memory": Memory,
-    "env": Environment,
-    "error": Optional[EthereumException],
-    "message": Message,
+builtins_exception_mappings = {
+    (
+        "ethereum",
+        "exceptions",
+        f"{name}",
+    ): cls
+    for name, cls in builtins_exception_classes
 }
-
-
-@dataclass
-class Evm(
-    make_dataclass(
-        "Evm",
-        [(f.name, _field_mapping.get(f.name, f.type), f) for f in fields(EvmBase)],
-        namespace={"__doc__": EvmBase.__doc__},
-    )
-):
-    def __eq__(self, other):
-        common_fields_ok = all(
-            getattr(self, field.name) == getattr(other, field.name)
-            for field in fields(self)
-            if field.name != "error" and field.name != "refund_counter"
-        ) and type(self.error) is type(other.error)
-
-        # The refund_counter is a felt, is serialized as a positive integer `int`, but in this specific case,
-        # we want a felt (that can be either positive or negative)
-        refund_counter_ok = (
-            self.refund_counter % DEFAULT_PRIME == other.refund_counter % DEFAULT_PRIME
-        )
-        return common_fields_ok and refund_counter_ok
-
-
-@dataclass
-class FlatState:
-    """A version of the State class that has flattened storage tries.
-    The keys of the storage tries are of type Tuple[Address, Bytes32]
-    """
-
-    _main_trie: Trie[Address, Optional[Account]]
-    _storage_tries: Trie[Tuple[Address, Bytes32], U256]
-    _snapshots: List[
-        Tuple[Trie[Address, Optional[Account]], Trie[Tuple[Address, Bytes32], U256]]
-    ]
-    created_accounts: Set[Address]
-
-    @classmethod
-    def from_state(cls, state: State) -> "FlatState":
-        """Convert a State object to a FlatState object."""
-        flat_state = cls(
-            _main_trie=state._main_trie,
-            _storage_tries=Trie(
-                secured=True,
-                default=U256(0),
-                _data=defaultdict(lambda: U256(0), {}),
-            ),
-            _snapshots=[],
-            created_accounts=state.created_accounts,
-        )
-
-        # Flatten storage tries
-        for address, storage_trie in state._storage_tries.items():
-            for key in storage_trie._data.keys():
-                value = trie_get(storage_trie, key)
-                trie_set(flat_state._storage_tries, (address, key), value)
-
-        # Flatten snapshots
-        for snapshot in state._snapshots:
-            snapshot_main_trie = snapshot[0]
-            snapshot_storage_tries = Trie(
-                flat_state._storage_tries.secured,
-                flat_state._storage_tries.default,
-                defaultdict(lambda: U256(0), {}),
-            )
-            for address, storage_trie in snapshot[1].items():
-                for key in storage_trie._data.keys():
-                    value = trie_get(storage_trie, key)
-                    trie_set(snapshot_storage_tries, (address, key), value)
-            flat_state._snapshots.append((snapshot_main_trie, snapshot_storage_tries))
-
-        return flat_state
-
-    def to_state(self) -> State:
-        """Convert a FlatState object back to a State object."""
-        # Initialize state with main trie and created accounts
-        state = State(
-            _main_trie=self._main_trie,
-            _storage_tries={},
-            _snapshots=[],
-            created_accounts=self.created_accounts,
-        )
-
-        # Unflatten storage tries by grouping by address
-        for (address, key), value in self._storage_tries._data.items():
-            if address not in state._storage_tries:
-                state._storage_tries[address] = Trie(
-                    secured=self._storage_tries.secured, default=U256(0), _data={}
-                )
-            trie = state._storage_tries[address]
-            trie_set(trie, key, value)
-            state._storage_tries[address] = trie
-
-        # Unflatten snapshots
-        for snapshot_main_trie, snapshot_storage_tries in self._snapshots:
-            address_to_storage_trie = {}
-            # Group storage tries by address for each snapshot
-            for (address, key), value in snapshot_storage_tries._data.items():
-                if address not in address_to_storage_trie:
-                    address_to_storage_trie[address] = Trie(
-                        secured=snapshot_storage_tries.secured,
-                        default=U256(0),
-                        _data={},
-                    )
-                trie = address_to_storage_trie[address]
-                trie_set(trie, key, value)
-                address_to_storage_trie[address] = trie
-            state._snapshots.append((snapshot_main_trie, address_to_storage_trie))
-
-        return state
-
-
-@dataclass
-class AddressAccountNodeDiffEntry:
-    key: Address
-    prev_value: AccountNode
-    new_value: AccountNode
-
-
-@dataclass
-class StorageDiffEntry:
-    key: int
-    prev_value: U256
-    new_value: U256
-
-
-@dataclass
-class FlatTransientStorage:
-    """A version of the TransientStorage class that has flattened storage tries.
-    The keys of the storage tries are of type Tuple[Address, Bytes32]
-    """
-
-    _tries: Trie[Tuple[Address, Bytes32], U256]
-    _snapshots: List[Trie[Tuple[Address, Bytes32], U256]]
-
-    @classmethod
-    def from_transient_storage(cls, ts: TransientStorage) -> "FlatTransientStorage":
-        """Convert a TransientStorage object to a FlatTransientStorage object."""
-        flat_ts = cls(
-            _tries=Trie(
-                secured=True,
-                default=U256(0),
-                _data=defaultdict(lambda: U256(0), {}),
-            ),
-            _snapshots=[],
-        )
-
-        # Flatten tries
-        for address, storage_trie in ts._tries.items():
-            for key in storage_trie._data.keys():
-                value = trie_get(storage_trie, key)
-                trie_set(flat_ts._tries, (address, key), value)
-
-        # Flatten snapshots
-        for snapshot in ts._snapshots:
-            snapshot_tries = Trie(
-                flat_ts._tries.secured,
-                flat_ts._tries.default,
-                defaultdict(lambda: U256(0), {}),
-            )
-            for address, storage_trie in snapshot.items():
-                for key in storage_trie._data.keys():
-                    value = trie_get(storage_trie, key)
-                    trie_set(snapshot_tries, (address, key), value)
-            flat_ts._snapshots.append(snapshot_tries)
-
-        return flat_ts
-
-    def to_transient_storage(self) -> TransientStorage:
-        """Convert a FlatTransientStorage object back to a TransientStorage object."""
-        # Initialize transient storage
-        ts = TransientStorage()
-
-        # Unflatten tries by grouping by address
-        for (address, key), value in self._tries._data.items():
-            if address not in ts._tries:
-                ts._tries[address] = Trie(
-                    secured=self._tries.secured, default=U256(0), _data={}
-                )
-            trie = ts._tries[address]
-            trie_set(trie, key, value)
-            ts._tries[address] = trie
-
-        # Unflatten snapshots
-        for snapshot_tries in self._snapshots:
-            address_to_storage_trie = {}
-            # Group storage tries by address for each snapshot
-            for (address, key), value in snapshot_tries._data.items():
-                if address not in address_to_storage_trie:
-                    address_to_storage_trie[address] = Trie(
-                        secured=snapshot_tries.secured,
-                        default=U256(0),
-                        _data={},
-                    )
-                trie = address_to_storage_trie[address]
-                trie_set(trie, key, value)
-                address_to_storage_trie[address] = trie
-            ts._snapshots.append(address_to_storage_trie)
-
-        return ts
-
 
 vm_exception_classes = inspect.getmembers(
     sys.modules["ethereum.cancun.vm.exceptions"],
@@ -564,6 +218,14 @@ ethereum_exception_mappings = {
     for name, cls in ethereum_exception_classes
 }
 
+# Surprising side-effect of the `typing` module: If a type is first encountered in a specific order in a Union,
+# then all permutations of the types in the Union will be considered in the same order as the first encounter.
+# to overcome that, we can cleanup the cache of the `typing` module. Notably this happens because in
+# EELS both Union[Bytes, LegacyTransaction] and Union[LegacyTransaction, Bytes] are used - on our
+# side we only use the former.
+for cleanup_fn in typing._cleanups:
+    cleanup_fn()
+
 # Union of all possible trie types as defined in the ethereum spec.
 # Does not take into account our internal trie where we merged accounts and storage.
 # ! Order matters here.
@@ -584,15 +246,18 @@ _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
     ("cairo_core", "numeric", "SetUint"): Set[Uint],
     ("cairo_core", "numeric", "UnionUintU256"): Union[Uint, U256],
     ("cairo_core", "numeric", "U384"): U384,
+    ("cairo_core", "numeric", "OptionalU384"): Optional[U384],
     ("cairo_core", "bytes", "Bytes0"): Bytes0,
     ("cairo_core", "bytes", "Bytes1"): Bytes1,
     ("cairo_core", "bytes", "Bytes4"): Bytes4,
     ("cairo_core", "bytes", "Bytes8"): Bytes8,
     ("cairo_core", "bytes", "Bytes20"): Bytes20,
     ("cairo_core", "bytes", "Bytes32"): Bytes32,
+    ("cairo_core", "bytes", "Bytes48"): Bytes48,
     ("cairo_core", "bytes", "TupleBytes32"): Tuple[Bytes32, ...],
     ("cairo_core", "bytes", "Bytes256"): Bytes256,
     ("cairo_core", "bytes", "Bytes"): Bytes,
+    ("cairo_core", "bytes", "OptionalBytes"): Optional[Bytes],
     ("cairo_core", "bytes", "String"): str,
     ("cairo_core", "bytes", "TupleBytes"): Tuple[Bytes, ...],
     ("cairo_core", "bytes", "MappingBytesBytes"): Mapping[Bytes, Bytes],
@@ -795,29 +460,42 @@ _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
     ("ethereum", "cancun", "fork", "ApplyBodyOutput"): ApplyBodyOutput,
     **vm_exception_mappings,
     **ethereum_exception_mappings,
+    **builtins_exception_mappings,
     # For tests only
     ("tests", "legacy", "utils", "test_dict", "MappingUintUint"): Mapping[Uint, Uint],
     ("ethereum", "crypto", "alt_bn128", "BNF12"): BNF12,
-    ("ethereum", "crypto", "alt_bn128", "TupleBNF12"): Tuple[BNF12, ...],
-    ("ethereum", "crypto", "alt_bn128", "BNP12"): BNP12,
     ("ethereum", "crypto", "alt_bn128", "BNF2"): BNF2,
     ("ethereum", "crypto", "alt_bn128", "BNP"): BNP,
     ("ethereum", "crypto", "alt_bn128", "BNF"): BNF,
     ("ethereum", "crypto", "alt_bn128", "BNP2"): BNP2,
-    ("mpt", "trie_diff", "MappingBytes32Address"): Mapping[Bytes32, Address],
-    ("mpt", "trie_diff", "MappingBytes32Bytes32"): Mapping[Bytes32, Bytes32],
-    ("mpt", "trie_diff", "AccountNode"): AccountNode,
-    ("mpt", "trie_diff", "NodeStore"): Mapping[Hash32, Optional[InternalNode]],
+    ("mpt", "types", "MappingBytes32Address"): Mapping[Bytes32, Address],
+    ("mpt", "types", "MappingBytes32Bytes32"): Mapping[Bytes32, Bytes32],
+    ("mpt", "types", "NodeStore"): Mapping[Hash32, Bytes],
     ("cairo_core", "bytes", "HashedBytes32"): int,
-    ("mpt", "trie_diff", "UnionInternalNodeExtended"): Union[InternalNode, Extended],
-    ("mpt", "trie_diff", "OptionalUnionInternalNodeExtended"): Optional[
+    ("mpt", "types", "UnionInternalNodeExtended"): Union[InternalNode, Extended],
+    ("mpt", "types", "OptionalUnionInternalNodeExtended"): Optional[
         Union[InternalNode, Extended]
     ],
-    ("mpt", "trie_diff", "AddressAccountNodeDiffEntry"): AddressAccountNodeDiffEntry,
-    ("mpt", "trie_diff", "AccountDiff"): List[AddressAccountNodeDiffEntry],
-    ("mpt", "trie_diff", "StorageDiffEntry"): StorageDiffEntry,
-    ("mpt", "trie_diff", "StorageDiff"): List[StorageDiffEntry],
+    ("mpt", "types", "AddressAccountDiffEntry"): AddressAccountDiffEntry,
+    ("mpt", "types", "AccountDiff"): List[AddressAccountDiffEntry],
+    ("mpt", "types", "StorageDiffEntry"): StorageDiffEntry,
+    ("mpt", "types", "StorageDiff"): List[StorageDiffEntry],
     ("ethereum", "cancun", "fork_types", "HashedTupleAddressBytes32"): Uint,
+    ("ethereum", "crypto", "kzg", "BLSScalar"): BLSFieldElement,
+    ("ethereum", "crypto", "bls12_381", "BLSF"): BLSF,
+    ("ethereum", "crypto", "bls12_381", "BLSF2"): BLSF2,
+    ("ethereum", "crypto", "bls12_381", "BLSF12"): BLSF12,
+    ("ethereum", "crypto", "kzg", "KZGCommitment"): KZGCommitment,
+    ("ethereum", "crypto", "bls12_381", "BLSP"): Optimized_Point3D[BLSF],
+    ("ethereum", "crypto", "bls12_381", "BLSP2"): Optimized_Point3D[BLSF2],
+    ("ethereum", "crypto", "bls12_381", "G1Compressed"): G1Compressed,
+    ("ethereum", "crypto", "bls12_381", "G1Uncompressed"): G1Uncompressed,
+    ("ethereum", "crypto", "kzg", "BLSPubkey"): BLSPubkey,
+    ("ethereum", "crypto", "kzg", "KZGProof"): KZGProof,
+    ("ethereum", "crypto", "bls12_381", "TupleBLSPBLSP2"): Tuple[FQ, FQ2],
+    ("ethereum", "crypto", "bls12_381", "TupleTupleBLSPBLSP2"): Tuple[
+        Tuple[FQ, FQ2], Tuple[FQ, FQ2]
+    ],
 }
 
 # In the EELS, some functions are annotated with Sequence while it's actually just Bytes.
@@ -1017,6 +695,14 @@ def _gen_arg(
         if arg_type_origin is tuple and (
             Ellipsis not in get_args(arg_type) or annotations
         ):
+            # Handle conversion from Optimized_Point3D to Optimized_Point2D for BLS12-381
+            if arg_type in (Optimized_Point3D[BLSF], Optimized_Point3D[BLSF2]):
+                if is_inf(arg):
+                    arg = (arg[0].zero(), arg[1].zero())
+                else:
+                    assert arg[2] == arg[2].one()
+                    arg = (arg[0], arg[1])
+
             # Case a tuple with a fixed number of elements, all of different types.
             # These are represented as a pointer to a struct with a pointer to each element.
             element_types = get_args(arg_type)
@@ -1093,6 +779,9 @@ def _gen_arg(
         if arg_type_origin is State:
             return generate_state_arg(dict_manager, segments, arg)
 
+        if arg_type_origin is Trie:
+            return generate_trie_arg(dict_manager, segments, arg_type, arg)
+
         if arg_type_origin is TransientStorage:
             return generate_transient_storage_arg(dict_manager, segments, arg)
 
@@ -1109,24 +798,9 @@ def _gen_arg(
         ]
 
         segments.load_data(struct_ptr, data)
-
-        if arg_type_origin is Trie:
-            # In case of a Trie, we need the dict to be a defaultdict with the trie.default as the default value.
-            dict_ptr = segments.memory.get(data[2])
-            current_ptr = segments.memory.get(data[2] + 1)
-            if isinstance(dict_manager, DictManager):
-                dict_manager.trackers[dict_ptr.segment_index].data = defaultdict(
-                    lambda: data[1], dict_manager.trackers[dict_ptr.segment_index].data
-                )
-            else:
-                dict_manager.trackers[dict_ptr.segment_index] = RustDictTracker(
-                    data=dict_manager.trackers[dict_ptr.segment_index].data,
-                    current_ptr=current_ptr,
-                    default_value=data[1],
-                )
         return struct_ptr
 
-    if arg_type in (U256, Hash32, Bytes32):
+    if arg_type in (U256, Hash32, Bytes32, BLSFieldElement):
         if isinstance_with_generic(arg, U256):
             arg = arg.to_be_bytes32()[::-1]
 
@@ -1141,25 +815,33 @@ def _gen_arg(
         segments.load_data(base, felt_values)
         return base
 
-    if arg_type is U384:
-        bytes_value = arg.to_le_bytes()
+    if arg_type in (U384, G1Compressed, Bytes48, KZGCommitment, BLSPubkey, KZGProof):
+        if isinstance_with_generic(arg, U384):
+            arg = arg.to_le_bytes()
+        elif isinstance_with_generic(arg, G1Compressed):
+            arg = U384(arg).to_le_bytes()
+
         felt_values = [
-            int.from_bytes(bytes_value[i : i + 12], "little") for i in range(0, 48, 12)
+            int.from_bytes(arg[i : i + 12], "little") for i in range(0, 48, 12)
         ]
 
         base = segments.add()
         segments.load_data(base, felt_values)
         return base
 
-    if arg_type is BNF:
+    if arg_type in (BNF, BLSF):
         base = segments.add()
         coeff = [_gen_arg(dict_manager, segments, U384, U384(arg))]
         segments.load_data(base, coeff)
         return base
 
-    if arg_type in (BNF2, BNF12):
+    if arg_type in (BNF2, BNF12, BLSF2, BLSF12):
         base = segments.add()
-        # In python, BNF<N> is a tuple of N int but in cairo it's a struct with N U384
+        # In python, BNF<N> is a raw tuple of N int.
+        # In python, BLSF<N> stores this tuple in a field "coeffs".
+        if arg_type in (BLSF2, BLSF12):
+            arg = arg.coeffs
+        # In Cairo, BNF<N> and BLSF<N> are a struct of N U384.
         # Cast int to U384 to be able to serialize
         coeffs = [
             _gen_arg(dict_manager, segments, U384, U384(arg[i]))
@@ -1168,7 +850,7 @@ def _gen_arg(
         segments.load_data(base, coeffs)
         return base
 
-    if arg_type in (BNP, BNP2, BNP12):
+    if arg_type in (BNP, BNP2):
         struct_ptr = segments.add()
 
         # Handle the x and y coordinates recursively
@@ -1259,12 +941,15 @@ def generate_trie_arg(
     # In case of a Trie, we need the trie.default to be the default value of the dict.
     dict_ptr = segments.memory.get(data)
 
-    if isinstance(dict_manager, DictManager):
-        default_value = dict_manager.trackers[
-            dict_ptr.segment_index
-        ].data.default_factory()
+    if isinstance(arg._data, defaultdict):
+        if isinstance(dict_manager, DictManager):
+            default_value = dict_manager.trackers[
+                dict_ptr.segment_index
+            ].data.default_factory()
+        else:
+            default_value = dict_manager.get_default_value(dict_ptr.segment_index)
     else:
-        default_value = dict_manager.get_default_value(dict_ptr.segment_index)
+        default_value = _gen_arg(dict_manager, segments, type(arg.default), arg.default)
     segments.load_data(base, [secured, default_value, data])
 
     return base

@@ -9,10 +9,7 @@ from typing import Any, Dict, Generator, Tuple, Union
 import pytest
 from _pytest.mark.structures import ParameterSet
 from ethereum.cancun.fork import state_transition
-from ethereum.cancun.fork_types import Account
-from ethereum.cancun.state import State
-from ethereum.cancun.trie import root as compute_root
-from ethereum.cancun.trie import trie_get, trie_set
+from ethereum.cancun.trie import Trie
 from ethereum.crypto.hash import keccak256
 from ethereum.exceptions import EthereumException
 from ethereum.utils.hexadecimal import hex_to_bytes
@@ -21,31 +18,7 @@ from ethereum_rlp.exceptions import RLPException
 from ethereum_spec_tools.evm_tools.loaders.fixture_loader import Load
 from ethereum_types.numeric import U64, U256
 
-
-def prepare_state(state: State) -> State:
-    for address in state._storage_tries:
-        state._storage_tries[address]._data = defaultdict(
-            lambda: defaultdict(lambda: U256(0)), state._storage_tries[address]._data
-        )
-        storage_root = compute_root(state._storage_tries[address])
-        account = trie_get(state._main_trie, address)
-        account = Account(
-            balance=account.balance,
-            nonce=account.nonce,
-            code=account.code,
-            storage_root=storage_root,
-        )
-        trie_set(state._main_trie, address, account)
-    state._main_trie._data = defaultdict(lambda: None, state._main_trie._data)
-
-    for snap in state._snapshots:
-        for address in snap._storage_tries:
-            snap._storage_tries[address]._data = defaultdict(
-                lambda: defaultdict(lambda: U256(0)), snap._storage_tries[address]._data
-            )
-        snap._main_trie._data = defaultdict(lambda: None, snap._main_trie._data)
-
-    return state
+from utils.fixture_loader import LoadKethFixture
 
 
 class NoTestsFound(Exception):
@@ -56,7 +29,7 @@ class NoTestsFound(Exception):
 
 
 def run_blockchain_st_test(
-    test_case: Dict, load: Load, cairo_run, request: pytest.FixtureRequest
+    test_case: Dict, load: LoadKethFixture, cairo_run, request: pytest.FixtureRequest
 ) -> None:
     test_file = test_case["test_file"]
     test_key = test_case["test_key"]
@@ -98,7 +71,6 @@ def run_blockchain_st_test(
                 block_exception = value
                 break
 
-        chain.state = prepare_state(chain.state)
         if block_exception:
             # TODO: Once all the specific exception types are thrown,
             #       only `pytest.raises` the correct exception type instead of
@@ -131,11 +103,24 @@ def add_block_to_chain(
     assert rlp.encode(block) == block_rlp
 
     try:
-        cairo_chain = cairo_run("state_transition", chain, block)
+        cairo_chain = cairo_run(
+            "state_transition", verify_squashed_dicts=True, chain=chain, block=block
+        )
         if request.config.getoption("--log-cli-level") == "TRACE":
             # In trace mode, run EELS as well to get a side-by-side comparison
             state_transition(chain, block)
         chain.blocks = cairo_chain.blocks
+        # Serializing the state back to a dict loses the `defaultdict` property - we must inject it back.
+        # because for EF-Tests, we don't know all touched keys beforehand.
+        cairo_chain.state._main_trie._data = defaultdict(
+            lambda: None, cairo_chain.state._main_trie._data
+        )
+        cairo_chain.state._storage_tries = defaultdict(
+            lambda: Trie(
+                secured=True, default=U256(0), _data=defaultdict(lambda: U256(0))
+            ),
+            cairo_chain.state._storage_tries,
+        )
         chain.state = cairo_chain.state
     except Exception as e:
         err_traceback = traceback.format_exc()

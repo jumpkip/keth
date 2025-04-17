@@ -3,33 +3,26 @@ import logging
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping
 
-from ethereum.cancun.fork_types import Address
+from ethereum.cancun.fork_types import Account, Address
 from ethereum.cancun.state import State, set_account, set_storage
 from ethereum.cancun.trie import (
     BranchNode,
     ExtensionNode,
     InternalNode,
     LeafNode,
+    Trie,
 )
 from ethereum.crypto.hash import Hash32, keccak256
 from ethereum_rlp import rlp
 from ethereum_types.bytes import Bytes, Bytes20, Bytes32
-from ethereum_types.numeric import U256
+from ethereum_types.numeric import U256, Uint
 
-from eth_rpc import EthereumRPC
-from mpt.utils import AccountNode, decode_node, nibble_list_to_bytes
+from keth_types.types import EMPTY_BYTES_HASH, EMPTY_TRIE_HASH
+from mpt.utils import decode_node, deserialize_to_internal_node, nibble_list_to_bytes
 
 logger = logging.getLogger(__name__)
-
-
-EMPTY_TRIE_HASH = Hash32.fromhex(
-    "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
-)
-EMPTY_BYTES_HASH = Hash32.fromhex(
-    "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
-)
 
 
 @dataclass
@@ -38,41 +31,28 @@ class EthereumTries:
     Represents an Ethereum MPT.
 
     Attributes:
-        nodes: A mapping of node hashes to the corresponding internal nodes.
+        nodes: A mapping of node hashes to the corresponding RLP encoded internal nodes.
         codes: A mapping of code hashes to the corresponding code.
         address_preimages: A mapping of MPT path to the corresponding addresses.
         storage_key_preimages: A mapping of MPT path to the corresponding storage keys.
         state_root: The root hash of the MPT.
     """
 
-    nodes: Mapping[Hash32, InternalNode]
+    nodes: Mapping[Hash32, Bytes]
     codes: Mapping[Hash32, Bytes]
     address_preimages: Mapping[Hash32, Address]
     storage_key_preimages: Mapping[Hash32, Bytes32]
     state_root: Hash32
 
-    # TODO: remove
-    # Currently, zkpi does not provide codes of accounts touched only by EXTCODEHASH during a block
-    # execution. As such, we fallback on an RPC client to fetch missing codes.
-    rpc_client: Optional[EthereumRPC] = None
-
-    def get_code(self, code_hash: Hash32, address: Address) -> Bytes:
+    def get_code(self, code_hash: Hash32) -> Bytes:
         """
         Get the code corresponding to the given code hash.
-        If no code is found, we fallback on an RPC client to fetch the code.
+        If no code is found, it means the code is not required for block execution.
         """
         if code_hash == EMPTY_BYTES_HASH:
             return b""
 
         code = self.codes.get(code_hash)
-        if code is not None:
-            return code
-
-        if self.rpc_client is None:
-            self.rpc_client = EthereumRPC.from_env()
-
-        code = self.rpc_client.get_code(address)
-        self.codes[code_hash] = code
         return code
 
     @staticmethod
@@ -93,7 +73,7 @@ class EthereumTries:
             An EthereumTries object.
         """
         nodes = {
-            keccak256(bytes.fromhex(node[2:])): decode_node(bytes.fromhex(node[2:]))
+            keccak256(bytes.fromhex(node[2:])): bytes.fromhex(node[2:])
             for node in data["witness"]["state"]
         }
 
@@ -171,15 +151,17 @@ class EthereumTries:
                         continue
                     nibble = bytes([i])
 
-                    # Handle the next node
-                    if len(subnode) > 32:
-                        raise ValueError(f"Invalid subnode length: {len(subnode)}")
+                    if isinstance(subnode, bytes) and len(subnode) == 32:
+                        next_node = (
+                            decode_node(self.nodes[subnode])
+                            if subnode in self.nodes
+                            else None
+                        )
+                    elif isinstance(subnode, list):
+                        next_node = deserialize_to_internal_node(subnode)
+                    else:
+                        raise ValueError(f"Invalid subnode type: {type(subnode)}")
 
-                    next_node = (
-                        self.nodes.get(subnode)
-                        if len(subnode) == 32
-                        else decode_node(subnode)
-                    )
                     if not next_node:
                         # If the subnode is not found, we assume this path
                         # is not needed for block execution
@@ -195,15 +177,18 @@ class EthereumTries:
             case ExtensionNode():
                 current_path = current_path + node.key_segment
 
-                if len(node.subnode) > 32:
-                    raise ValueError(f"Invalid subnode length: {len(node.subnode)}")
-
                 # subnode is a hash, so we need to resolve it
-                next_node = (
-                    self.nodes.get(node.subnode)
-                    if len(node.subnode) == 32
-                    else decode_node(node.subnode)
-                )
+                if isinstance(node.subnode, bytes) and len(node.subnode) == 32:
+                    next_node = (
+                        decode_node(self.nodes[node.subnode])
+                        if node.subnode in self.nodes
+                        else None
+                    )
+                elif isinstance(node.subnode, list):
+                    next_node = deserialize_to_internal_node(node.subnode)
+                else:
+                    raise ValueError(f"Invalid subnode type: {type(node.subnode)}")
+
                 if not next_node:
                     # If the subnode is not found, we assume this path
                     # is not needed for block execution
@@ -238,19 +223,26 @@ class EthereumTries:
         if address is None:
             return
 
-        account_node = AccountNode.from_rlp(node.value)
-        account_code = self.get_code(account_node.code_hash, address)
-        account = account_node.to_eels_account(account_code)
+        # RLP-decode the account, then get the code matching the code hash.
+        account_without_code = Account.from_rlp(node.value)
+        account_code = self.get_code(account_without_code.code_hash)
+        account = Account(
+            nonce=account_without_code.nonce,
+            balance=account_without_code.balance,
+            code_hash=account_without_code.code_hash,
+            storage_root=account_without_code.storage_root,
+            code=account_code,
+        )
 
         set_account(state, address, account)
 
-        if account_node.storage_root == EMPTY_TRIE_HASH:
+        if account.storage_root == EMPTY_TRIE_HASH:
             return
 
         # We need to resolve the storage root of the account
-        storage_root_node = self.nodes.get(account_node.storage_root)
-        if storage_root_node is None:
+        if account.storage_root not in self.nodes:
             return
+        storage_root_node = decode_node(self.nodes[account.storage_root])
 
         self.traverse_trie_and_process_leaf(
             storage_root_node,
@@ -283,7 +275,9 @@ class EthereumTries:
         Convert the Ethereum tries to a State object from the `ethereum` package.
         """
         state = State()
-        root_node = self.nodes[self.state_root]
+        if self.state_root not in self.nodes:
+            raise ValueError(f"State root not found in nodes: {self.state_root}")
+        root_node = decode_node(self.nodes[self.state_root])
         self.traverse_trie_and_process_leaf(
             root_node, b"", partial(self.set_account_from_leaf, state=state)
         )
@@ -335,7 +329,7 @@ class EthereumTrieTransitionDB(EthereumTries):
         pre_trie = EthereumTries.from_data(data)
 
         post_nodes = {
-            keccak256(bytes.fromhex(node[2:])): decode_node(bytes.fromhex(node[2:]))
+            keccak256(bytes.fromhex(node[2:])): bytes.fromhex(node[2:])
             for node in data["extra"]["committed"]
         }
         post_state_root = Hash32.fromhex(data["blocks"][0]["header"]["stateRoot"][2:])
@@ -352,15 +346,92 @@ class EthereumTrieTransitionDB(EthereumTries):
         instance.post_state_root = post_state_root
         return instance
 
-    def to_pre_state(self) -> State:
-        """Convert the pre-state trie to a State object."""
-        return self.to_state()
 
-    def to_post_state(self) -> State:
-        """Convert the post-state trie to a State object."""
-        state = State()
-        root_node = self.nodes[self.post_state_root]
-        self.traverse_trie_and_process_leaf(
-            root_node, b"", partial(self.set_account_from_leaf, state=state)
+class PreState:
+    @staticmethod
+    def from_data(data: Dict[str, Any]) -> State:
+        """
+        Create a PreState object from the ZKPI-provided data.
+        """
+        pre_state = State()
+        for address_hex, account in data["extra"]["preState"].items():
+            address = Address.fromhex(address_hex[2:])
+            # Create an empty, non-defaultdict, storage trie for the account
+            storage_trie = Trie(secured=True, default=U256(0), _data={})
+            pre_state._storage_tries[address] = storage_trie
+            if account is None:
+                # If the account is not present in the preState data, we want it explicitly set to NONE instead of being a non-existent entry.
+                # This is very important for the args_gen purpose, as we need all touched accounts to be present in the initial state dict.
+                pre_state._main_trie._data[address] = None
+                continue
+
+            # Initialize the account
+            pre_balance = U256(int(account["balance"][2:], 16))
+            pre_nonce = Uint(int(account["nonce"][2:], 16))
+            pre_code_hash = Hash32.fromhex(account["codeHash"][2:])
+            pre_storage_hash = Hash32.fromhex(account["storageHash"][2:])
+            pre_code = Bytes.fromhex(account["code"][2:]) if "code" in account else None
+
+            # Note: If you want to use EELS with the ZKPi-pre-state, you need to explicitly set the code to an empty bytearray if the codehash is none,
+            # because EELS will check code==bytearray() for EOA checks.
+
+            # Explicitly instantiate without code, as it's not an interesting data in the
+            # case of state / trie diffs
+            pre_account = Account(
+                nonce=pre_nonce,
+                balance=pre_balance,
+                code_hash=pre_code_hash,
+                storage_root=pre_storage_hash,
+                code=pre_code,
+            )
+            set_account(pre_state, address, pre_account)
+
+            if "storage" not in account:
+                continue
+
+            # Fill the storage trie
+            for storage_key_hex, value in account["storage"].items():
+                storage_key = Bytes32.fromhex(storage_key_hex[2:])
+                pre_state._storage_tries[address]._data[storage_key] = U256(
+                    int(value[2:], 16)
+                )
+
+        return pre_state
+
+
+@dataclass
+class ZkPi:
+    """
+    Contains the pre-state, state diff, and transition DB, extracted from the ZKPI-provided JSON data.
+
+    Attributes:
+        transition_db: A DB containing nodes and information about the pre and post-block MPTs.
+        state_diff: The state diff produced by the STF.
+        pre_state: The pre-state of the block.
+    """
+
+    from mpt.trie_diff import StateDiff
+
+    transition_db: EthereumTrieTransitionDB
+    state_diff: StateDiff
+    pre_state: State
+
+    @classmethod
+    def from_data(cls, data: Dict[str, Any]) -> "ZkPi":
+        """
+        Create a ZkPi object from the ZKPI-provided data.
+
+        An account that is not present in the preState data but is present in the postState data is
+        set in the pre-state to EMPTY_ACCOUNT.
+
+        A storage key that is not present in the preState
+        data but is present in the postState data is set in the pre-state to U256(0).
+        """
+        from mpt.trie_diff import StateDiff
+
+        transition_tries = EthereumTrieTransitionDB.from_data(data)
+        state_diff = StateDiff.from_data(data)
+        pre_state = PreState.from_data(data)
+        return cls(
+            transition_db=transition_tries, state_diff=state_diff, pre_state=pre_state
         )
-        return state

@@ -8,6 +8,7 @@ from ethereum_types.numeric import Bool, U256, Uint, U64, U256Struct, bool
 from ethereum_types.bytes import (
     Bytes,
     Bytes0,
+    OptionalBytes,
     BytesStruct,
     Bytes8,
     Bytes32,
@@ -30,6 +31,7 @@ from ethereum.cancun.blocks import (
 from ethereum.cancun.fork_types import (
     Address,
     Account,
+    AccountStruct,
     Bloom,
     Address_from_felt_be,
     TupleVersionedHash,
@@ -59,7 +61,7 @@ from ethereum.utils.numeric import (
     Uint_from_be_bytes,
     U64_from_be_bytes,
 )
-from ethereum.utils.bytes import Bytes8_to_Bytes, Bytes__eq__
+from ethereum.utils.bytes import Bytes8_to_Bytes, Bytes__eq__, Bytes_to_Bytes32
 from cairo_core.comparison import is_zero
 from legacy.utils.array import reverse
 from legacy.utils.bytes import (
@@ -219,6 +221,50 @@ namespace ExtendedImpl {
             ),
         );
         return extended;
+    }
+
+    // @notice Converts a Simple to an Extended. This is needed because `decode` returns a Simple but `trie.cairo` types are Extended.
+    // @dev in Python, this conversion is trivial since Simple is included in Extended.
+    //      in Cairo, we need to check the type of the Simple and convert it to the correct Extended variant.
+    func from_simple(simple: Simple) -> Extended {
+        alloc_locals;
+
+        if (cast(simple.value, felt) == 0) {
+            let res = Extended(cast(0, ExtendedEnum*));
+            return res;
+        }
+
+        if (simple.value.bytes.value != 0) {
+            let res = ExtendedImpl.bytes(simple.value.bytes);
+            return res;
+        }
+
+        if (simple.value.sequence.value.len == 0) {
+            tempvar sequence_extended = SequenceExtended(
+                new SequenceExtendedStruct(cast(simple.value.sequence.value.data, Extended*), 0)
+            );
+            let res = ExtendedImpl.sequence(sequence_extended);
+            return res;
+        }
+
+        let (buffer: Extended*) = alloc();
+        _from_simple_inner(buffer, simple.value.sequence, 0);
+        tempvar sequence_extended = SequenceExtended(
+            new SequenceExtendedStruct(buffer, simple.value.sequence.value.len)
+        );
+        let res = ExtendedImpl.sequence(sequence_extended);
+        return res;
+    }
+
+    func _from_simple_inner(dst: Extended*, src: SequenceSimple, index: felt) {
+        if (index == src.value.len) {
+            return ();
+        }
+
+        let current = src.value.data[index];
+        let current_extended = ExtendedImpl.from_simple(current);
+        assert dst[index] = current_extended;
+        return _from_simple_inner(dst, src, index + 1);
     }
 }
 
@@ -443,7 +489,7 @@ func encode_account{range_check_ptr, bitwise_ptr: BitwiseBuiltin*, keccak_ptr: K
 
     // Encoding the code hash is encoding 32 bytes, so we know the prefix is 0x80 + 32
     // code_hash_len is 33 bytes and we can directly copy the bytes into the buffer
-    let code_hash = keccak256(raw_account_data.value.code);
+    let code_hash = raw_account_data.value.code_hash;
     let code_hash_len = 32;
     assert [body_ptr] = 0x80 + code_hash_len;
     uint256_to_bytes32_little(body_ptr + 1, [code_hash.value]);
@@ -2192,4 +2238,41 @@ func U256_from_rlp{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(encoding: Byte
 
     let res = U256_from_be_bytes(decoded_bytes);
     return res;
+}
+
+// @notice Decodes the RLP encoded representation of an account.
+// @dev Extracts nonce, balance, code hash, and storage root from the RLP sequence.
+// @param encoding The RLP encoded bytes of the account node.
+// @return account The decoded Account - with an empty `code` field.
+// @return storage_root_bytes The storage root as Bytes, needed for storage diff computation.
+func Account_from_rlp{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(encoding: Bytes) -> (
+    account: Account, storage_root_bytes: Bytes
+) {
+    alloc_locals;
+
+    let decoded = decode(encoding);
+
+    let sequence = decoded.value.sequence;
+    let len = sequence.value.len;
+    let data = sequence.value.data;
+
+    let nonce_bytes = data[0].value.bytes;
+    let balance_bytes = data[1].value.bytes;
+    let storage_root_bytes = data[2].value.bytes;
+    let codehash_bytes = data[3].value.bytes;
+
+    let balance = U256_from_be_bytes(balance_bytes);
+    let codehash = Bytes_to_Bytes32(codehash_bytes);
+    let nonce = Uint_from_be_bytes(nonce_bytes);
+    let storage_root = Bytes_to_Bytes32(storage_root_bytes);
+
+    let none = OptionalBytes(cast(0, BytesStruct*));
+
+    tempvar res = Account(
+        new AccountStruct(
+            nonce=nonce, balance=balance, code_hash=codehash, storage_root=storage_root, code=none
+        ),
+    );
+
+    return (res, storage_root_bytes);
 }

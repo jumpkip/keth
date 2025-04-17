@@ -1,13 +1,18 @@
 from starkware.cairo.common.alloc import alloc
-from starkware.cairo.common.cairo_builtins import PoseidonBuiltin, BitwiseBuiltin
+from starkware.cairo.common.cairo_builtins import PoseidonBuiltin, BitwiseBuiltin, KeccakBuiltin
+from starkware.cairo.common.builtin_keccak.keccak import keccak_uint256s
 from starkware.cairo.lang.compiler.lib.registers import get_fp_and_pc
 from starkware.cairo.common.dict import DictAccess
 from starkware.cairo.common.memset import memset
 from starkware.cairo.common.memcpy import memcpy
-from ethereum.crypto.hash import Hash32
+from ethereum.crypto.hash import Hash32, keccak256
 from ethereum.cancun.fork_types import (
     OptionalAddress,
     Address,
+    Account,
+    AccountStruct,
+    account_eq_without_storage_root,
+    OptionalAccount,
     TupleAddressBytes32U256DictAccess,
     HashedTupleAddressBytes32,
 )
@@ -22,6 +27,7 @@ from ethereum_types.bytes import (
     String,
     StringStruct,
 )
+from ethereum.utils.bytes import Bytes20_to_Bytes, Bytes32_to_Bytes
 from ethereum_types.numeric import U256, Uint, U256Struct, Bool, bool
 from ethereum.cancun.trie import (
     LeafNode,
@@ -43,6 +49,7 @@ from ethereum.cancun.trie import (
     nibble_list_to_bytes,
 )
 from ethereum_rlp.rlp import (
+    Account_from_rlp,
     Extended,
     ExtendedEnum,
     decode,
@@ -55,9 +62,17 @@ from ethereum_rlp.rlp import (
 )
 
 from starkware.cairo.common.builtin_poseidon.poseidon import poseidon_hash, poseidon_hash_many
+from legacy.utils.bytes import felt_to_bytes20_little
 from legacy.utils.dict import hashdict_read, hashdict_write, dict_new_empty, dict_read
 from cairo_core.control_flow import raise
-from ethereum.utils.numeric import ceil32, divmod, U256_from_be_bytes, U256_le, Uint_from_be_bytes
+from ethereum.utils.numeric import (
+    ceil32,
+    divmod,
+    U256_from_be_bytes,
+    U256_le,
+    Uint_from_be_bytes,
+    U256__eq__,
+)
 from ethereum.utils.bytes import (
     Bytes_to_Bytes32,
     Bytes__add__,
@@ -66,131 +81,44 @@ from ethereum.utils.bytes import (
     Bytes__startswith__,
 )
 
-from mpt.utils import deserialize_to_internal_node
+from mpt.utils import (
+    deserialize_to_internal_node,
+    check_branch_node,
+    check_leaf_node,
+    check_extension_node,
+    decode_to_internal_node,
+)
+from mpt.types import (
+    NodeStore,
+    NodeStoreStruct,
+    NodeStoreDictAccess,
+    MappingBytes32Address,
+    MappingBytes32AddressStruct,
+    Bytes32OptionalAddressDictAccess,
+    MappingBytes32Bytes32,
+    MappingBytes32Bytes32Struct,
+    Bytes32Bytes32DictAccess,
+    AccountDiff,
+    AccountDiffStruct,
+    StorageDiff,
+    StorageDiffStruct,
+    StorageDiffEntry,
+    StorageDiffEntryStruct,
+    AddressAccountDiffEntryStruct,
+    AddressAccountDiffEntry,
+    OptionalUnionInternalNodeExtended,
+    OptionalUnionInternalNodeExtendedEnum,
+)
+from legacy.utils.dict import dict_squash
 
 const EMPTY_TRIE_HASH_LOW = 0x6ef8c092e64583ffa655cc1b171fe856;
 const EMPTY_TRIE_HASH_HIGH = 0x21b463e3b52f6201c0ad6c991be0485b;
 
-// NodeStore is a mapping of node hashes to their corresponding InternalNode
-// In the world state DB given as input to the program
-// This is used to store state and storage MPT nodes
-// used to prove the state transition function
-struct NodeStore {
-    value: NodeStoreStruct*,
-}
-struct NodeStoreStruct {
-    dict_ptr_start: NodeStoreDictAccess*,
-    dict_ptr: NodeStoreDictAccess*,
-}
-
-struct NodeStoreDictAccess {
-    key: HashedBytes32,
-    prev_value: OptionalInternalNode,
-    new_value: OptionalInternalNode,
-}
-// AddressPreimages is a mapping of keccak(address) to their corresponding preimages
-// As per the specification, MPT state nodes paths are keccak(address)
-// This mapping is used to retrieve the address given a full state path
-struct MappingBytes32Address {
-    value: MappingBytes32AddressStruct*,
-}
-struct MappingBytes32AddressStruct {
-    dict_ptr_start: Bytes32OptionalAddressDictAccess*,
-    dict_ptr: Bytes32OptionalAddressDictAccess*,
-}
-struct Bytes32OptionalAddressDictAccess {
-    key: HashedBytes32,
-    prev_value: Address,
-    new_value: Address,
-}
-
-// StorageKeyPreimages is a mapping of keccak(storage_key) to their corresponding preimages
-// As per the specification, MPT storage nodes paths are keccak(storage_key)
-// This mapping is used to retrieve the storage key given a full storage path for a given address
-struct MappingBytes32Bytes32 {
-    value: MappingBytes32Bytes32Struct*,
-}
-struct MappingBytes32Bytes32Struct {
-    dict_ptr_start: Bytes32Bytes32DictAccess*,
-    dict_ptr: Bytes32Bytes32DictAccess*,
-}
-struct Bytes32Bytes32DictAccess {
-    key: HashedBytes32,
-    prev_value: Bytes32,
-    new_value: Bytes32,
-}
-
-struct AccountDiff {
-    value: AccountDiffStruct*,
-}
-struct AccountDiffStruct {
-    data: AddressAccountNodeDiffEntry*,
-    len: felt,
-}
-
-struct StorageDiff {
-    value: StorageDiffStruct*,
-}
-struct StorageDiffStruct {
-    data: StorageDiffEntry*,
-    len: felt,
-}
-
-struct StorageDiffEntry {
-    value: StorageDiffEntryStruct*,
-}
-
-struct StorageDiffEntryStruct {
-    key: HashedTupleAddressBytes32,
-    prev_value: U256,
-    new_value: U256,
-}
-
-// AccountNode is the format of
-// the account inside the Ethereum state MPT
-struct AccountNode {
-    value: AccountNodeStruct*,
-}
-struct AccountNodeStruct {
-    nonce: Uint,
-    balance: U256,
-    code_hash: Hash32,
-    storage_root: Hash32,
-}
-
-struct AddressAccountNodeDiffEntryStruct {
-    key: Address,
-    prev_value: AccountNode,
-    new_value: AccountNode,
-}
-
-struct AddressAccountNodeDiffEntry {
-    value: AddressAccountNodeDiffEntryStruct*,
-}
-
-// Union of InternalNode (union type) and Extended (union type)
-// Both sub unions must be inlined because in Python a Union[A, Union[B,C]] is just Union[A,B,C]
-struct OptionalUnionInternalNodeExtended {
-    value: OptionalUnionInternalNodeExtendedEnum*,
-}
-struct OptionalUnionInternalNodeExtendedEnum {
-    leaf: LeafNode,
-    extension: ExtensionNode,
-    branch: BranchNode,
-    sequence: SequenceExtended,
-    bytearray: Bytes,
-    bytes: Bytes,
-    uint: Uint*,
-    fixed_uint: Uint*,
-    str: String,
-    bool: Bool*,
-}
-
 // / @notice Implementation details for OptionalUnionInternalNodeExtended.
 namespace OptionalUnionInternalNodeExtendedImpl {
-    // / @notice Creates an OptionalUnionInternalNodeExtended from a LeafNode.
-    // / @param self The LeafNode to wrap.
-    // / @return The OptionalUnionInternalNodeExtended containing the LeafNode.
+    // @notice Creates an OptionalUnionInternalNodeExtended from a LeafNode.
+    // @param self The LeafNode to wrap.
+    // @return The OptionalUnionInternalNodeExtended containing the LeafNode.
     func from_leaf(self: LeafNode) -> OptionalUnionInternalNodeExtended {
         alloc_locals;
         tempvar res = OptionalUnionInternalNodeExtended(
@@ -210,9 +138,9 @@ namespace OptionalUnionInternalNodeExtendedImpl {
         return res;
     }
 
-    // / @notice Creates an OptionalUnionInternalNodeExtended from an ExtensionNode.
-    // / @param self The ExtensionNode to wrap.
-    // / @return The OptionalUnionInternalNodeExtended containing the ExtensionNode.
+    // @notice Creates an OptionalUnionInternalNodeExtended from an ExtensionNode.
+    // @param self The ExtensionNode to wrap.
+    // @return The OptionalUnionInternalNodeExtended containing the ExtensionNode.
     func from_extension(self: ExtensionNode) -> OptionalUnionInternalNodeExtended {
         alloc_locals;
         tempvar res = OptionalUnionInternalNodeExtended(
@@ -232,9 +160,9 @@ namespace OptionalUnionInternalNodeExtendedImpl {
         return res;
     }
 
-    // / @notice Creates an OptionalUnionInternalNodeExtended from a BranchNode.
-    // / @param self The BranchNode to wrap.
-    // / @return The OptionalUnionInternalNodeExtended containing the BranchNode.
+    // @notice Creates an OptionalUnionInternalNodeExtended from a BranchNode.
+    // @param self The BranchNode to wrap.
+    // @return The OptionalUnionInternalNodeExtended containing the BranchNode.
     func from_branch(self: BranchNode) -> OptionalUnionInternalNodeExtended {
         alloc_locals;
         tempvar res = OptionalUnionInternalNodeExtended(
@@ -254,10 +182,10 @@ namespace OptionalUnionInternalNodeExtendedImpl {
         return res;
     }
 
-    // / @notice Creates an OptionalUnionInternalNodeExtended from an Extended type.
-    // / @dev Casts the Extended enum to the padded OptionalUnionInternalNodeExtendedEnum.
-    // / @param self The Extended value to wrap.
-    // / @return The OptionalUnionInternalNodeExtended containing the Extended value.
+    // @notice Creates an OptionalUnionInternalNodeExtended from an Extended type.
+    // @dev Casts the Extended enum to the padded OptionalUnionInternalNodeExtendedEnum.
+    // @param self The Extended value to wrap.
+    // @return The OptionalUnionInternalNodeExtended containing the Extended value.
     func from_extended(self: Extended) -> OptionalUnionInternalNodeExtended {
         alloc_locals;
         // Input is an extended enum
@@ -271,14 +199,33 @@ namespace OptionalUnionInternalNodeExtendedImpl {
         );
         return res;
     }
+
+    func from_bytes(self: Bytes) -> OptionalUnionInternalNodeExtended {
+        alloc_locals;
+        tempvar res = OptionalUnionInternalNodeExtended(
+            new OptionalUnionInternalNodeExtendedEnum(
+                leaf=LeafNode(cast(0, LeafNodeStruct*)),
+                extension=ExtensionNode(cast(0, ExtensionNodeStruct*)),
+                branch=BranchNode(cast(0, BranchNodeStruct*)),
+                sequence=SequenceExtended(cast(0, SequenceExtendedStruct*)),
+                bytearray=Bytes(cast(0, BytesStruct*)),
+                bytes=self,
+                uint=cast(0, Uint*),
+                fixed_uint=cast(0, Uint*),
+                str=String(cast(0, StringStruct*)),
+                bool=cast(0, Bool*),
+            ),
+        );
+        return res;
+    }
 }
 
-// / @notice Compares two OptionalUnionInternalNodeExtended instances for equality.
-// / @dev Handles null checks, type checks for InternalNode variants (Leaf, Extension, Branch),
-// /      and delegates to Extended__eq__ for Extended types.
-// / @param left The left OptionalUnionInternalNodeExtended instance.
-// / @param right The right OptionalUnionInternalNodeExtended instance.
-// / @return bool(1) if equal, bool(0) otherwise.
+// @notice Compares two OptionalUnionInternalNodeExtended instances for equality.
+// @dev Handles null checks, type checks for InternalNode variants (Leaf, Extension, Branch),
+//      and delegates to Extended__eq__ for Extended types.
+// @param left The left OptionalUnionInternalNodeExtended instance.
+// @param right The right OptionalUnionInternalNodeExtended instance.
+// @return bool(1) if equal, bool(0) otherwise.
 func OptionalUnionInternalNodeExtended__eq__(
     left: OptionalUnionInternalNodeExtended, right: OptionalUnionInternalNodeExtended
 ) -> bool {
@@ -353,62 +300,28 @@ func OptionalUnionInternalNodeExtended__eq__(
     return res;
 }
 
-// / @notice Decodes the RLP encoded representation of an account node.
-// / @dev Extracts nonce, balance, code hash, and storage root from the RLP sequence.
-// / @param encoding The RLP encoded bytes of the account node.
-// / @return account The decoded AccountNode.
-// / @return storage_root_bytes The storage root as Bytes, needed for storage diff computation.
-func AccountNode_from_rlp{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(encoding: Bytes) -> (
-    account: AccountNode, storage_root_bytes: Bytes
-) {
-    alloc_locals;
-
-    let decoded = decode(encoding);
-
-    let sequence = decoded.value.sequence;
-    let len = sequence.value.len;
-    let data = sequence.value.data;
-
-    let nonce_bytes = data[0].value.bytes;
-    let balance_bytes = data[1].value.bytes;
-    let storage_root_bytes = data[2].value.bytes;
-    let codehash_bytes = data[3].value.bytes;
-
-    let balance = U256_from_be_bytes(balance_bytes);
-    let codehash = Bytes_to_Bytes32(codehash_bytes);
-    let nonce = Uint_from_be_bytes(nonce_bytes);
-    let storage_root = Bytes_to_Bytes32(storage_root_bytes);
-
-    tempvar res = AccountNode(
-        new AccountNodeStruct(
-            nonce=nonce, balance=balance, code_hash=codehash, storage_root=storage_root
-        ),
-    );
-
-    return (res, storage_root_bytes);
-}
-
-// / @notice Processes the difference between two account nodes in the state trie.
-// / @dev Retrieves the address from preimages using the path hash, decodes account data from
-// /      RLP encoding for both left and right nodes, records the difference in the
-// /      `main_trie_end` structure, and recursively calls `_compute_diff` for the storage trie.
-// / @implicit node_store Access to the global node store for resolving hashes.
-// / @implicit address_preimages Mapping from path hash to account address.
-// / @implicit storage_key_preimages Mapping from storage key hash to storage key (passed down).
-// / @implicit main_trie_end Pointer to the current end of the account diff list.
-// / @implicit storage_tries_end Pointer to the current end of the storage diff list (passed down).
-// / @param path The keccak hash of the account address (path in the state trie).
-// / @param left The previous (left) account leaf node at this path (optional).
-// / @param right The current (right) account leaf node at this path (optional).
-// / @return Updates main_trie_end and potentially storage_tries_end via recursive calls.
+// @notice Processes the difference between two account nodes in the state trie.
+// @dev Retrieves the address from preimages using the path hash, decodes account data from
+//      RLP encoding for both left and right nodes, records the difference in the
+//      `main_trie_end` structure, and recursively calls `_compute_diff` for the storage trie.
+// @implicit node_store Access to the global node store for resolving hashes.
+// @implicit address_preimages Mapping from path hash to account address.
+// @implicit storage_key_preimages Mapping from storage key hash to storage key (passed down).
+// @implicit main_trie_end Pointer to the current end of the account diff list.
+// @implicit storage_tries_end Pointer to the current end of the storage diff list (passed down).
+// @param path The keccak hash of the account address (path in the state trie).
+// @param left The previous (left) account leaf node at this path (optional).
+// @param right The current (right) account leaf node at this path (optional).
+// @return Updates main_trie_end and potentially storage_tries_end via recursive calls.
 func _process_account_diff{
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
     node_store: NodeStore,
     address_preimages: MappingBytes32Address,
     storage_key_preimages: MappingBytes32Bytes32,
-    main_trie_end: AddressAccountNodeDiffEntry*,
+    main_trie_end: AddressAccountDiffEntry*,
     storage_tries_end: StorageDiffEntry*,
 }(path: Bytes32, left: OptionalLeafNode, right: OptionalLeafNode) -> () {
     alloc_locals;
@@ -424,8 +337,16 @@ func _process_account_diff{
     );
     tempvar address = Address(pointer);
 
+    // INVARIANT [Soundness]: check keccak(address) == path
+    let address_bytes = Bytes20_to_Bytes(address);
+    let hashed_address = keccak256(address_bytes);
+    with_attr error_message("INVARIANT - Invalid address preimage: keccak(address) != path") {
+        assert hashed_address.value.low = path.value.low;
+        assert hashed_address.value.high = path.value.high;
+    }
+
     if (left.value != 0) {
-        let (left_account, left_storage_root_bytes) = AccountNode_from_rlp(
+        let (left_account, left_storage_root_bytes) = Account_from_rlp(
             left.value.value.value.bytes
         );
         let left_storage_root_extended = ExtendedImpl.bytes(left_storage_root_bytes);
@@ -433,10 +354,11 @@ func _process_account_diff{
             left_storage_root_extended
         );
         tempvar left_storage_root = left_storage_root;
-        tempvar left_account = left_account;
+        tempvar left_optional_account = OptionalAccount(left_account.value);
         tempvar range_check_ptr = range_check_ptr;
         tempvar bitwise_ptr = bitwise_ptr;
         tempvar poseidon_ptr = poseidon_ptr;
+        tempvar keccak_ptr = keccak_ptr;
     } else {
         tempvar left_storage_root = OptionalUnionInternalNodeExtended(
             cast(0, OptionalUnionInternalNodeExtendedEnum*)
@@ -445,17 +367,19 @@ func _process_account_diff{
         tempvar range_check_ptr = range_check_ptr;
         tempvar bitwise_ptr = bitwise_ptr;
         tempvar poseidon_ptr = poseidon_ptr;
+        tempvar keccak_ptr = keccak_ptr;
     }
     let left_storage_root = OptionalUnionInternalNodeExtended(
-        cast([ap - 5], OptionalUnionInternalNodeExtendedEnum*)
+        cast([ap - 6], OptionalUnionInternalNodeExtendedEnum*)
     );
-    let left_account = AccountNode(cast([ap - 4], AccountNodeStruct*));
-    let range_check_ptr = [ap - 3];
-    let bitwise_ptr = cast([ap - 2], BitwiseBuiltin*);
-    let poseidon_ptr = cast([ap - 1], PoseidonBuiltin*);
+    let left_optional_account = OptionalAccount(cast([ap - 5], AccountStruct*));
+    let range_check_ptr = [ap - 4];
+    let bitwise_ptr = cast([ap - 3], BitwiseBuiltin*);
+    let poseidon_ptr = cast([ap - 2], PoseidonBuiltin*);
+    let keccak_ptr = cast([ap - 1], KeccakBuiltin*);
 
     if (right.value != 0) {
-        let (right_account, right_storage_root_bytes) = AccountNode_from_rlp(
+        let (right_account, right_storage_root_bytes) = Account_from_rlp(
             right.value.value.value.bytes
         );
 
@@ -468,6 +392,7 @@ func _process_account_diff{
         tempvar range_check_ptr = range_check_ptr;
         tempvar bitwise_ptr = bitwise_ptr;
         tempvar poseidon_ptr = poseidon_ptr;
+        tempvar keccak_ptr = keccak_ptr;
     } else {
         tempvar right_storage_root = OptionalUnionInternalNodeExtended(
             cast(0, OptionalUnionInternalNodeExtendedEnum*)
@@ -476,23 +401,35 @@ func _process_account_diff{
         tempvar range_check_ptr = range_check_ptr;
         tempvar bitwise_ptr = bitwise_ptr;
         tempvar poseidon_ptr = poseidon_ptr;
+        tempvar keccak_ptr = keccak_ptr;
     }
     let right_storage_root = OptionalUnionInternalNodeExtended(
-        cast([ap - 5], OptionalUnionInternalNodeExtendedEnum*)
+        cast([ap - 6], OptionalUnionInternalNodeExtendedEnum*)
     );
-    let right_account = AccountNode(cast([ap - 4], AccountNodeStruct*));
-    let range_check_ptr = [ap - 3];
-    let bitwise_ptr = cast([ap - 2], BitwiseBuiltin*);
-    let poseidon_ptr = cast([ap - 1], PoseidonBuiltin*);
+    let right_account_value = cast([ap - 5], AccountStruct*);
+    let range_check_ptr = [ap - 4];
+    let bitwise_ptr = cast([ap - 3], BitwiseBuiltin*);
+    let poseidon_ptr = cast([ap - 2], PoseidonBuiltin*);
+    let keccak_ptr = cast([ap - 1], KeccakBuiltin*);
 
-    tempvar account_diff = AddressAccountNodeDiffEntry(
-        new AddressAccountNodeDiffEntryStruct(
-            key=address, prev_value=left_account, new_value=right_account
-        ),
+    // This is an account diff only if the ACCOUNT is different - not taking into account its storage.
+    // We don't log any diff in the main_trie_end if only the storage root is different.
+    let is_prev_eq_new = account_eq_without_storage_root(
+        left_optional_account, OptionalAccount(right_account_value)
     );
-
-    assert [main_trie_end] = account_diff;
-    tempvar main_trie_end = main_trie_end + AddressAccountNodeDiffEntry.SIZE;
+    if (is_prev_eq_new.value != 0) {
+        tempvar main_trie_end = main_trie_end;
+    } else {
+        tempvar account_diff = AddressAccountDiffEntry(
+            new AddressAccountDiffEntryStruct(
+                key=address,
+                prev_value=left_optional_account,
+                new_value=Account(right_account_value),
+            ),
+        );
+        assert [main_trie_end] = account_diff;
+        tempvar main_trie_end = main_trie_end + AddressAccountDiffEntry.SIZE;
+    }
 
     let (new_path_buffer) = alloc();
     tempvar new_path = Bytes(new BytesStruct(new_path_buffer, 0));
@@ -500,26 +437,32 @@ func _process_account_diff{
     tempvar new_address = OptionalAddress(new address.value);
 
     _compute_diff(
-        left=left_storage_root, right=right_storage_root, path=new_path, account_address=new_address
+        left=left_storage_root,
+        right=right_storage_root,
+        parent_left=OptionalInternalNode(cast(0, InternalNodeEnum*)),
+        parent_right=OptionalInternalNode(cast(0, InternalNodeEnum*)),
+        path=new_path,
+        account_address=new_address,
     );
     return ();
 }
 
-// / @notice Processes the difference between two storage leaf nodes for a specific account.
-// / @dev Retrieves the storage key from preimages using the path hash, decodes storage values
-// /      (U256) from RLP encoding for both left and right nodes, and records the difference
-// /      in the `storage_tries_end` structure.
-// / @implicit storage_key_preimages Mapping from storage path hash to storage key.
-// / @implicit storage_tries_end Pointer to the current end of the storage diff list.
-// / @param address The account address that owns this storage trie.
-// / @param path The keccak hash of the storage key (path in the storage trie).
-// / @param left The previous (left) storage leaf node at this path (optional).
-// / @param right The current (right) storage leaf node at this path (optional).
-// / @return Updates storage_tries_end.
+// @notice Processes the difference between two storage leaf nodes for a specific account.
+// @dev Retrieves the storage key from preimages using the path hash, decodes storage values
+//      (U256) from RLP encoding for both left and right nodes, and records the difference
+//      in the `storage_tries_end` structure.
+// @implicit storage_key_preimages Mapping from storage path hash to storage key.
+// @implicit storage_tries_end Pointer to the current end of the storage diff list.
+// @param address The account address that owns this storage trie.
+// @param path The keccak hash of the storage key (path in the storage trie).
+// @param left The previous (left) storage leaf node at this path (optional).
+// @param right The current (right) storage leaf node at this path (optional).
+// @return Updates storage_tries_end.
 func _process_storage_diff{
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
     storage_key_preimages: MappingBytes32Bytes32,
     storage_tries_end: StorageDiffEntry*,
 }(address: Address, path: Bytes32, left: OptionalLeafNode, right: OptionalLeafNode) -> () {
@@ -536,37 +479,57 @@ func _process_storage_diff{
     );
     tempvar storage_key = Bytes32(cast(pointer, Bytes32Struct*));
 
-    if (left.value != 0) {
-        let left_decoded = U256_from_rlp(left.value.value.value.bytes);
-        tempvar range_check_ptr = range_check_ptr;
-        tempvar bitwise_ptr = bitwise_ptr;
-        tempvar poseidon_ptr = poseidon_ptr;
-    } else {
-        tempvar left = left;
-        tempvar range_check_ptr = range_check_ptr;
-        tempvar bitwise_ptr = bitwise_ptr;
-        tempvar poseidon_ptr = poseidon_ptr;
+    // INVARIANT [Soundness]: check keccak(storage_key) == path
+    let (storage_key_hash) = keccak_uint256s(1, storage_key.value);
+    with_attr error_message(
+            "INVARIANT - Invalid storage key preimage: keccak(storage_key) != path") {
+        assert storage_key_hash.low = path.value.low;
+        assert storage_key_hash.high = path.value.high;
     }
-    let left_u256 = U256(cast([ap - 4], U256Struct*));
-    let range_check_ptr = [ap - 3];
-    let bitwise_ptr = cast([ap - 2], BitwiseBuiltin*);
-    let poseidon_ptr = cast([ap - 1], PoseidonBuiltin*);
+
+    if (left.value != 0) {
+        let left_u256 = U256_from_rlp(left.value.value.value.bytes);
+        tempvar range_check_ptr = range_check_ptr;
+        tempvar bitwise_ptr = bitwise_ptr;
+        tempvar poseidon_ptr = poseidon_ptr;
+        tempvar keccak_ptr = keccak_ptr;
+    } else {
+        tempvar left_u256 = U256(new U256Struct(0, 0));
+        tempvar range_check_ptr = range_check_ptr;
+        tempvar bitwise_ptr = bitwise_ptr;
+        tempvar poseidon_ptr = poseidon_ptr;
+        tempvar keccak_ptr = keccak_ptr;
+    }
+
+    let left_u256 = U256(cast([ap - 5], U256Struct*));
+    let range_check_ptr = [ap - 4];
+    let bitwise_ptr = cast([ap - 3], BitwiseBuiltin*);
+    let poseidon_ptr = cast([ap - 2], PoseidonBuiltin*);
+    let keccak_ptr = cast([ap - 1], KeccakBuiltin*);
 
     if (right.value != 0) {
-        let right_decoded = U256_from_rlp(right.value.value.value.bytes);
+        let right_u256 = U256_from_rlp(right.value.value.value.bytes);
         tempvar range_check_ptr = range_check_ptr;
         tempvar bitwise_ptr = bitwise_ptr;
         tempvar poseidon_ptr = poseidon_ptr;
+        tempvar keccak_ptr = keccak_ptr;
     } else {
-        tempvar right = right;
+        tempvar right_u256 = U256(new U256Struct(0, 0));
         tempvar range_check_ptr = range_check_ptr;
         tempvar bitwise_ptr = bitwise_ptr;
         tempvar poseidon_ptr = poseidon_ptr;
+        tempvar keccak_ptr = keccak_ptr;
     }
-    let right_u256 = U256(cast([ap - 4], U256Struct*));
-    let range_check_ptr = [ap - 3];
-    let bitwise_ptr = cast([ap - 2], BitwiseBuiltin*);
-    let poseidon_ptr = cast([ap - 1], PoseidonBuiltin*);
+    let right_u256 = U256(cast([ap - 5], U256Struct*));
+    let range_check_ptr = [ap - 4];
+    let bitwise_ptr = cast([ap - 3], BitwiseBuiltin*);
+    let poseidon_ptr = cast([ap - 2], PoseidonBuiltin*);
+    let keccak_ptr = cast([ap - 1], KeccakBuiltin*);
+
+    let is_prev_eq_new = U256__eq__(left_u256, right_u256);
+    if (is_prev_eq_new.value != 0) {
+        return ();
+    }
 
     let (tuple_address_bytes32_buffer) = alloc();
     assert [tuple_address_bytes32_buffer] = address.value;
@@ -582,21 +545,25 @@ func _process_storage_diff{
 
     assert [storage_tries_end] = storage_diff_entry;
     tempvar storage_tries_end = storage_tries_end + StorageDiffEntry.SIZE;
+
     return ();
 }
 
-// / @notice Entry point for computing the difference between two Ethereum tries (state or storage).
-// / @dev Initializes diff lists, calls the recursive `_compute_diff` function, and returns the
-// /      collected account and storage differences.
-// / @param node_store The initial node store containing MPT nodes.
-// / @param address_preimages Mapping from path hash to account address preimages.
-// / @param storage_key_preimages Mapping from storage path hash to storage key preimages.
-// / @param left The root node (or reference) of the previous state trie.
-// / @param right The root node (or reference) of the current state trie.
-// / @return account_diff A list containing differences found in account nodes.
-// / @return storage_diff A list containing differences found in storage nodes across all accounts.
+// @notice Entry point for computing the difference between two Ethereum tries (state or storage).
+// @dev Initializes diff lists, calls the recursive `_compute_diff` function, and returns the
+//      collected account and storage differences.
+// @param node_store The initial node store containing MPT nodes.
+// @param address_preimages Mapping from path hash to account address preimages.
+// @param storage_key_preimages Mapping from storage path hash to storage key preimages.
+// @param left The root node (or reference) of the previous state trie.
+// @param right The root node (or reference) of the current state trie.
+// @return account_diff A list containing differences found in account nodes.
+// @return storage_diff A list containing differences found in storage nodes across all accounts.
 func compute_diff_entrypoint{
-    range_check_ptr, bitwise_ptr: BitwiseBuiltin*, poseidon_ptr: PoseidonBuiltin*
+    range_check_ptr,
+    bitwise_ptr: BitwiseBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
 }(
     node_store: NodeStore,
     address_preimages: MappingBytes32Address,
@@ -605,9 +572,9 @@ func compute_diff_entrypoint{
     right: OptionalUnionInternalNodeExtended,
 ) -> (AccountDiff, StorageDiff) {
     alloc_locals;
-    let (main_trie_end: AddressAccountNodeDiffEntry*) = alloc();
+    let (main_trie_end: AddressAccountDiffEntry*) = alloc();
 
-    local main_trie_start: AddressAccountNodeDiffEntry* = main_trie_end;
+    local main_trie_start: AddressAccountDiffEntry* = main_trie_end;
 
     let (storage_tries_end: StorageDiffEntry*) = alloc();
     let storage_tries_start = storage_tries_end;
@@ -622,7 +589,28 @@ func compute_diff_entrypoint{
         storage_key_preimages=storage_key_preimages,
         main_trie_end=main_trie_end,
         storage_tries_end=storage_tries_end,
-    }(left=left, right=right, path=path, account_address=account_address);
+    }(
+        left=left,
+        right=right,
+        parent_left=OptionalInternalNode(cast(0, InternalNodeEnum*)),
+        parent_right=OptionalInternalNode(cast(0, InternalNodeEnum*)),
+        path=path,
+        account_address=account_address,
+    );
+
+    // Squash the dicts once used
+    dict_squash(
+        cast(node_store.value.dict_ptr_start, DictAccess*),
+        cast(node_store.value.dict_ptr, DictAccess*),
+    );
+    dict_squash(
+        cast(address_preimages.value.dict_ptr_start, DictAccess*),
+        cast(address_preimages.value.dict_ptr, DictAccess*),
+    );
+    dict_squash(
+        cast(storage_key_preimages.value.dict_ptr_start, DictAccess*),
+        cast(storage_key_preimages.value.dict_ptr, DictAccess*),
+    );
 
     tempvar account_diff = AccountDiff(
         new AccountDiffStruct(data=main_trie_start, len=main_trie_end - main_trie_start)
@@ -634,33 +622,38 @@ func compute_diff_entrypoint{
     return (account_diff, storage_diff);
 }
 
-// / @notice Recursively computes the difference between two Ethereum tries (or sub-tries).
-// / @dev Resolves node references (hashes), pattern matches on the types of the left and right
-// /      nodes, and delegates to specialized handler functions (`_left_is_null`,
-// /      `_left_is_leaf_node`, etc.) to process the differences based on the node type
-// /      combinations. Handles the base case where left and right nodes are identical.
-// / @implicit node_store Passed down for node resolution.
-// / @implicit address_preimages Passed down for account processing.
-// / @implicit storage_key_preimages Passed down for storage processing.
-// / @implicit main_trie_end Passed down to record account diffs.
-// / @implicit storage_tries_end Passed down to record storage diffs.
-// / @param left The node (or reference) from the previous state's trie.
-// / @param right The node (or reference) from the current state's trie.
-// / @param path The path (sequence of nibbles) traversed so far in the trie.
-// / @param account_address The account address if processing a storage trie, otherwise 0.
-// / @return Recursively updates diff lists via helper functions.
+// @notice Recursively computes the difference between two Ethereum tries (or sub-tries).
+// @dev Resolves node references (hashes), pattern matches on the types of the left and right
+//      nodes, and delegates to specialized handler functions (`_left_is_null`,
+//      `_left_is_leaf_node`, etc.) to process the differences based on the node type
+//      combinations. Handles the base case where left and right nodes are identical.
+// @implicit node_store Passed down for node resolution.
+// @implicit address_preimages Passed down for account processing.
+// @implicit storage_key_preimages Passed down for storage processing.
+// @implicit main_trie_end Passed down to record account diffs.
+// @implicit storage_tries_end Passed down to record storage diffs.
+// @param left The node (or reference) from the previous state's trie.
+// @param right The node (or reference) from the current state's trie.
+// @param parent_left The parent of the left node. Used to ensure the trie traversed is well-formed.
+// @param parent_right The parent of the right node. Used to ensure the trie traversed is well-formed.
+// @param path The path (sequence of nibbles) traversed so far in the trie.
+// @param account_address The account address if processing a storage trie, otherwise 0.
+// @return Recursively updates diff lists via helper functions.
 func _compute_diff{
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
     node_store: NodeStore,
     address_preimages: MappingBytes32Address,
     storage_key_preimages: MappingBytes32Bytes32,
-    main_trie_end: AddressAccountNodeDiffEntry*,
+    main_trie_end: AddressAccountDiffEntry*,
     storage_tries_end: StorageDiffEntry*,
 }(
     left: OptionalUnionInternalNodeExtended,
     right: OptionalUnionInternalNodeExtended,
+    parent_left: OptionalInternalNode,
+    parent_right: OptionalInternalNode,
     path: Bytes,
     account_address: OptionalAddress,
 ) -> () {
@@ -678,25 +671,37 @@ func _compute_diff{
 
     // Case 1: left is null
     if (cast(l_resolved.value, felt) == 0) {
-        return _left_is_null(left, r_resolved, path, account_address);
+        return _left_is_null(left, r_resolved, parent_left, parent_right, path, account_address);
     }
 
     // Case 2: left is a leaf node
     if (cast(l_resolved.value.leaf_node.value, felt) != 0) {
-        return _left_is_leaf_node(l_resolved.value.leaf_node, r_resolved, path, account_address);
+        return _left_is_leaf_node(
+            l_resolved.value.leaf_node, r_resolved, parent_left, parent_right, path, account_address
+        );
     }
 
     // Case 3: left is an extension node
     if (cast(l_resolved.value.extension_node.value, felt) != 0) {
         return _left_is_extension_node(
-            l_resolved.value.extension_node, r_resolved, path, account_address
+            l_resolved.value.extension_node,
+            r_resolved,
+            parent_left,
+            parent_right,
+            path,
+            account_address,
         );
     }
 
     // Case 4: left is a branch node
     if (cast(l_resolved.value.branch_node.value, felt) != 0) {
         return _left_is_branch_node(
-            l_resolved.value.branch_node, r_resolved, path, account_address
+            l_resolved.value.branch_node,
+            r_resolved,
+            parent_left,
+            parent_right,
+            path,
+            account_address,
         );
     }
 
@@ -705,32 +710,37 @@ func _compute_diff{
     }
 }
 
-// / @notice Handles the diff computation case where the left node is null.
-// / @dev Compares a null left node with the resolved right node (Leaf, Extension, Branch, or Null).
-// /      If right is Leaf, logs a new leaf creation. If right is Extension or Branch,
-// /      recursively calls `_compute_diff` on the right sub-tree with a null left node.
-// / @implicit node_store Passed down.
-// / @implicit address_preimages Passed down.
-// / @implicit storage_key_preimages Passed down.
-// / @implicit main_trie_end Passed down.
-// / @implicit storage_tries_end Passed down.
-// / @param left The null node from the previous state (represented as OptionalUnionInternalNodeExtended).
-// / @param right The resolved node from the current state (OptionalInternalNode).
-// / @param path The path traversed so far.
-// / @param account_address The current account address (0 for state trie).
-// / @return Updates diff lists based on the type of the right node.
+// @notice Handles the diff computation case where the left node is null.
+// @dev Compares a null left node with the resolved right node (Leaf, Extension, Branch, or Null).
+//      If right is Leaf, logs a new leaf creation. If right is Extension or Branch,
+//      recursively calls `_compute_diff` on the right sub-tree with a null left node.
+// @implicit node_store Passed down.
+// @implicit address_preimages Passed down.
+// @implicit storage_key_preimages Passed down.
+// @implicit main_trie_end Passed down.
+// @implicit storage_tries_end Passed down.
+// @param left The null node from the previous state (represented as OptionalUnionInternalNodeExtended).
+// @param right The resolved node from the current state (OptionalInternalNode).
+// @param parent_left The parent of the left node.
+// @param parent_right The parent of the right node.
+// @param path The path traversed so far.
+// @param account_address The current account address (0 for state trie).
+// @return Updates diff lists based on the type of the right node.
 func _left_is_null{
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
     node_store: NodeStore,
     address_preimages: MappingBytes32Address,
     storage_key_preimages: MappingBytes32Bytes32,
-    main_trie_end: AddressAccountNodeDiffEntry*,
+    main_trie_end: AddressAccountDiffEntry*,
     storage_tries_end: StorageDiffEntry*,
 }(
     left: OptionalUnionInternalNodeExtended,
     right: OptionalInternalNode,
+    parent_left: OptionalInternalNode,
+    parent_right: OptionalInternalNode,
     path: Bytes,
     account_address: OptionalAddress,
 ) -> () {
@@ -744,6 +754,7 @@ func _left_is_null{
     // (None, LeafNode()) -> new leaf
     if (cast(right.value.leaf_node.value, felt) != 0) {
         let r_leaf = right.value.leaf_node;
+        check_leaf_node(path, r_leaf);
         let full_path_nibbles = Bytes__add__(path, r_leaf.value.rest_of_key);
         let full_path = nibble_list_to_bytes(full_path_nibbles);
         let full_path_b32 = Bytes_to_Bytes32(full_path);
@@ -771,12 +782,18 @@ func _left_is_null{
     // (None, ExtensionNode()) -> look for diffs in the right sub-tree
     if (cast(right.value.extension_node.value, felt) != 0) {
         let r_extension = right.value.extension_node;
+        check_extension_node(r_extension, parent_right);
         let updated_path = Bytes__add__(path, r_extension.value.key_segment);
         let subnode = OptionalUnionInternalNodeExtendedImpl.from_extended(
             r_extension.value.subnode
         );
         return _compute_diff(
-            left=left, right=subnode, path=updated_path, account_address=account_address
+            left=left,
+            right=subnode,
+            parent_left=OptionalInternalNode(cast(0, InternalNodeEnum*)),
+            parent_right=right,
+            path=updated_path,
+            account_address=account_address,
         );
     }
 
@@ -796,32 +813,43 @@ func _left_is_null{
     return ();
 }
 
-// / @notice Handles the diff computation case where the left node is a LeafNode.
-// / @dev Compares the left LeafNode with the resolved right node (Null, Leaf, Extension, or Branch).
-// /      Handles leaf deletion, update, path change, and replacement by Extension/Branch nodes.
-// / @implicit node_store Passed down.
-// / @implicit address_preimages Passed down.
-// / @implicit storage_key_preimages Passed down.
-// / @implicit main_trie_end Passed down.
-// / @implicit storage_tries_end Passed down.
-// / @param l_leaf The LeafNode from the previous state.
-// / @param right The resolved node from the current state (OptionalInternalNode).
-// / @param path The path traversed so far.
-// / @param account_address The current account address (0 for state trie).
-// / @return Updates diff lists based on the comparison results.
+// @notice Handles the diff computation case where the left node is a LeafNode.
+// @dev Compares the left LeafNode with the resolved right node (Null, Leaf, Extension, or Branch).
+//      Handles leaf deletion, update, path change, and replacement by Extension/Branch nodes.
+// @implicit node_store Passed down.
+// @implicit address_preimages Passed down.
+// @implicit storage_key_preimages Passed down.
+// @implicit main_trie_end Passed down.
+// @implicit storage_tries_end Passed down.
+// @param l_leaf The LeafNode from the previous state.
+// @param right The resolved node from the current state (OptionalInternalNode).
+// @param parent_left The parent of the left node.
+// @param parent_right The parent of the right node.
+// @param path The path traversed so far.
+// @param account_address The current account address (0 for state trie).
+// @return Updates diff lists based on the comparison results.
 func _left_is_leaf_node{
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
     node_store: NodeStore,
     address_preimages: MappingBytes32Address,
     storage_key_preimages: MappingBytes32Bytes32,
-    main_trie_end: AddressAccountNodeDiffEntry*,
+    main_trie_end: AddressAccountDiffEntry*,
     storage_tries_end: StorageDiffEntry*,
-}(l_leaf: LeafNode, right: OptionalInternalNode, path: Bytes, account_address: OptionalAddress) -> (
-    ) {
+}(
+    l_leaf: LeafNode,
+    right: OptionalInternalNode,
+    parent_left: OptionalInternalNode,
+    parent_right: OptionalInternalNode,
+    path: Bytes,
+    account_address: OptionalAddress,
+) -> () {
     alloc_locals;
     // Pattern matching on the types of right.
+
+    check_leaf_node(path, l_leaf);
 
     // (LeafNode(), None) -> deleted leaf
     if (cast(right.value, felt) == 0) {
@@ -850,6 +878,7 @@ func _left_is_leaf_node{
     // (LeafNode(), LeafNode()) -> diffs in the leaf node
     if (cast(right.value.leaf_node.value, felt) != 0) {
         let r_leaf = right.value.leaf_node;
+        check_leaf_node(path, r_leaf);
         let is_rest_equal = Bytes__eq__(l_leaf.value.rest_of_key, r_leaf.value.rest_of_key);
 
         // Same path
@@ -925,6 +954,7 @@ func _left_is_leaf_node{
     // comparing it to the old leaf with the same key
     if (cast(right.value.extension_node.value, felt) != 0) {
         let r_extension = right.value.extension_node;
+        check_extension_node(r_extension, parent_right);
         let r_prefix_l = Bytes__startswith__(
             l_leaf.value.rest_of_key, r_extension.value.key_segment
         );
@@ -951,6 +981,8 @@ func _left_is_leaf_node{
             return _compute_diff(
                 left=l_leaf_typed,
                 right=r_subnode,
+                parent_left=parent_left,
+                parent_right=right,
                 path=updated_path,
                 account_address=account_address,
             );
@@ -970,6 +1002,8 @@ func _left_is_leaf_node{
         _compute_diff(
             left=null_node,
             right=r_subnode,
+            parent_left=OptionalInternalNode(cast(0, InternalNodeEnum*)),
+            parent_right=right,
             path=updated_path_right,
             account_address=account_address,
         );
@@ -1019,33 +1053,49 @@ func _left_is_leaf_node{
     }
 }
 
-// / @notice Handles the diff computation case where the left node is an ExtensionNode.
-// / @dev Compares the left ExtensionNode with the resolved right node (Null, Leaf, Extension, Branch).
-// /      Handles extension deletion, replacement by Leaf, modifications (key changes, subnode changes),
-// /      and replacement by Branch nodes. Considers prefix relationships between keys.
-// / @implicit node_store Passed down.
-// / @implicit address_preimages Passed down.
-// / @implicit storage_key_preimages Passed down.
-// / @implicit main_trie_end Passed down.
-// / @implicit storage_tries_end Passed down.
-// / @param left The ExtensionNode from the previous state.
-// / @param right The resolved node from the current state (OptionalInternalNode).
-// / @param path The path traversed so far.
-// / @param account_address The current account address (0 for state trie).
-// / @return Updates diff lists based on the comparison results.
+// @notice Handles the diff computation case where the left node is an ExtensionNode.
+// @dev Compares the left ExtensionNode with the resolved right node (Null, Leaf, Extension, Branch).
+//      Handles extension deletion, replacement by Leaf, modifications (key changes, subnode changes),
+//      and replacement by Branch nodes. Considers prefix relationships between keys.
+// @implicit node_store Passed down.
+// @implicit address_preimages Passed down.
+// @implicit storage_key_preimages Passed down.
+// @implicit main_trie_end Passed down.
+// @implicit storage_tries_end Passed down.
+// @param left The ExtensionNode from the previous state.
+// @param right The resolved node from the current state (OptionalInternalNode).
+// @param parent_left The parent of the left node.
+// @param parent_right The parent of the right node.
+// @param path The path traversed so far.
+// @param account_address The current account address (0 for state trie).
+// @return Updates diff lists based on the comparison results.
 func _left_is_extension_node{
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
     node_store: NodeStore,
     address_preimages: MappingBytes32Address,
     storage_key_preimages: MappingBytes32Bytes32,
-    main_trie_end: AddressAccountNodeDiffEntry*,
+    main_trie_end: AddressAccountDiffEntry*,
     storage_tries_end: StorageDiffEntry*,
 }(
-    left: ExtensionNode, right: OptionalInternalNode, path: Bytes, account_address: OptionalAddress
+    left: ExtensionNode,
+    right: OptionalInternalNode,
+    parent_left: OptionalInternalNode,
+    parent_right: OptionalInternalNode,
+    path: Bytes,
+    account_address: OptionalAddress,
 ) -> () {
     alloc_locals;
+    check_extension_node(left, parent_left);
+    tempvar left_as_optional = OptionalInternalNode(
+        new InternalNodeEnum(
+            leaf_node=LeafNode(cast(0, LeafNodeStruct*)),
+            extension_node=left,
+            branch_node=BranchNode(cast(0, BranchNodeStruct*)),
+        ),
+    );
 
     // (ExtensionNode(), None) -> deleted extension node
     if (cast(right.value, felt) == 0) {
@@ -1056,8 +1106,14 @@ func _left_is_extension_node{
         let right_null = OptionalUnionInternalNodeExtended(
             cast(0, OptionalUnionInternalNodeExtendedEnum*)
         );
+
         return _compute_diff(
-            left=l_subnode, right=right_null, path=updated_path, account_address=account_address
+            left=l_subnode,
+            right=right_null,
+            parent_left=left_as_optional,
+            parent_right=OptionalInternalNode(cast(0, InternalNodeEnum*)),
+            path=updated_path,
+            account_address=account_address,
         );
     }
 
@@ -1067,6 +1123,7 @@ func _left_is_extension_node{
     if (cast(right.value.leaf_node.value, felt) != 0) {
         // Remove the left node's key segment from the right leaf node
         let r_leaf = right.value.leaf_node;
+        check_leaf_node(path, r_leaf);
         let l_prefix_r = Bytes__startswith__(r_leaf.value.rest_of_key, left.value.key_segment);
         if (l_prefix_r.value != 0) {
             let updated_path = Bytes__add__(path, left.value.key_segment);
@@ -1090,6 +1147,8 @@ func _left_is_extension_node{
             return _compute_diff(
                 left=l_subnode,
                 right=r_leaf_typed,
+                parent_left=left_as_optional,
+                parent_right=parent_right,
                 path=updated_path,
                 account_address=account_address,
             );
@@ -1106,7 +1165,12 @@ func _left_is_extension_node{
         let updated_path_left = Bytes__add__(path, left.value.key_segment);
         let l_subnode = OptionalUnionInternalNodeExtendedImpl.from_extended(left.value.subnode);
         _compute_diff(
-            left=l_subnode, right=null_node, path=updated_path_left, account_address=account_address
+            left=l_subnode,
+            right=null_node,
+            parent_left=left_as_optional,
+            parent_right=OptionalInternalNode(cast(0, InternalNodeEnum*)),
+            path=updated_path_left,
+            account_address=account_address,
         );
 
         // Compute deletions in the left sub-tree
@@ -1136,6 +1200,7 @@ func _left_is_extension_node{
     // (ExtensionNode(), ExtensionNode()) ->
     if (cast(right.value.extension_node.value, felt) != 0) {
         let r_extension = right.value.extension_node;
+        check_extension_node(r_extension, parent_right);
         let keys_equal = Bytes__eq__(left.value.key_segment, r_extension.value.key_segment);
         if (keys_equal.value != 0) {
             // equal keys -> look for diffs in children
@@ -1145,7 +1210,12 @@ func _left_is_extension_node{
             );
             let updated_path = Bytes__add__(path, left.value.key_segment);
             return _compute_diff(
-                left=l_subnode, right=r_subnode, path=updated_path, account_address=account_address
+                left=l_subnode,
+                right=r_subnode,
+                parent_left=left_as_optional,
+                parent_right=right,
+                path=updated_path,
+                account_address=account_address,
             );
         }
 
@@ -1180,6 +1250,8 @@ func _left_is_extension_node{
             return _compute_diff(
                 left=l_shortened,
                 right=r_subnode,
+                parent_left=parent_left,
+                parent_right=right,
                 path=updated_path,
                 account_address=account_address,
             );
@@ -1214,6 +1286,8 @@ func _left_is_extension_node{
             return _compute_diff(
                 left=l_subnode,
                 right=r_shortened,
+                parent_left=left_as_optional,
+                parent_right=parent_right,
                 path=updated_path,
                 account_address=account_address,
             );
@@ -1231,6 +1305,8 @@ func _left_is_extension_node{
         _compute_diff(
             left=l_subnode_typed,
             right=null_node,
+            parent_left=left_as_optional,
+            parent_right=OptionalInternalNode(cast(0, InternalNodeEnum*)),
             path=updated_path_left,
             account_address=account_address,
         );
@@ -1242,6 +1318,8 @@ func _left_is_extension_node{
         _compute_diff(
             left=null_node,
             right=r_subnode_typed,
+            parent_left=OptionalInternalNode(cast(0, InternalNodeEnum*)),
+            parent_right=right,
             path=updated_path_right,
             account_address=account_address,
         );
@@ -1250,10 +1328,11 @@ func _left_is_extension_node{
 
     // (ExtensionNode(), BranchNode())
     if (cast(right.value.branch_node.value, felt) != 0) {
-        let left_typed = OptionalUnionInternalNodeExtendedImpl.from_extension(left);
         _compute_left_extension_node_diff_on_right_branch_node(
-            left=left_typed,
+            left=left_as_optional,
             subnodes=right.value.branch_node.value.subnodes,
+            parent_left=parent_left,
+            parent_right=right,
             path=path,
             account_address=account_address,
             index=0,
@@ -1266,31 +1345,41 @@ func _left_is_extension_node{
     }
 }
 
-// / @notice Handles the diff computation case where the left node is a BranchNode.
-// / @dev Compares the left BranchNode with the resolved right node (Null, Leaf, Extension, Branch).
-// /      Delegates comparison logic to helper functions based on the right node type.
-// / @implicit node_store Passed down.
-// / @implicit address_preimages Passed down.
-// / @implicit storage_key_preimages Passed down.
-// / @implicit main_trie_end Passed down.
-// / @implicit storage_tries_end Passed down.
-// / @param left The BranchNode from the previous state.
-// / @param right The resolved node from the current state (OptionalInternalNode).
-// / @param path The path traversed so far.
-// / @param account_address The current account address (0 for state trie).
-// / @return Updates diff lists via helper functions.
+// @notice Handles the diff computation case where the left node is a BranchNode.
+// @dev Compares the left BranchNode with the resolved right node (Null, Leaf, Extension, Branch).
+//      Delegates comparison logic to helper functions based on the right node type.
+// @implicit node_store Passed down.
+// @implicit address_preimages Passed down.
+// @implicit storage_key_preimages Passed down.
+// @implicit main_trie_end Passed down.
+// @implicit storage_tries_end Passed down.
+// @param left The BranchNode from the previous state.
+// @param right The resolved node from the current state (OptionalInternalNode).
+// @param parent_left The parent of the left node.
+// @param parent_right The parent of the right node.
+// @param path The path traversed so far.
+// @param account_address The current account address (0 for state trie).
+// @return Updates diff lists via helper functions.
 func _left_is_branch_node{
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
     node_store: NodeStore,
     address_preimages: MappingBytes32Address,
     storage_key_preimages: MappingBytes32Bytes32,
-    main_trie_end: AddressAccountNodeDiffEntry*,
+    main_trie_end: AddressAccountDiffEntry*,
     storage_tries_end: StorageDiffEntry*,
-}(left: BranchNode, right: OptionalInternalNode, path: Bytes, account_address: OptionalAddress) -> (
-    ) {
+}(
+    left: BranchNode,
+    right: OptionalInternalNode,
+    parent_left: OptionalInternalNode,
+    parent_right: OptionalInternalNode,
+    path: Bytes,
+    account_address: OptionalAddress,
+) -> () {
     alloc_locals;
+    check_branch_node(left);
 
     // (BranchNode(), None) -> deleted branch node
     // Look for diffs in all branches of the left sub-tree
@@ -1305,6 +1394,7 @@ func _left_is_branch_node{
     // The remaining branch is compared to the leaf.
     if (cast(right.value.leaf_node.value, felt) != 0) {
         let right_leaf = right.value.leaf_node;
+        check_leaf_node(path, right_leaf);
         return _compute_left_branch_on_right_leaf(
             left=left, right=right_leaf, path=path, account_address=account_address, index=0
         );
@@ -1315,14 +1405,30 @@ func _left_is_branch_node{
     // remaining sub-tree.
     if (cast(right.value.extension_node.value, felt) != 0) {
         let right_extension = right.value.extension_node;
-        return _compute_left_branch_on_right_extension_node(
-            left=left, right=right_extension, path=path, account_address=account_address, index=0
+        check_extension_node(right_extension, parent_right);
+
+        tempvar left_as_optional = OptionalInternalNode(
+            new InternalNodeEnum(
+                leaf_node=LeafNode(cast(0, LeafNodeStruct*)),
+                extension_node=ExtensionNode(cast(0, ExtensionNodeStruct*)),
+                branch_node=left,
+            ),
+        );
+        return _compute_left_branch_node_diff_on_right_extension_node(
+            subnodes=left.value.subnodes,
+            right=right,
+            parent_left=left_as_optional,
+            parent_right=parent_right,
+            path=path,
+            account_address=account_address,
+            index=0,
         );
     }
 
     // (BranchNode(), BranchNode()) -> Look for diffs in all branches of the right sub-tree
     if (cast(right.value.branch_node.value, felt) != 0) {
         let right_branch = right.value.branch_node;
+        check_branch_node(right_branch);
         return _compute_left_branch_on_right_branch_node(
             left=left, right=right_branch, path=path, account_address=account_address, index=0
         );
@@ -1333,28 +1439,29 @@ func _left_is_branch_node{
     }
 }
 
-// / @notice Helper function for `_left_is_branch_node`: computes diff when right node is Null.
-// / @dev Recursively calls `_compute_diff` for each subnode of the left BranchNode, comparing it
-// /      against a null node to register deletions.
-// / @implicit node_store Passed down.
-// / @implicit address_preimages Passed down.
-// / @implicit storage_key_preimages Passed down.
-// / @implicit main_trie_end Passed down.
-// / @implicit storage_tries_end Passed down.
-// / @param left The BranchNode from the previous state.
-// / @param right The Null node from the current state (OptionalInternalNode).
-// / @param path The path up to the branch node.
-// / @param account_address The current account address.
-// / @param index The current subnode index being processed (0-15).
-// / @return Updates diff lists via recursive calls.
+// @notice Helper function for `_left_is_branch_node`: computes diff when right node is Null.
+// @dev Recursively calls `_compute_diff` for each subnode of the left BranchNode, comparing it
+//      against a null node to register deletions.
+// @implicit node_store Passed down.
+// @implicit address_preimages Passed down.
+// @implicit storage_key_preimages Passed down.
+// @implicit main_trie_end Passed down.
+// @implicit storage_tries_end Passed down.
+// @param left The BranchNode from the previous state.
+// @param right The Null node from the current state (OptionalInternalNode).
+// @param path The path up to the branch node.
+// @param account_address The current account address.
+// @param index The current subnode index being processed (0-15).
+// @return Updates diff lists via recursive calls.
 func _compute_left_branch_on_none{
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
     node_store: NodeStore,
     address_preimages: MappingBytes32Address,
     storage_key_preimages: MappingBytes32Bytes32,
-    main_trie_end: AddressAccountNodeDiffEntry*,
+    main_trie_end: AddressAccountDiffEntry*,
     storage_tries_end: StorageDiffEntry*,
 }(
     left: BranchNode,
@@ -1384,35 +1491,51 @@ func _compute_left_branch_on_none{
         new BytesStruct(data=path_copy.value.data, len=path_copy.value.len + 1)
     );
 
-    _compute_diff(left=subnode_i, right=null_node, path=sub_path, account_address=account_address);
+    tempvar left_as_optional = OptionalInternalNode(
+        new InternalNodeEnum(
+            leaf_node=LeafNode(cast(0, LeafNodeStruct*)),
+            extension_node=ExtensionNode(cast(0, ExtensionNodeStruct*)),
+            branch_node=left,
+        ),
+    );
+
+    _compute_diff(
+        left=subnode_i,
+        right=null_node,
+        parent_left=left_as_optional,
+        parent_right=OptionalInternalNode(cast(0, InternalNodeEnum*)),
+        path=sub_path,
+        account_address=account_address,
+    );
     return _compute_left_branch_on_none(
         left=left, right=right, path=path, account_address=account_address, index=index + 1
     );
 }
 
-// / @notice Helper function for `_left_is_branch_node`: computes diff when right node is LeafNode.
-// / @dev Recursively calls `_compute_diff` for each subnode of the left BranchNode. Compares
-// /      against the (potentially shortened) right LeafNode if the index matches the leaf's
-// /      first nibble, otherwise compares against a null node.
-// / @implicit node_store Passed down.
-// / @implicit address_preimages Passed down.
-// / @implicit storage_key_preimages Passed down.
-// / @implicit main_trie_end Passed down.
-// / @implicit storage_tries_end Passed down.
-// / @param left The BranchNode from the previous state.
-// / @param right The LeafNode from the current state.
-// / @param path The path up to the branch node.
-// / @param account_address The current account address.
-// / @param index The current subnode index being processed (0-15).
-// / @return Updates diff lists via recursive calls.
+// @notice Helper function for `_left_is_branch_node`: computes diff when right node is LeafNode.
+// @dev Recursively calls `_compute_diff` for each subnode of the left BranchNode. Compares
+//      against the (potentially shortened) right LeafNode if the index matches the leaf's
+//      first nibble, otherwise compares against a null node.
+// @implicit node_store Passed down.
+// @implicit address_preimages Passed down.
+// @implicit storage_key_preimages Passed down.
+// @implicit main_trie_end Passed down.
+// @implicit storage_tries_end Passed down.
+// @param left The BranchNode from the previous state.
+// @param right The LeafNode from the current state.
+// @param path The path up to the branch node.
+// @param account_address The current account address.
+// @param index The current subnode index being processed (0-15).
+// @return Updates diff lists via recursive calls.
 func _compute_left_branch_on_right_leaf{
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
     node_store: NodeStore,
     address_preimages: MappingBytes32Address,
     storage_key_preimages: MappingBytes32Bytes32,
-    main_trie_end: AddressAccountNodeDiffEntry*,
+    main_trie_end: AddressAccountDiffEntry*,
     storage_tries_end: StorageDiffEntry*,
 }(
     left: BranchNode, right: LeafNode, path: Bytes, account_address: OptionalAddress, index: felt
@@ -1422,6 +1545,14 @@ func _compute_left_branch_on_right_leaf{
     if (index == 16) {
         return ();
     }
+
+    tempvar left_as_optional = OptionalInternalNode(
+        new InternalNodeEnum(
+            leaf_node=LeafNode(cast(0, LeafNodeStruct*)),
+            extension_node=ExtensionNode(cast(0, ExtensionNodeStruct*)),
+            branch_node=left,
+        ),
+    );
 
     let subnodes_ptr = cast(left.value.subnodes.value, felt*);
     let subnode_i_extended = Extended(cast(subnodes_ptr[index], ExtendedEnum*));
@@ -1450,7 +1581,12 @@ func _compute_left_branch_on_right_leaf{
         );
         let right_shortened = OptionalUnionInternalNodeExtendedImpl.from_leaf(right_leaf_shortened);
         _compute_diff(
-            left=subnode_i, right=right_shortened, path=sub_path, account_address=account_address
+            left=subnode_i,
+            right=right_shortened,
+            parent_left=left_as_optional,
+            parent_right=OptionalInternalNode(cast(0, InternalNodeEnum*)),
+            path=sub_path,
+            account_address=account_address,
         );
         return _compute_left_branch_on_right_leaf(
             left=left, right=right, path=path, account_address=account_address, index=index + 1
@@ -1460,53 +1596,67 @@ func _compute_left_branch_on_right_leaf{
     tempvar null_node = OptionalUnionInternalNodeExtended(
         cast(0, OptionalUnionInternalNodeExtendedEnum*)
     );
-    _compute_diff(left=subnode_i, right=null_node, path=sub_path, account_address=account_address);
-
+    _compute_diff(
+        left=subnode_i,
+        right=null_node,
+        parent_left=left_as_optional,
+        parent_right=OptionalInternalNode(cast(0, InternalNodeEnum*)),
+        path=sub_path,
+        account_address=account_address,
+    );
     return _compute_left_branch_on_right_leaf(
         left=left, right=right, path=path, account_address=account_address, index=index + 1
     );
 }
 
-// / @notice Helper function for `_left_is_branch_node`: computes diff when right node is ExtensionNode.
-// / @dev Recursively calls `_compute_diff` for each subnode of the left BranchNode. Compares
-// /      against the (potentially shortened) right ExtensionNode if the index matches the
-// /      extension's first nibble, otherwise compares against a null node.
-// / @implicit node_store Passed down.
-// / @implicit address_preimages Passed down.
-// / @implicit storage_key_preimages Passed down.
-// / @implicit main_trie_end Passed down.
-// / @implicit storage_tries_end Passed down.
-// / @param left The BranchNode from the previous state.
-// / @param right The ExtensionNode from the current state.
-// / @param path The path up to the branch node.
-// / @param account_address The current account address.
-// / @param index The current subnode index being processed (0-15).
-// / @return Updates diff lists via recursive calls.
-func _compute_left_branch_on_right_extension_node{
+// @notice Processes differences when the left node is a BranchNode and the right node is an ExtensionNode.
+// @dev Recursively processes each subnode (index 0-15) of the left branch.
+//      Compares the left subnode against the (potentially shortened or resolved) right ExtensionNode
+//      if the index matches the extension's first nibble, otherwise compares against null.
+// @implicit node_store Passed down.
+// @implicit address_preimages Passed down.
+// @implicit storage_key_preimages Passed down.
+// @implicit main_trie_end Passed down.
+// @implicit storage_tries_end Passed down.
+// @param subnodes The subnodes structure of the right BranchNode.
+// @param right The Optional Extension Node from the previous state.
+// @param parent_left The parent of the left node.
+// @param parent_right The parent of the right node.
+// @param path The path traversed so far.
+// @param account_address The current account address.
+// @param index The current branch index being processed (0-15).
+// @return Updates diff lists via recursive calls to `_compute_diff`.
+// TODO: left should not be optional
+func _compute_left_branch_node_diff_on_right_extension_node{
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
     node_store: NodeStore,
     address_preimages: MappingBytes32Address,
     storage_key_preimages: MappingBytes32Bytes32,
-    main_trie_end: AddressAccountNodeDiffEntry*,
+    main_trie_end: AddressAccountDiffEntry*,
     storage_tries_end: StorageDiffEntry*,
 }(
-    left: BranchNode,
-    right: ExtensionNode,
+    subnodes: Subnodes,
+    right: OptionalInternalNode,
+    parent_left: OptionalInternalNode,
+    parent_right: OptionalInternalNode,
     path: Bytes,
     account_address: OptionalAddress,
     index: felt,
 ) -> () {
     alloc_locals;
-
     if (index == 16) {
         return ();
     }
 
-    let subnodes_ptr = cast(left.value.subnodes.value, felt*);
+    // Use `branch_0` as the base pointer to the list of subnodes and index it as a felt*.
+    let subnodes_ptr = cast(subnodes.value, felt*);
     let subnode_i_extended = Extended(cast(subnodes_ptr[index], ExtendedEnum*));
     let subnode_i = OptionalUnionInternalNodeExtendedImpl.from_extended(subnode_i_extended);
+
+    // TODO: optimization possible here
 
     // path = path + bytes([i])
     let path_copy = Bytes__copy__(path);
@@ -1515,61 +1665,93 @@ func _compute_left_branch_on_right_extension_node{
         new BytesStruct(data=path_copy.value.data, len=path_copy.value.len + 1)
     );
 
-    let first_nib = right.value.key_segment.value.data[0];
+    // Two cases:
+    // 1. The first nibble of the subnode matches the branch node's key segment, in which
+    // case we compare to the subnode
+    // 2. It doesn't in which case we compare to null.
+
+    let right_extension = right.value.extension_node;
+    let first_nib = right_extension.value.key_segment.value.data[0];
+    local node_to_compare: OptionalUnionInternalNodeExtended;
+    local current_parent_right: OptionalInternalNode;
     if (first_nib == index) {
-        // Compare to the shortened extension node
-        // the length of the key segment is always _at least_ one in an extension
-        tempvar extension = ExtensionNode(
-            new ExtensionNodeStruct(
-                key_segment=Bytes(
-                    new BytesStruct(
-                        data=right.value.key_segment.value.data + 1,
-                        len=right.value.key_segment.value.len - 1,
+        // Fully consumed by this nibble: compare to the subnode
+        if (right_extension.value.key_segment.value.len == 1) {
+            let node_to_compare_ = OptionalUnionInternalNodeExtendedImpl.from_extended(
+                right_extension.value.subnode
+            );
+            assert current_parent_right = right;
+            assert node_to_compare = node_to_compare_;
+        } else {
+            // Compare to the shortened extension node
+            tempvar shortened_extension = ExtensionNode(
+                new ExtensionNodeStruct(
+                    key_segment=Bytes(
+                        new BytesStruct(
+                            data=right_extension.value.key_segment.value.data + 1,
+                            len=right_extension.value.key_segment.value.len - 1,
+                        ),
                     ),
+                    subnode=right_extension.value.subnode,
                 ),
-                subnode=right.value.subnode,
-            ),
-        );
-        let right_shortened = OptionalUnionInternalNodeExtendedImpl.from_extension(extension);
-        _compute_diff(
-            left=subnode_i, right=right_shortened, path=sub_path, account_address=account_address
-        );
-        return _compute_left_branch_on_right_extension_node(
-            left=left, right=right, path=path, account_address=account_address, index=index + 1
+            );
+            let node_to_compare_ = OptionalUnionInternalNodeExtendedImpl.from_extension(
+                shortened_extension
+            );
+            assert current_parent_right = parent_right;
+            assert node_to_compare = node_to_compare_;
+        }
+    } else {
+        // Compare to None
+        assert current_parent_right = parent_right;
+        assert node_to_compare = OptionalUnionInternalNodeExtended(
+            cast(0, OptionalUnionInternalNodeExtendedEnum*)
         );
     }
-    // Compare to None
-    let null_node = OptionalUnionInternalNodeExtended(
-        cast(0, OptionalUnionInternalNodeExtendedEnum*)
+
+    _compute_diff(
+        left=subnode_i,
+        right=node_to_compare,
+        parent_left=parent_left,
+        parent_right=current_parent_right,
+        path=sub_path,
+        account_address=account_address,
     );
-    _compute_diff(left=subnode_i, right=null_node, path=sub_path, account_address=account_address);
-    return _compute_left_branch_on_right_extension_node(
-        left=left, right=right, path=path, account_address=account_address, index=index + 1
+
+    return _compute_left_branch_node_diff_on_right_extension_node(
+        subnodes=subnodes,
+        right=right,
+        parent_left=parent_left,
+        parent_right=parent_right,
+        path=path,
+        account_address=account_address,
+        index=index + 1,
     );
 }
 
-// / @notice Helper function for `_left_is_branch_node`: computes diff when right node is BranchNode.
-// / @dev Recursively calls `_compute_diff` comparing the corresponding subnodes (at the same index)
-// /      of the left and right BranchNodes.
-// / @implicit node_store Passed down.
-// / @implicit address_preimages Passed down.
-// / @implicit storage_key_preimages Passed down.
-// / @implicit main_trie_end Passed down.
-// / @implicit storage_tries_end Passed down.
-// / @param left The BranchNode from the previous state.
-// / @param right The BranchNode from the current state.
-// / @param path The path up to the branch nodes.
-// / @param account_address The current account address.
-// / @param index The current subnode index being processed (0-15).
-// / @return Updates diff lists via recursive calls.
+// @notice Helper function for `_left_is_branch_node`: computes diff when right node is BranchNode.
+// @dev Recursively calls `_compute_diff` comparing the corresponding subnodes (at the same index)
+//      of the left and right BranchNodes.
+// @implicit node_store Passed down.
+// @implicit address_preimages Passed down.
+// @implicit storage_key_preimages Passed down.
+// @implicit main_trie_end Passed down.
+// @implicit storage_tries_end Passed down.
+// @param left The BranchNode from the previous state.
+// @param right The BranchNode from the current state.
+// @param path The path up to the branch nodes.
+// @param account_address The current account address.
+// @param index The current subnode index being processed (0-15).
+// @return Updates diff lists via recursive calls.
 func _compute_left_branch_on_right_branch_node{
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
     node_store: NodeStore,
     address_preimages: MappingBytes32Address,
     storage_key_preimages: MappingBytes32Bytes32,
-    main_trie_end: AddressAccountNodeDiffEntry*,
+    main_trie_end: AddressAccountDiffEntry*,
     storage_tries_end: StorageDiffEntry*,
 }(
     left: BranchNode, right: BranchNode, path: Bytes, account_address: OptionalAddress, index: felt
@@ -1595,8 +1777,28 @@ func _compute_left_branch_on_right_branch_node{
         new BytesStruct(data=path_copy.value.data, len=path_copy.value.len + 1)
     );
 
+    tempvar left_as_optional = OptionalInternalNode(
+        new InternalNodeEnum(
+            leaf_node=LeafNode(cast(0, LeafNodeStruct*)),
+            extension_node=ExtensionNode(cast(0, ExtensionNodeStruct*)),
+            branch_node=left,
+        ),
+    );
+    tempvar right_as_optional = OptionalInternalNode(
+        new InternalNodeEnum(
+            leaf_node=LeafNode(cast(0, LeafNodeStruct*)),
+            extension_node=ExtensionNode(cast(0, ExtensionNodeStruct*)),
+            branch_node=right,
+        ),
+    );
+
     _compute_diff(
-        left=subnode_left, right=subnode_right, path=sub_path, account_address=account_address
+        left=subnode_left,
+        right=subnode_right,
+        parent_left=left_as_optional,
+        parent_right=right_as_optional,
+        path=sub_path,
+        account_address=account_address,
     );
 
     return _compute_left_branch_on_right_branch_node(
@@ -1604,30 +1806,31 @@ func _compute_left_branch_on_right_branch_node{
     );
 }
 
-// / @notice Processes differences when the left node is a Leaf/Null and the right node is a Branch.
-// / @dev Recursively processes each subnode (index 0-15) of the right branch.
-// /      If the left node is a Leaf, compares the right subnode against the (potentially shortened)
-// /      left leaf if the index matches the leaf's first nibble, otherwise compares against null.
-// /      If the left node is Null, compares the right subnode against null.
-// / @implicit node_store Passed down.
-// / @implicit address_preimages Passed down.
-// / @implicit storage_key_preimages Passed down.
-// / @implicit main_trie_end Passed down.
-// / @implicit storage_tries_end Passed down.
-// / @param left The Optional Leaf Node (or Null) from the previous state.
-// / @param subnodes The subnodes structure of the right BranchNode.
-// / @param path The path traversed so far.
-// / @param account_address The current account address.
-// / @param index The current branch index being processed (0-15).
-// / @return Updates diff lists via recursive calls to `_compute_diff`.
+// @notice Processes differences when the left node is a Leaf/Null and the right node is a Branch.
+// @dev Recursively processes each subnode (index 0-15) of the right branch.
+//      If the left node is a Leaf, compares the right subnode against the (potentially shortened)
+//      left leaf if the index matches the leaf's first nibble, otherwise compares against null.
+//      If the left node is Null, compares the right subnode against null.
+// @implicit node_store Passed down.
+// @implicit address_preimages Passed down.
+// @implicit storage_key_preimages Passed down.
+// @implicit main_trie_end Passed down.
+// @implicit storage_tries_end Passed down.
+// @param left The Optional Leaf Node (or Null) from the previous state.
+// @param subnodes The subnodes structure of the right BranchNode.
+// @param path The path traversed so far.
+// @param account_address The current account address.
+// @param index The current branch index being processed (0-15).
+// @return Updates diff lists via recursive calls to `_compute_diff`.
 func _compute_left_leaf_diff_on_right_branch_node{
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
     node_store: NodeStore,
     address_preimages: MappingBytes32Address,
     storage_key_preimages: MappingBytes32Bytes32,
-    main_trie_end: AddressAccountNodeDiffEntry*,
+    main_trie_end: AddressAccountDiffEntry*,
     storage_tries_end: StorageDiffEntry*,
 }(
     left: OptionalUnionInternalNodeExtended,
@@ -1698,6 +1901,8 @@ func _compute_left_leaf_diff_on_right_branch_node{
     _compute_diff(
         left=left_to_compare_in_iter,
         right=subnode_i,
+        parent_left=OptionalInternalNode(cast(0, InternalNodeEnum*)),
+        parent_right=OptionalInternalNode(cast(0, InternalNodeEnum*)),
         path=sub_path,
         account_address=account_address,
     );
@@ -1707,34 +1912,39 @@ func _compute_left_leaf_diff_on_right_branch_node{
     );
 }
 
-// / @notice Processes differences when the left node is an ExtensionNode and the right node is a Branch.
-// / @dev Recursively processes each subnode (index 0-15) of the right branch.
-// /      Compares the right subnode against the (potentially shortened or resolved) left ExtensionNode
-// /      if the index matches the extension's first nibble, otherwise compares against null.
-// / @implicit node_store Passed down.
-// / @implicit address_preimages Passed down.
-// / @implicit storage_key_preimages Passed down.
-// / @implicit main_trie_end Passed down.
-// / @implicit storage_tries_end Passed down.
-// / @param left The Optional Extension Node from the previous state.
-// / @param subnodes The subnodes structure of the right BranchNode.
-// / @param path The path traversed so far.
-// / @param account_address The current account address.
-// / @param index The current branch index being processed (0-15).
-// / @return Updates diff lists via recursive calls to `_compute_diff`.
+// @notice Processes differences when the left node is an ExtensionNode and the right node is a Branch.
+// @dev Recursively processes each subnode (index 0-15) of the right branch.
+//      Compares the right subnode against the (potentially shortened or resolved) left ExtensionNode
+//      if the index matches the extension's first nibble, otherwise compares against null.
+// @implicit node_store Passed down.
+// @implicit address_preimages Passed down.
+// @implicit storage_key_preimages Passed down.
+// @implicit main_trie_end Passed down.
+// @implicit storage_tries_end Passed down.
+// @param left The Optional Extension Node from the previous state.
+// @param subnodes The subnodes structure of the right BranchNode.
+// @param parent_left The parent of the left node.
+// @param parent_right The parent of the right node.
+// @param path The path traversed so far.
+// @param account_address The current account address.
+// @param index The current branch index being processed (0-15).
+// @return Updates diff lists via recursive calls to `_compute_diff`.
 // TODO: left should not be optional
 func _compute_left_extension_node_diff_on_right_branch_node{
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
     node_store: NodeStore,
     address_preimages: MappingBytes32Address,
     storage_key_preimages: MappingBytes32Bytes32,
-    main_trie_end: AddressAccountNodeDiffEntry*,
+    main_trie_end: AddressAccountDiffEntry*,
     storage_tries_end: StorageDiffEntry*,
 }(
-    left: OptionalUnionInternalNodeExtended,
+    left: OptionalInternalNode,
     subnodes: Subnodes,
+    parent_left: OptionalInternalNode,
+    parent_right: OptionalInternalNode,
     path: Bytes,
     account_address: OptionalAddress,
     index: felt,
@@ -1763,15 +1973,18 @@ func _compute_left_extension_node_diff_on_right_branch_node{
     // case we compare to the subnode
     // 2. It doesn't in which case we compare to null.
 
-    let l_extension = left.value.extension;
+    let l_extension = left.value.extension_node;
     let first_nib = l_extension.value.key_segment.value.data[0];
+    local node_to_compare: OptionalUnionInternalNodeExtended;
+    local current_parent_left: OptionalInternalNode;
     if (first_nib == index) {
         // Fully consumed by this nibble: compare to the subnode
         if (l_extension.value.key_segment.value.len == 1) {
             let node_to_compare_ = OptionalUnionInternalNodeExtendedImpl.from_extended(
                 l_extension.value.subnode
             );
-            tempvar node_to_compare = node_to_compare_;
+            assert current_parent_left = left;
+            assert node_to_compare = node_to_compare_;
         } else {
             // Compare to the shortened extension node
             tempvar shortened_extension = ExtensionNode(
@@ -1788,44 +2001,51 @@ func _compute_left_extension_node_diff_on_right_branch_node{
             let node_to_compare_ = OptionalUnionInternalNodeExtendedImpl.from_extension(
                 shortened_extension
             );
-            tempvar node_to_compare = node_to_compare_;
+            assert current_parent_left = parent_left;
+            assert node_to_compare = node_to_compare_;
         }
-        let left_ = OptionalUnionInternalNodeExtended(
-            cast([ap - 1], OptionalUnionInternalNodeExtendedEnum*)
-        );
-        tempvar left_to_compare_in_iter = left_;
     } else {
         // Compare to None
-        tempvar left_to_compare_in_iter = OptionalUnionInternalNodeExtended(
+        assert current_parent_left = parent_left;
+        assert node_to_compare = OptionalUnionInternalNodeExtended(
             cast(0, OptionalUnionInternalNodeExtendedEnum*)
         );
     }
-    let left_to_compare_in_iter = OptionalUnionInternalNodeExtended(
-        cast([ap - 1], OptionalUnionInternalNodeExtendedEnum*)
-    );
 
     _compute_diff(
-        left=left_to_compare_in_iter,
+        left=node_to_compare,
         right=subnode_i,
+        parent_left=current_parent_left,
+        parent_right=parent_right,
         path=sub_path,
         account_address=account_address,
     );
 
     return _compute_left_extension_node_diff_on_right_branch_node(
-        left=left, subnodes=subnodes, path=path, account_address=account_address, index=index + 1
+        left=left,
+        subnodes=subnodes,
+        parent_left=parent_left,
+        parent_right=parent_right,
+        path=path,
+        account_address=account_address,
+        index=index + 1,
     );
 }
 
-// / @notice Retrieves a node from the node store dictionary by its hash.
-// / @dev Uses the poseidon hash components (low, high) as the key to look up the node pointer
-// /      in the `node_store` dictionary. Handles the special case for the empty trie hash.
-// / @implicit poseidon_ptr Used for hashing if needed by `hashdict_read`.
-// / @implicit node_store The NodeStore containing the hash-to-node mapping.
-// / @param node_hash The Hash32 of the node to retrieve.
-// / @return The retrieved OptionalInternalNode (pointer to the node's enum or 0 if not found/empty hash).
-func node_store_get{poseidon_ptr: PoseidonBuiltin*, node_store: NodeStore}(
-    node_hash: Hash32
-) -> OptionalInternalNode {
+// @notice Retrieves a node from the node store dictionary by its hash.
+// @dev Uses the poseidon hash components (low, high) as the key to look up the node pointer
+//      in the `node_store` dictionary. Handles the special case for the empty trie hash.
+// @implicit poseidon_ptr Used for hashing if needed by `hashdict_read`.
+// @implicit node_store The NodeStore containing the hash-to-node mapping.
+// @param node_hash The Hash32 of the node to retrieve.
+// @return The retrieved OptionalInternalNode (pointer to the node's enum or 0 if not found/empty hash).
+func node_store_get{
+    range_check_ptr,
+    bitwise_ptr: BitwiseBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
+    node_store: NodeStore,
+}(node_hash: Hash32) -> OptionalInternalNode {
     alloc_locals;
 
     // The empty trie hash has no corresponding node in the node store.
@@ -1852,23 +2072,33 @@ func node_store_get{poseidon_ptr: PoseidonBuiltin*, node_store: NodeStore}(
     tempvar node_store = NodeStore(
         new NodeStoreStruct(node_store.value.dict_ptr_start, new_dict_ptr)
     );
-    // Cast the result to an OptionalInternalNode and return
-    tempvar res = OptionalInternalNode(cast(pointer, InternalNodeEnum*));
-    return res;
+
+    // Cast the result to a Bytes, hash it to check invariant and RLP-decode it.
+    tempvar encoded_node = Bytes(cast(pointer, BytesStruct*));
+    let hash = keccak256(encoded_node);
+    // Invariant
+    with_attr error_message("INVARIANT: NodeStore preimage hash mismatch") {
+        assert hash.value.low = node_hash.value.low;
+        assert hash.value.high = node_hash.value.high;
+    }
+    let decoded_node = decode_to_internal_node(encoded_node);
+    let result = OptionalInternalNode(decoded_node.value);
+    return result;
 }
 
-// / @notice Resolves an OptionalUnionInternalNodeExtended to an OptionalInternalNode.
-// / @dev Handles different representations of trie nodes within the Extended type:
-// /      1. Direct InternalNode (Leaf, Extension, Branch): Returns it directly.
-// /      2. Bytes: Interprets as a 32-byte hash, fetches the node from `node_store_get`, or returns null for empty bytes.
-// /      3. Sequence: Interprets as an RLP-encoded embedded node, decodes it using `deserialize_to_internal_node`.
-// /      Returns null if the input `node` is null or if resolution fails (e.g., invalid Bytes length).
-// / @implicit node_store Used by `node_store_get`.
-// / @param node The OptionalUnionInternalNodeExtended node reference to resolve.
-// / @return The resolved OptionalInternalNode (pointer to InternalNodeEnum or 0).
+// @notice Resolves an OptionalUnionInternalNodeExtended to an OptionalInternalNode.
+// @dev Handles different representations of trie nodes within the Extended type:
+//      1. Direct InternalNode (Leaf, Extension, Branch): Returns it directly.
+//      2. Bytes: Interprets as a 32-byte hash, fetches the node from `node_store_get`, or returns null for empty bytes.
+//      3. Sequence: Interprets as an RLP-encoded embedded node, decodes it using `deserialize_to_internal_node`.
+//      Returns null if the input `node` is null or if resolution fails (e.g., invalid Bytes length).
+// @implicit node_store Used by `node_store_get`.
+// @param node The OptionalUnionInternalNodeExtended node reference to resolve.
+// @return The resolved OptionalInternalNode (pointer to InternalNodeEnum or 0).
 func resolve{
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
     node_store: NodeStore,
 }(node: OptionalUnionInternalNodeExtended) -> OptionalInternalNode {
@@ -1909,7 +2139,7 @@ func resolve{
         // Get the node hash from the node store
         let node_hash = Bytes_to_Bytes32(bytes);
 
-        let result = node_store_get{poseidon_ptr=poseidon_ptr, node_store=node_store}(node_hash);
+        let result = node_store_get(node_hash);
 
         return result;
     }

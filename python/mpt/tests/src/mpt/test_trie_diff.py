@@ -1,9 +1,9 @@
-from collections import defaultdict
+import re
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Tuple, Union
 
 import pytest
-from ethereum.cancun.fork_types import Address
+from ethereum.cancun.fork_types import Account, Address
 from ethereum.cancun.trie import (
     BranchNode,
     ExtensionNode,
@@ -19,12 +19,12 @@ from ethereum_types.numeric import U256
 from hypothesis import assume, given
 from hypothesis import strategies as st
 from hypothesis.strategies import composite
-from starkware.cairo.lang.vm.crypto import poseidon_hash_many
 
 from cairo_addons.utils.uint256 import int_to_uint256
+from cairo_addons.vm import poseidon_hash_many
 from mpt.ethereum_tries import EthereumTrieTransitionDB
 from mpt.trie_diff import StateDiff, resolve
-from mpt.utils import AccountNode, decode_node
+from mpt.utils import decode_node
 
 
 @composite
@@ -69,13 +69,10 @@ def ethereum_trie_transition_db(data_path):
 
 @pytest.fixture(scope="session")
 def node_store(zkpi):
-    nodes = defaultdict(
-        lambda: None,
-        {
-            keccak256(Bytes.fromhex(node[2:])): decode_node(Bytes.fromhex(node[2:]))
-            for node in zkpi["witness"]["state"]
-        },
-    )
+    nodes = {
+        keccak256(Bytes.fromhex(node[2:])): Bytes.fromhex(node[2:])
+        for node in zkpi["witness"]["state"]
+    }
     return nodes
 
 
@@ -111,9 +108,7 @@ class TestTrieDiff:
             account_address=None,
         )
 
-        accounts_lookup: Dict[
-            Address, Tuple[Optional[AccountNode], Optional[AccountNode]]
-        ] = {
+        accounts_lookup: Dict[Address, Tuple[Optional[Account], Optional[Account]]] = {
             dict_entry.key: (dict_entry.prev_value, dict_entry.new_value)
             for dict_entry in main_trie_diff_cairo
         }
@@ -148,11 +143,10 @@ class TestTrieDiff:
         "data_path", [Path("test_data/22081873.json")], scope="session"
     )
     @given(data=st.data())
+    @pytest.mark.slow
     def test_node_store_get(self, cairo_run, node_store, data):
         # take 20 keys from the node_store
-        small_store = defaultdict(
-            lambda: None, {k: v for k, v in list(node_store.items())[:6]}
-        )
+        small_store = {k: v for k, v in list(node_store.items())[:6]}
         existing_keys = list(small_store.keys())
         # take sample_size keys from small_store
         sample_size = data.draw(
@@ -170,20 +164,27 @@ class TestTrieDiff:
         keys.append(keccak256("non_existing".encode()))
 
         for key in keys:
-            _, result = cairo_run("node_store_get", small_store, key)
-            assert result == small_store.get(key)
+            try:
+                _, result = cairo_run("node_store_get", small_store, key)
+            except Exception as cairo_error:
+                assert "Dict Error: No value found for key" in str(cairo_error)
+                with pytest.raises(KeyError):
+                    decode_node(small_store[key])
+                continue
+            assert result == decode_node(small_store[key])
 
-    @given(path=..., account_before=..., account_after=...)
+    @given(address=..., account_before=..., account_after=...)
     def test__process_account_diff(
         self,
         cairo_run,
-        path: Bytes32,
-        account_before: Optional[AccountNode],
-        account_after: Optional[AccountNode],
+        address: Address,
+        account_before: Optional[Account],
+        account_after: Optional[Account],
     ):
         # Python
+        path = keccak256(address)
         diff_cls = StateDiff()
-        diff_cls._address_preimages = {path: keccak256(path)[:20]}
+        diff_cls._address_preimages = {path: address}
         leaf_before = (
             None
             if account_before is None
@@ -200,9 +201,7 @@ class TestTrieDiff:
             right=leaf_after,
         )
 
-        node_store = defaultdict(
-            lambda: None,
-        )
+        node_store = {}
 
         result_diffs = cairo_run(
             "test__process_account_diff",
@@ -224,27 +223,78 @@ class TestTrieDiff:
         for key, (prev_value, new_value) in diff_cls._main_trie.items():
             assert (prev_value, new_value) == result_lookup[key]
 
-    @given(path=..., address=..., storage_key_before=..., storage_key_after=...)
-    def test__process_storage_diff(
+    @given(address=..., account_before=..., account_after=...)
+    def test__process_account_diff_invalid(
         self,
         cairo_run,
-        path: Bytes32,
         address: Address,
-        storage_key_before: Optional[U256],
-        storage_key_after: Optional[U256],
+        account_before: Optional[Account],
+        account_after: Optional[Account],
     ):
+        path = keccak256(address)
+
+        ## BREAKING THE INVARIANT:
+        wrong_address = keccak256(b"invalid")[0:20]
+
         diff_cls = StateDiff()
-        # Fill preimages with arbitrary 32-bytes data
-        diff_cls._storage_key_preimages = {path: keccak256(path)}
+        diff_cls._address_preimages = {path: wrong_address}
         leaf_before = (
             None
-            if storage_key_before is None
-            else LeafNode(rest_of_key=b"", value=rlp.encode(storage_key_before))
+            if account_before is None
+            else LeafNode(rest_of_key=b"", value=account_before.to_rlp())
         )
         leaf_after = (
             None
-            if storage_key_after is None
-            else LeafNode(rest_of_key=b"", value=rlp.encode(storage_key_after))
+            if account_after is None
+            else LeafNode(rest_of_key=b"", value=account_after.to_rlp())
+        )
+        diff_cls._process_account_diff(
+            path=path,
+            left=leaf_before,
+            right=leaf_after,
+        )
+
+        node_store = {}
+
+        with pytest.raises(
+            Exception,
+            match=re.escape(
+                "INVARIANT - Invalid address preimage: keccak(address) != path"
+            ),
+        ):
+            cairo_run(
+                "test__process_account_diff",
+                node_store=node_store,
+                address_preimages=diff_cls._address_preimages,
+                storage_key_preimages=diff_cls._storage_key_preimages,
+                path=path,
+                left=leaf_before,
+                right=leaf_after,
+            )
+
+    @given(
+        storage_key=..., address=..., storage_value_before=..., storage_value_after=...
+    )
+    def test__process_storage_diff(
+        self,
+        cairo_run,
+        storage_key: Bytes32,
+        address: Address,
+        storage_value_before: Optional[U256],
+        storage_value_after: Optional[U256],
+    ):
+        diff_cls = StateDiff()
+        path = keccak256(storage_key)
+        diff_cls._storage_key_preimages = {path: storage_key}
+        leaf_before = (
+            None
+            if storage_value_before is None
+            else LeafNode(rest_of_key=b"", value=rlp.encode(storage_value_before))
+        )
+        leaf_after = (
+            None
+            if storage_value_after is None
+            else LeafNode(rest_of_key=b"", value=rlp.encode(storage_value_after))
         )
         diff_cls._process_storage_diff(
             address=address,
@@ -270,20 +320,71 @@ class TestTrieDiff:
             for diff in result_diffs
         }
 
+        # Cases where the prev == new, so no diffs are generated.
+        if address not in diff_cls._storage_tries:
+            assert address not in result_lookup
+            return
+
         for key, (prev_value, new_value) in diff_cls._storage_tries[address].items():
             key = int_to_uint256(int.from_bytes(key, "little"))
             hashed_key = poseidon_hash_many((int.from_bytes(address, "little"), *key))
             assert (prev_value, new_value) == result_lookup[hashed_key]
 
+    @given(
+        storage_key=..., address=..., storage_value_before=..., storage_value_after=...
+    )
+    def test__process_storage_diff_invalid(
+        self,
+        cairo_run,
+        storage_key: Bytes32,
+        address: Address,
+        storage_value_before: Optional[U256],
+        storage_value_after: Optional[U256],
+    ):
+        diff_cls = StateDiff()
+        path = keccak256(storage_key)
+
+        fake_storage_key = keccak256(b"invalid")
+        diff_cls._storage_key_preimages = {path: fake_storage_key}
+        leaf_before = (
+            None
+            if storage_value_before is None
+            else LeafNode(rest_of_key=b"", value=rlp.encode(storage_value_before))
+        )
+        leaf_after = (
+            None
+            if storage_value_after is None
+            else LeafNode(rest_of_key=b"", value=rlp.encode(storage_value_after))
+        )
+        diff_cls._process_storage_diff(
+            address=address,
+            path=path,
+            left=leaf_before,
+            right=leaf_after,
+        )
+
+        with pytest.raises(
+            Exception,
+            match=re.escape(
+                "INVARIANT - Invalid storage key preimage: keccak(storage_key) != path"
+            ),
+        ):
+            cairo_run(
+                "test__process_storage_diff",
+                storage_key_preimages=diff_cls._storage_key_preimages,
+                path=path,
+                address=address,
+                left=leaf_before,
+                right=leaf_after,
+            )
+
     @pytest.mark.parametrize(
         "data_path", [Path("test_data/22081873.json")], scope="session"
     )
     @given(data=st.data())
-    def test_resolve(self, cairo_run, node_store: Mapping[Hash32, InternalNode], data):
+    def test_resolve(self, cairo_run, node_store: Mapping[Hash32, Bytes], data):
         # take 20 keys from the node_store
-        small_store = defaultdict(
-            lambda: None, {k: v for k, v in list(node_store.items())[:3]}
-        )
+        small_store = {k: v for k, v in list(node_store.items())[:3]}
         existing_keys = list(small_store.keys())
         # take sample_size keys from small_store
         sample_size = data.draw(
@@ -301,7 +402,14 @@ class TestTrieDiff:
         keys.append(keccak256("non_existing".encode()))
 
         for key in keys:
-            _, cairo_result = cairo_run("resolve", small_store, node=bytes(key))
+            try:
+                _, cairo_result = cairo_run("resolve", small_store, node=bytes(key))
+            except Exception as cairo_error:
+                assert "Dict Error: No value found for key" in str(cairo_error)
+                # We can't use strict_raises here because the error is a RuntimeError in Cairo
+                with pytest.raises(KeyError):
+                    resolve(key, small_store)
+                continue
             result = resolve(key, small_store)
             assert result == cairo_result
 
@@ -310,11 +418,10 @@ class TestTrieDiff:
             assert node == resolve(result, small_store)
 
     @given(embedded_node_dict=embedded_node_strategy())
+    @pytest.mark.slow
     def test_resolve_embedded_node(self, cairo_run, embedded_node_dict):
         # We don't need a node store for this test
-        node_store = defaultdict(
-            lambda: None,
-        )
+        node_store = {}
         parent_node = embedded_node_dict["extension"]
         expected_branch_node = embedded_node_dict["branch"]
         expected_leaf_node = embedded_node_dict["leaf"]
@@ -337,27 +444,14 @@ class TestTrieDiff:
                 assert cairo_subnode == expected_leaf_node
 
 
-class TestAccountNode:
-    @given(account_node=...)
-    def test_account_node_rlp(self, cairo_run, account_node: AccountNode):
-        # Python from / to rlp
-        rlp_encoded = account_node.to_rlp()
-        decoded = AccountNode.from_rlp(rlp_encoded)
-        assert decoded == account_node
-
-        # Cairo from rlp
-        cairo_decoded, _ = cairo_run("AccountNode_from_rlp", encoding=rlp_encoded)
-        assert cairo_decoded == account_node
-
-
 class TestTypes:
     @given(left=..., right=...)
     def test_OptionalUnionInternalNodeExtended__eq__(
         self,
-        cairo_run_py,
+        cairo_run,
         left: Optional[Union[InternalNode, Extended]],
         right: Optional[Union[InternalNode, Extended]],
     ):
         eq_py = (left == right) and type(left) is type(right)
-        eq_cairo = cairo_run_py("OptionalUnionInternalNodeExtended__eq__", left, right)
+        eq_cairo = cairo_run("OptionalUnionInternalNodeExtended__eq__", left, right)
         assert eq_py == eq_cairo

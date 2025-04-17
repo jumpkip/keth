@@ -69,8 +69,9 @@ impl PyCairoRunner {
     /// * `enable_traces` - Whether to enable execution of hints containing log traces. When false,
     ///   Python identifiers and program identifiers are not loaded to save memory and
     ///   initialization time.
+    #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (program, py_identifiers=None, program_input=None, layout=None, proof_mode=false, allow_missing_builtins=false, enable_traces=false, ordered_builtins=vec![], cairo_file=None))]
+    #[pyo3(signature = (program, py_identifiers=None, program_input=None, layout=None, proof_mode=false, allow_missing_builtins=false, enable_traces=false, ordered_builtins=vec![], cairo_file=None, py_debug_info=None))]
     fn new(
         program: &PyProgram,
         py_identifiers: Option<PyObject>,
@@ -81,6 +82,7 @@ impl PyCairoRunner {
         enable_traces: bool,
         ordered_builtins: Vec<String>,
         cairo_file: Option<PyObject>,
+        py_debug_info: Option<PyObject>,
     ) -> PyResult<Self> {
         let layout = layout.unwrap_or_default().into_layout_name()?;
 
@@ -133,6 +135,12 @@ impl PyCairoRunner {
 
             if let Some(cairo_file) = cairo_file {
                 context.set_item("cairo_file", cairo_file).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?;
+            }
+
+            if let Some(py_debug_info) = py_debug_info {
+                context.set_item("py_debug_info", py_debug_info).map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
                 })?;
             }
@@ -259,7 +267,7 @@ except Exception as e:
 
     #[getter]
     fn segments(&mut self) -> PyMemorySegmentManager {
-        PyMemorySegmentManager { vm: &mut self.inner.vm }
+        PyMemorySegmentManager { inner: &mut self.inner.vm.segments }
     }
 
     /// Loads data into memory at the specified base address.
@@ -392,6 +400,31 @@ except Exception as e:
     fn verify_secure_runner(&mut self) -> PyResult<()> {
         verify_secure_runner(&self.inner, true, None)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(())
+    }
+
+    fn verify_squashed_dicts(&mut self) -> PyResult<()> {
+        let dict_manager_ref = self
+            .inner
+            .exec_scopes
+            .get_dict_manager()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let dict_manager = dict_manager_ref.borrow();
+
+        let unsquashed_trackers: Vec<String> = dict_manager
+            .trackers
+            .values()
+            .filter(|tracker| !tracker.is_squashed)
+            .map(|t| t.name.clone().unwrap_or_else(|| t.current_ptr.to_string()))
+            .collect();
+
+        if !unsquashed_trackers.is_empty() {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "unsquashed trackers: {:?}",
+                unsquashed_trackers
+            )));
+        }
+
         Ok(())
     }
 
@@ -602,11 +635,19 @@ impl PyCairoRunner {
 
 /// Runs the Cairo program in proof mode with public and private inputs.
 /// Mimics the behavior of the `run` function from cairo-vm-cli.
+/// # Arguments
+/// * `entrypoint` - The entrypoint of the cairo program (e.g. "main")
+/// * `program_input` - The program inputs
+/// * `compiled_program_path` - The path to the compiled cairo program
+/// * `output_dir` - The output directory
+/// * `stwo_proof` - Whether to use Stwo proof
+/// * `proof_path` - The path to the proof
+/// * `verify` - Whether to verify the proof
 #[allow(clippy::too_many_arguments)]
-#[pyfunction(signature = (entrypoint, program_inputs, compiled_program_path, output_dir, stwo_proof=false, proof_path=None, verify=false))]
+#[pyfunction(signature = (entrypoint, program_input, compiled_program_path, output_dir, stwo_proof=false, proof_path=None, verify=false))]
 pub fn run_proof_mode(
     entrypoint: String,
-    program_inputs: PyObject,
+    program_input: PyObject,
     compiled_program_path: String,
     output_dir: PathBuf,
     stwo_proof: bool,
@@ -650,7 +691,7 @@ pub fn run_proof_mode(
     Python::with_gil(|py| {
         let context = PyDict::new(py);
 
-        context.set_item("program_inputs", program_inputs)?;
+        context.set_item("program_input", program_input)?;
 
         let identifiers = program
             .iter_identifiers()

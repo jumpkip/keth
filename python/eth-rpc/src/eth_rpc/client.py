@@ -87,7 +87,11 @@ class EthereumRPC:
             ],
         }
         response = requests.post(self.url, json=payload)
-        result = response.json()["result"]
+        try:
+            result = response.json()["result"]
+        except Exception as e:
+            logger.error(f"Error getting proof: {e} \n {response.text}")
+            raise e
         return AccountProof(
             address=Address.fromhex(result["address"][2:]),
             account_proof=[
@@ -132,7 +136,11 @@ class EthereumRPC:
             ],
         }
 
-        response = requests.post(self.url, json=payload)
+        try:
+            response = requests.post(self.url, json=payload)
+            result = Bytes.fromhex(response.json()["result"][2:])
+        except Exception as e:
+            logger.error(f"Error getting code: {e} \n {response.text}")
+            raise e
 
-        result = Bytes.fromhex(response.json()["result"][2:])
         return result

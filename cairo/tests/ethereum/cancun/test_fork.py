@@ -1,10 +1,7 @@
-import json
 from collections import defaultdict
 from dataclasses import replace
-from pathlib import Path
 from typing import Optional, Tuple
 
-import pytest
 from eth_abi.abi import encode
 from eth_account import Account as EthAccount
 from eth_keys.datatypes import PrivateKey
@@ -19,7 +16,6 @@ from ethereum.cancun.fork import (
     get_last_256_block_hashes,
     make_receipt,
     process_transaction,
-    state_transition,
     validate_header,
 )
 from ethereum.cancun.fork_types import Account, Address, VersionedHash
@@ -38,15 +34,13 @@ from ethereum.cancun.transactions import (
     signing_hash_4844,
     signing_hash_pre155,
 )
-from ethereum.cancun.trie import Trie
+from ethereum.cancun.trie import Trie, root
 from ethereum.cancun.utils.address import to_address
 from ethereum.cancun.vm import Environment
-from ethereum.cancun.vm.gas import TARGET_BLOB_GAS_PER_BLOCK, calculate_excess_blob_gas
+from ethereum.cancun.vm.gas import TARGET_BLOB_GAS_PER_BLOCK
 from ethereum.crypto.hash import Hash32, keccak256
 from ethereum.exceptions import EthereumException
-from ethereum.utils.hexadecimal import hex_to_bytes, hex_to_u256, hex_to_uint
 from ethereum_rlp import rlp
-from ethereum_spec_tools.evm_tools.loaders.fixture_loader import Load
 from ethereum_types.bytes import Bytes, Bytes0, Bytes8, Bytes20, Bytes32
 from ethereum_types.numeric import U64, U256, Uint
 from hypothesis import assume, given, settings
@@ -54,7 +48,7 @@ from hypothesis import strategies as st
 from hypothesis.strategies import composite, integers
 
 from cairo_addons.testing.errors import strict_raises
-from tests.ef_tests.helpers.load_state_tests import prepare_state
+from keth_types.types import EMPTY_BYTES_HASH, EMPTY_TRIE_HASH
 from tests.ethereum.cancun.vm.test_interpreter import unimplemented_precompiles
 from tests.utils.constants import (
     COINBASE,
@@ -213,6 +207,8 @@ def get_blob_tx_with_tx_sender_in_state():
         balance=U256(int("0x1000000000000000000", 16)),
         nonce=U256(int("0x1bfec", 16)),
         code=bytearray(),
+        storage_root=EMPTY_TRIE_HASH,
+        code_hash=EMPTY_BYTES_HASH,
     )
     # Empty state
     state = State(
@@ -429,6 +425,8 @@ def tx_with_sender_in_state(
         st.integers(0, 10 * int(TARGET_BLOB_GAS_PER_BLOCK)).map(U64)
     )
     state = env.state
+    # Explicitly clean any snapshot in the state - as in the initial state of a tx, there are no snapshots.
+    state._snapshots = []
     tx = draw(tx_strategy)
     account = draw(account_strategy)
     private_key = draw(st.from_type(PrivateKey))
@@ -440,6 +438,12 @@ def tx_with_sender_in_state(
         if calculate_intrinsic_cost(tx) > tx.gas:
             tx = replace(tx, gas=(calculate_intrinsic_cost(tx) + Uint(10000)))
 
+        account_address = to_address(Uint(expected_address))
+        if account_address in state._storage_tries:
+            account_storage_root = root(state._storage_tries[account_address])
+        else:
+            account_storage_root = EMPTY_TRIE_HASH
+
         set_account(
             state,
             to_address(Uint(expected_address)),
@@ -449,6 +453,8 @@ def tx_with_sender_in_state(
                 + U256(10000),
                 nonce=account.nonce,
                 code=bytes(),
+                code_hash=EMPTY_BYTES_HASH,
+                storage_root=account_storage_root,
             ),
         )
     # 2 * chain_id + 35 + v must be less than 2^64 for the signature of a legacy transaction to be valid
@@ -492,126 +498,6 @@ def tx_with_sender_in_state(
         sender = Address(int(expected_address).to_bytes(20, "little"))
         set_account(state, sender, account)
     return tx, env, chain_id
-
-
-@pytest.fixture
-def zkpi_fixture(zkpi_path):
-    with open(zkpi_path, "r") as f:
-        fixture = json.load(f)
-
-    load = Load("Cancun", "cancun")
-    block = Block(
-        header=load.json_to_header(fixture["newBlockParameters"]["blockHeader"]),
-        transactions=tuple(
-            (
-                LegacyTransaction(
-                    nonce=hex_to_u256(tx["nonce"]),
-                    gas_price=hex_to_uint(tx["gasPrice"]),
-                    gas=hex_to_uint(tx["gas"]),
-                    to=Address(hex_to_bytes(tx["to"])) if tx["to"] else Bytes0(),
-                    value=hex_to_u256(tx["value"]),
-                    data=Bytes(hex_to_bytes(tx["data"])),
-                    v=hex_to_u256(tx["v"]),
-                    r=hex_to_u256(tx["r"]),
-                    s=hex_to_u256(tx["s"]),
-                )
-                if isinstance(tx, dict)
-                else Bytes(hex_to_bytes(tx))
-            )  # Non-legacy txs are hex strings
-            for tx in fixture["newBlockParameters"]["transactions"]
-        ),
-        ommers=(),
-        withdrawals=tuple(
-            Withdrawal(
-                index=U64(int(w["index"], 16)),
-                validator_index=U64(int(w["validatorIndex"], 16)),
-                address=Address(hex_to_bytes(w["address"])),
-                amount=U256(int(w["amount"], 16)),
-            )
-            for w in fixture["newBlockParameters"]["withdrawals"]
-        ),
-    )
-    blocks = [
-        Block(
-            header=load.json_to_header(ancestor),
-            transactions=(),
-            ommers=(),
-            withdrawals=(),
-        )
-        for ancestor in fixture["ancestors"]
-    ]
-    chain = BlockChain(
-        blocks=blocks,
-        state=prepare_state(load.json_to_state(fixture["pre"])),
-        chain_id=U64(fixture["chainId"]),
-    )
-
-    # TODO: Remove when we have a working partial MPT
-    state_root = apply_body(
-        chain.state,
-        get_last_256_block_hashes(chain),
-        block.header.coinbase,
-        block.header.number,
-        block.header.base_fee_per_gas,
-        block.header.gas_limit,
-        block.header.timestamp,
-        block.header.prev_randao,
-        block.transactions,
-        chain.chain_id,
-        block.withdrawals,
-        block.header.parent_beacon_block_root,
-        calculate_excess_blob_gas(chain.blocks[-1].header),
-    ).state_root
-    block = Block(
-        header=load.json_to_header(
-            {
-                **fixture["newBlockParameters"]["blockHeader"],
-                "stateRoot": "0x" + state_root.hex(),
-            }
-        ),
-        transactions=tuple(
-            (
-                LegacyTransaction(
-                    nonce=hex_to_u256(tx["nonce"]),
-                    gas_price=hex_to_uint(tx["gasPrice"]),
-                    gas=hex_to_uint(tx["gas"]),
-                    to=Address(hex_to_bytes(tx["to"])) if tx["to"] else Bytes0(),
-                    value=hex_to_u256(tx["value"]),
-                    data=Bytes(hex_to_bytes(tx["data"])),
-                    v=hex_to_u256(tx["v"]),
-                    r=hex_to_u256(tx["r"]),
-                    s=hex_to_u256(tx["s"]),
-                )
-                if isinstance(tx, dict)
-                else Bytes(hex_to_bytes(tx))
-            )  # Non-legacy txs are hex strings
-            for tx in fixture["newBlockParameters"]["transactions"]
-        ),
-        ommers=(),
-        withdrawals=tuple(
-            Withdrawal(
-                index=U64(int(w["index"], 16)),
-                validator_index=U64(int(w["validatorIndex"], 16)),
-                address=Address(hex_to_bytes(w["address"])),
-                amount=U256(int(w["amount"], 16)),
-            )
-            for w in fixture["newBlockParameters"]["withdrawals"]
-        ),
-    )
-    chain = BlockChain(
-        blocks=blocks,
-        state=prepare_state(load.json_to_state(fixture["pre"])),
-        chain_id=U64(fixture["chainId"]),
-    )
-    # Safety check
-    state_transition(chain, block)
-    # Reset state to the original state
-    chain = BlockChain(
-        blocks=blocks[:-1],
-        state=prepare_state(load.json_to_state(fixture["pre"])),
-        chain_id=U64(fixture["chainId"]),
-    )
-    return chain, block
 
 
 class TestFork:
@@ -787,7 +673,7 @@ class TestFork:
                 default=None,
                 _data=defaultdict(lambda: None, accounts),
             ),
-            _storage_tries=dict(storage_tries),
+            _storage_tries=storage_tries,
             _snapshots=[],
             created_accounts=set(),
         )
@@ -816,40 +702,16 @@ class TestFork:
 
         output = apply_body(**kwargs)
 
+        # We compare all but not the state root - which is not computed in Cairo
+        cairo_result.state_root = output.state_root
         assert cairo_result == output
         assert cairo_state == state
-
-    @pytest.mark.parametrize(
-        "zkpi_path",
-        list(Path("data/1/eels").glob("*.json")),
-        ids=[x.stem for x in Path("data/1/eels").glob("*.json")],
-    )
-    @pytest.mark.slow
-    def test_state_transition_eth_mainnet(self, cairo_run, zkpi_fixture):
-        cairo_run("state_transition", *zkpi_fixture)
 
 
 def _create_erc20_data():
     """Helper to create the fixed ERC20 data structures"""
     erc20_contract = get_contract("ERC20", "KethToken")
     erc20_address = Address(bytes.fromhex(erc20_contract.address[2:]))
-
-    accounts = {
-        erc20_address: Account(
-            balance=U256(0),
-            nonce=Uint(0),
-            code=bytes(erc20_contract.bytecode_runtime),
-        ),
-        Address(bytes.fromhex(OTHER[2:])): Account(
-            balance=U256(int(1e18)), nonce=Uint(0), code=bytes()
-        ),
-        Address(bytes.fromhex(OWNER[2:])): Account(
-            balance=U256(int(1e18)), nonce=Uint(0), code=bytes()
-        ),
-        Address(bytes.fromhex(COINBASE[2:])): Account(
-            balance=U256(int(1e18)), nonce=Uint(0), code=bytes()
-        ),
-    }
 
     storage_data = {
         Bytes32(U256(0).to_be_bytes32()): U256.from_be_bytes(
@@ -864,12 +726,48 @@ def _create_erc20_data():
         ),
     }
 
-    storage_tries = {
-        erc20_address: Trie(
-            secured=True,
-            default=U256(0),
-            _data=defaultdict(lambda: U256(0), storage_data),
-        )
+    storage_tries = defaultdict(
+        lambda: Trie(secured=True, default=U256(0), _data=defaultdict(lambda: U256(0))),
+        {
+            erc20_address: Trie(
+                secured=True,
+                default=U256(0),
+                _data=defaultdict(lambda: U256(0), storage_data),
+            )
+        },
+    )
+
+    erc20_storage_root = root(storage_tries[erc20_address])
+
+    accounts = {
+        erc20_address: Account(
+            balance=U256(0),
+            nonce=Uint(0),
+            code=bytes(erc20_contract.bytecode_runtime),
+            storage_root=erc20_storage_root,
+            code_hash=keccak256(bytes(erc20_contract.bytecode_runtime)),
+        ),
+        Address(bytes.fromhex(OTHER[2:])): Account(
+            balance=U256(int(1e18)),
+            nonce=Uint(0),
+            code=bytes(),
+            storage_root=EMPTY_TRIE_HASH,
+            code_hash=EMPTY_BYTES_HASH,
+        ),
+        Address(bytes.fromhex(OWNER[2:])): Account(
+            balance=U256(int(1e18)),
+            nonce=Uint(0),
+            code=bytes(),
+            storage_root=EMPTY_TRIE_HASH,
+            code_hash=EMPTY_BYTES_HASH,
+        ),
+        Address(bytes.fromhex(COINBASE[2:])): Account(
+            balance=U256(int(1e18)),
+            nonce=Uint(0),
+            code=bytes(),
+            storage_root=EMPTY_TRIE_HASH,
+            code_hash=EMPTY_BYTES_HASH,
+        ),
     }
 
     return accounts, storage_tries

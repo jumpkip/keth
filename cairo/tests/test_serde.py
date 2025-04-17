@@ -30,23 +30,45 @@ from ethereum.cancun.vm.exceptions import (
 )
 from ethereum.cancun.vm.gas import ExtendMemory, MessageCallGas
 from ethereum.cancun.vm.interpreter import MessageCallOutput
-from ethereum.crypto.alt_bn128 import BNF, BNF2, BNF12, BNP, BNP2, BNP12
+from ethereum.crypto.alt_bn128 import BNF, BNF2, BNF12, BNP, BNP2
 from ethereum.crypto.hash import Hash32
+from ethereum.crypto.kzg import FQ, FQ2, BLSFieldElement, KZGCommitment, KZGProof
 from ethereum.exceptions import (
     EthereumException,
     InvalidSignatureError,
     InvalidTransaction,
 )
-from ethereum_types.bytes import Bytes, Bytes0, Bytes8, Bytes20, Bytes32, Bytes256
+from ethereum_types.bytes import (
+    Bytes,
+    Bytes0,
+    Bytes8,
+    Bytes20,
+    Bytes32,
+    Bytes48,
+    Bytes256,
+)
 from ethereum_types.numeric import U64, U256, Uint
 from hypothesis import HealthCheck, assume, given, settings
+from py_ecc.fields import optimized_bls12_381_FQ as BLSF
+from py_ecc.fields import optimized_bls12_381_FQ2 as BLSF2
+from py_ecc.fields import optimized_bls12_381_FQ12 as BLSF12
+from py_ecc.typing import Optimized_Point3D
 from starkware.cairo.common.dict import DictManager
 from starkware.cairo.lang.cairo_constants import DEFAULT_PRIME
 from starkware.cairo.lang.vm.memory_dict import MemoryDict
 from starkware.cairo.lang.vm.memory_segments import MemorySegmentManager
 
-from mpt.utils import AccountNode
-from tests.utils.args_gen import U384, Memory, Stack, _cairo_struct_to_python_type
+from tests.utils.args_gen import (
+    U384,
+    AddressAccountDiffEntry,
+    BLSPubkey,
+    G1Compressed,
+    G1Uncompressed,
+    Memory,
+    Stack,
+    StorageDiffEntry,
+    _cairo_struct_to_python_type,
+)
 from tests.utils.args_gen import gen_arg as _gen_arg
 from tests.utils.args_gen import to_cairo_type as _to_cairo_type
 from tests.utils.serde import Serde
@@ -106,7 +128,10 @@ def get_type(instance: Any) -> Type:
     if not isinstance(instance, (tuple, list)):
         return type(instance)
 
-    if isinstance(instance, (BNF2, BNF12, BNF, BNP, BNP2, BNP12)):
+    if isinstance(
+        instance,
+        (BNF2, BNF12, BNF, BNP, BNP2, BLSF, BLSF2, G1Compressed, BLSPubkey),
+    ):
         return instance.__class__
 
     # Empty sequence
@@ -115,6 +140,12 @@ def get_type(instance: Any) -> Type:
 
     # Get all element types
     elem_types = [get_type(x) for x in instance]
+
+    if all(t == BLSF for t in elem_types):
+        return Optimized_Point3D[BLSF]
+
+    if all(t == BLSF2 for t in elem_types):
+        return Optimized_Point3D[BLSF2]
 
     type_mapping = {
         tuple: lambda types: (
@@ -239,7 +270,6 @@ class TestSerde:
             BranchNode,
             InternalNode,
             Optional[InternalNode],
-            Mapping[Hash32, Optional[InternalNode]],
             Node,
             Mapping[Bytes, Bytes],
             Tuple[Mapping[Bytes, Bytes], ...],
@@ -291,17 +321,33 @@ class TestSerde:
             Trie[Bytes, Optional[Union[Bytes, Withdrawal]]],
             ApplyBodyOutput,
             U384,
+            Optional[U384],
             BNF12,
-            Tuple[BNF12, ...],
-            BNP12,
             BNF2,
             BNF,
             BNP,
             BNP2,
-            AccountNode,
             Mapping[Bytes32, Address],
-            Mapping[Hash32, Optional[InternalNode]],
+            Mapping[Hash32, Bytes],
             Mapping[Bytes32, Bytes32],
+            BLSFieldElement,
+            AddressAccountDiffEntry,
+            List[AddressAccountDiffEntry],
+            StorageDiffEntry,
+            List[StorageDiffEntry],
+            BLSF,
+            BLSF2,
+            KZGCommitment,
+            Bytes48,
+            Optimized_Point3D[BLSF],
+            Optimized_Point3D[BLSF2],
+            G1Compressed,
+            G1Uncompressed,
+            BLSPubkey,
+            KZGProof,
+            BLSF12,
+            Tuple[FQ, FQ2],
+            Tuple[Tuple[FQ, FQ2], Tuple[FQ, FQ2]],
         ],
     ):
         assume(no_empty_sequence(b))
@@ -327,6 +373,8 @@ class TestSerde:
             InvalidOpcode,
             InvalidSignatureError,
             InvalidTransaction,
+            ValueError,
+            AssertionError,
         ],
     ):
         base = segments.gen_arg([gen_arg(type(err), err)])

@@ -32,9 +32,10 @@ runs:
       uses: Swatinem/rust-cache@v2
       with:
         cache-on-failure: ${{ inputs.cache-on-failure }}
+        shared-key: "rust-cache"
 
     - name: Setup uv
-      uses: astral-sh/setup-uv@v3
+      uses: astral-sh/setup-uv@v5
       with:
         enable-cache: ${{ inputs.enable-uv-cache }}
         cache-dependency-glob: ${{ inputs.cache-dependency-glob }}

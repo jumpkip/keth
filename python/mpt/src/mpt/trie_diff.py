@@ -5,15 +5,26 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
-from ethereum.cancun.fork_types import Address
+from ethereum.cancun.fork_types import Account, Address
 from ethereum.cancun.trie import BranchNode, ExtensionNode, InternalNode, LeafNode
 from ethereum.crypto.hash import Hash32
-from ethereum_rlp import Extended, rlp
+from ethereum_rlp import rlp
+from ethereum_rlp.rlp import Extended
 from ethereum_types.bytes import Bytes, Bytes32
 from ethereum_types.numeric import U256, Uint
 
+from cairo_addons.utils.uint256 import int_to_uint256
+from cairo_addons.vm import poseidon_hash_many
+from keth_types.types import EMPTY_TRIE_HASH
 from mpt.ethereum_tries import EthereumTrieTransitionDB
-from mpt.utils import AccountNode, deserialize_to_internal_node, nibble_list_to_bytes
+from mpt.utils import (
+    check_branch_node,
+    check_extension_node,
+    check_leaf_node,
+    decode_node,
+    deserialize_to_internal_node,
+    nibble_list_to_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +35,8 @@ class StateDiff:
     Contains all information that is preserved between transactions.
     """
 
-    _main_trie: Dict[Address, Tuple[Optional[AccountNode], Optional[AccountNode]]] = (
-        field(default_factory=dict)
+    _main_trie: Dict[Address, Tuple[Optional[Account], Optional[Account]]] = field(
+        default_factory=dict
     )
     _storage_tries: Dict[
         Address, Tuple[Dict[Bytes32, Optional[U256]], Dict[Bytes32, Optional[U256]]]
@@ -55,11 +66,14 @@ class StateDiff:
                 pre_nonce = Uint(int(diff["preAccount"]["nonce"][2:], 16))
                 pre_code_hash = Hash32.fromhex(diff["preAccount"]["codeHash"][2:])
                 pre_storage_hash = Hash32.fromhex(diff["preAccount"]["storageHash"][2:])
-                pre_account = AccountNode(
+                # Explicitly instantiate without code, as it's not an interesting data in the
+                # case of state / trie diffs
+                pre_account = Account(
                     nonce=pre_nonce,
                     balance=pre_balance,
                     code_hash=pre_code_hash,
                     storage_root=pre_storage_hash,
+                    code=None,
                 )
             else:
                 pre_account = None
@@ -71,11 +85,12 @@ class StateDiff:
                 post_storage_hash = Hash32.fromhex(
                     diff["postAccount"]["storageHash"][2:]
                 )
-                post_account = AccountNode(
+                post_account = Account(
                     nonce=post_nonce,
                     balance=post_balance,
                     code_hash=post_code_hash,
                     storage_root=post_storage_hash,
+                    code=None,
                 )
             else:
                 post_account = None
@@ -85,15 +100,52 @@ class StateDiff:
                     key = Bytes32.fromhex(storage_diff["storageKey"][2:])
                     pre_int = int(storage_diff["preValue"][2:], 16)
                     post_int = int(storage_diff["postValue"][2:], 16)
-                    pre = None if pre_int == 0 else U256(pre_int)
-                    post = None if post_int == 0 else U256(post_int)
+                    pre = U256(pre_int)
+                    post = U256(post_int)
                     if address not in state_diff._storage_tries:
                         state_diff._storage_tries[address] = {}
                     state_diff._storage_tries[address][key] = tuple((pre, post))
 
-            state_diff._main_trie[address] = tuple((pre_account, post_account))
+            # Important consideration: the `stateDiffs` provided in the JSON contain a `storage_root` field;
+            # however, our approach uses diffs on the storage tries instead of re-computing the storage root.
+            # As such, if all fields are equal _except_ for the storage root, we consider that there is no _account diff_,
+            # only a _storage diff_.
+
+            # reminder: __eq__ operator does not take into account the `storage_root` field.
+            if pre_account != post_account:
+                state_diff._main_trie[address] = tuple((pre_account, post_account))
 
         return state_diff
+
+    def compute_commitments(self) -> Tuple[int, int]:
+        from tests.utils.args_gen import AddressAccountDiffEntry, StorageDiffEntry
+
+        account_diffs = []
+        for address, (pre_account, post_account) in self._main_trie.items():
+            account_diffs.append(
+                AddressAccountDiffEntry(address, pre_account, post_account)
+            )
+        account_diffs = sorted(
+            account_diffs, key=lambda x: int.from_bytes(x.key, "little")
+        )
+
+        storage_diffs = []
+        for address, (storage_trie) in self._storage_tries.items():
+            for key, (pre, post) in storage_trie.items():
+                key = int_to_uint256(int.from_bytes(key, "little"))
+                key_hashed = poseidon_hash_many(
+                    (int.from_bytes(address, "little"), *key)
+                )
+                storage_diffs.append(StorageDiffEntry(key_hashed, pre, post))
+        storage_diffs = sorted(storage_diffs, key=lambda x: x.key)
+
+        account_diff_hashes = [diff.hash_poseidon() for diff in account_diffs]
+        storage_diff_hashes = [diff.hash_poseidon() for diff in storage_diffs]
+
+        account_diff_commitment = poseidon_hash_many(account_diff_hashes)
+        storage_diff_commitment = poseidon_hash_many(storage_diff_hashes)
+
+        return account_diff_commitment, storage_diff_commitment
 
     @classmethod
     def from_tries(cls, tries: EthereumTrieTransitionDB) -> "StateDiff":
@@ -104,14 +156,23 @@ class StateDiff:
         l_root = tries.state_root
         r_root = tries.post_state_root
 
-        diff._compute_diff(l_root, r_root, Bytes(), diff._process_account_diff)
+        diff._compute_diff(
+            l_root,
+            r_root,
+            Bytes(),
+            left_parent=None,
+            right_parent=None,
+            process_leaf_diff=diff._process_account_diff,
+        )
         return diff
 
     def _compute_diff(
         self,
-        left: Optional[Hash32 | Bytes],
-        right: Optional[Hash32 | Bytes],
+        left: Optional[Union[InternalNode, Extended]],
+        right: Optional[Union[InternalNode, Extended]],
         path: Bytes,
+        left_parent: Optional[InternalNode],
+        right_parent: Optional[InternalNode],
         process_leaf_diff: Callable,
     ):
         if left == right:
@@ -128,31 +189,44 @@ class StateDiff:
 
             case (None, LeafNode()):
                 # new leaf
+                check_leaf_node(path, r_node)
                 full_path = nibble_list_to_bytes(path + r_node.rest_of_key)
                 process_leaf_diff(path=full_path, left=None, right=r_node)
 
             case (None, ExtensionNode()):
+                check_extension_node(r_node, parent=right_parent)
                 # Look for diffs in the right sub-tree
                 self._compute_diff(
-                    None, r_node.subnode, path + r_node.key_segment, process_leaf_diff
+                    None,
+                    r_node.subnode,
+                    path + r_node.key_segment,
+                    left_parent=None,
+                    right_parent=r_node,
+                    process_leaf_diff=process_leaf_diff,
                 )
 
             case (None, BranchNode()):
+                check_branch_node(r_node)
                 # Look for diffs in all branches of the right sub-tree
                 for i in range(0, 16):
                     self._compute_diff(
                         None,
                         r_node.subnodes[i],
                         path + bytes([i]),
-                        process_leaf_diff,
+                        left_parent=None,
+                        right_parent=r_node,
+                        process_leaf_diff=process_leaf_diff,
                     )
 
             case (LeafNode(), None):
                 # deleted leaf
+                check_leaf_node(path, l_node)
                 full_path = nibble_list_to_bytes(path + l_node.rest_of_key)
                 process_leaf_diff(path=full_path, left=l_node, right=None)
 
             case (LeafNode(), LeafNode()):
+                check_leaf_node(path, l_node)
+                check_leaf_node(path, r_node)
                 if l_node.rest_of_key == r_node.rest_of_key:
                     if l_node.value != r_node.value:
                         # Same path -> different values
@@ -173,6 +247,8 @@ class StateDiff:
                 return
 
             case (LeafNode(), ExtensionNode()):
+                check_leaf_node(path, l_node)
+                check_extension_node(r_node, parent=right_parent)
                 # Explore the extension node's subtree for any new leaves, comparing it to the old
                 # leaf with the same key
                 if l_node.rest_of_key.startswith(r_node.key_segment):
@@ -183,7 +259,9 @@ class StateDiff:
                         l_node,
                         r_node.subnode,
                         path + r_node.key_segment,
-                        process_leaf_diff,
+                        left_parent=left_parent,
+                        right_parent=r_node,
+                        process_leaf_diff=process_leaf_diff,
                     )
 
                 # Here we compute the deletion of the Leaf and creation of the ExtensionNode's children
@@ -193,10 +271,17 @@ class StateDiff:
 
                 # we explore the right sub-tree
                 self._compute_diff(
-                    None, r_node.subnode, path + r_node.key_segment, process_leaf_diff
+                    None,
+                    r_node.subnode,
+                    path + r_node.key_segment,
+                    left_parent=None,
+                    right_parent=r_node,
+                    process_leaf_diff=process_leaf_diff,
                 )
 
             case (LeafNode(), BranchNode()):
+                check_leaf_node(path, l_node)
+                check_branch_node(r_node)
                 # The branch was created and replaced the single leaf.
                 # All branches - except the one whose first nibble matches the leaf's key - are new.
                 for i in range(0, 16):
@@ -209,7 +294,9 @@ class StateDiff:
                             None,
                             r_node.subnodes[i],
                             path + bytes([i]),
-                            process_leaf_diff,
+                            left_parent=None,
+                            right_parent=r_node,
+                            process_leaf_diff=process_leaf_diff,
                         )
                     else:
                         shortened_l_node = LeafNode(
@@ -219,16 +306,25 @@ class StateDiff:
                             shortened_l_node,
                             r_node.subnodes[i],
                             path + bytes([i]),
-                            process_leaf_diff,
+                            left_parent=left_parent,
+                            right_parent=r_node,
+                            process_leaf_diff=process_leaf_diff,
                         )
 
             case (ExtensionNode(), None):
+                check_extension_node(l_node, parent=left_parent)
                 # Look for diffs in the left sub-tree
                 self._compute_diff(
-                    l_node.subnode, None, path + l_node.key_segment, process_leaf_diff
+                    l_node.subnode,
+                    None,
+                    path + l_node.key_segment,
+                    left_parent=l_node,
+                    right_parent=None,
+                    process_leaf_diff=process_leaf_diff,
                 )
 
             case (ExtensionNode(), LeafNode()):
+                check_extension_node(l_node, parent=left_parent)
                 # The extension node was deleted and replaced by a leaf - meaning that down the line of the extension node, in a branch, we deleted some nodes.
                 # Explore the extension node's subtree for any deleted nodes, comparing it to the new leaf
                 if r_node.rest_of_key.startswith(l_node.key_segment):
@@ -239,7 +335,9 @@ class StateDiff:
                         l_node.subnode,
                         r_node,
                         path + l_node.key_segment,
-                        process_leaf_diff,
+                        left_parent=l_node,
+                        right_parent=right_parent,
+                        process_leaf_diff=process_leaf_diff,
                     )
                     return
 
@@ -249,17 +347,26 @@ class StateDiff:
 
                 # we explore the left sub-tree
                 self._compute_diff(
-                    l_node.subnode, None, path + l_node.key_segment, process_leaf_diff
+                    l_node.subnode,
+                    None,
+                    path + l_node.key_segment,
+                    left_parent=l_node,
+                    right_parent=None,
+                    process_leaf_diff=process_leaf_diff,
                 )
 
             case (ExtensionNode(), ExtensionNode()):
+                check_extension_node(l_node, parent=left_parent)
+                check_extension_node(r_node, parent=right_parent)
                 # Equal keys -> Look for diffs in children
                 if l_node.key_segment == r_node.key_segment:
                     self._compute_diff(
                         l_node.subnode,
                         r_node.subnode,
                         path + l_node.key_segment,
-                        process_leaf_diff,
+                        left_parent=l_node,
+                        right_parent=r_node,
+                        process_leaf_diff=process_leaf_diff,
                     )
                 # Right is prefix of left
                 elif l_node.key_segment.startswith(r_node.key_segment):
@@ -274,7 +381,9 @@ class StateDiff:
                         l_node_shortened,
                         r_node.subnode,
                         path + r_node.key_segment,
-                        process_leaf_diff,
+                        left_parent=left_parent,
+                        right_parent=r_node,
+                        process_leaf_diff=process_leaf_diff,
                     )
                 # Left is prefix of right
                 elif r_node.key_segment.startswith(l_node.key_segment):
@@ -289,7 +398,9 @@ class StateDiff:
                         l_node.subnode,
                         r_node_shortened,
                         path + l_node.key_segment,
-                        process_leaf_diff,
+                        left_parent=l_node,
+                        right_parent=right_parent,
+                        process_leaf_diff=process_leaf_diff,
                     )
                 # Both are different -> Look for diffs in both sub-trees
                 else:
@@ -297,16 +408,22 @@ class StateDiff:
                         l_node.subnode,
                         None,
                         path + l_node.key_segment,
-                        process_leaf_diff,
+                        left_parent=l_node,
+                        right_parent=None,
+                        process_leaf_diff=process_leaf_diff,
                     )
                     self._compute_diff(
                         None,
                         r_node.subnode,
                         path + r_node.key_segment,
-                        process_leaf_diff,
+                        left_parent=None,
+                        right_parent=r_node,
+                        process_leaf_diff=process_leaf_diff,
                     )
 
             case (ExtensionNode(), BranchNode()):
+                check_extension_node(l_node, parent=left_parent)
+                check_branch_node(r_node)
                 # Match on the corresponding nibble of the extension key segment
                 for i in range(0, 16):
                     nibble = bytes([i])
@@ -316,17 +433,21 @@ class StateDiff:
                         if len(l_node.key_segment) == 1:
                             # Fully consumed by this nibble: compare to the subnode
                             l_node_to_compare = l_node.subnode
+                            left_parent = l_node
                         else:
                             l_node_to_compare = ExtensionNode(
                                 key_segment=Bytes(l_node.key_segment[1:]),
                                 subnode=l_node.subnode,
                             )
+                            left_parent = left_parent
                         # Remove the nibble from the extension key segment
                         self._compute_diff(
                             l_node_to_compare,
                             r_node.subnodes[i],
                             path + nibble,
-                            process_leaf_diff,
+                            left_parent=left_parent,
+                            right_parent=r_node,
+                            process_leaf_diff=process_leaf_diff,
                         )
                     else:
                         # Look for diffs in other branches
@@ -334,20 +455,27 @@ class StateDiff:
                             None,
                             r_node.subnodes[i],
                             path + nibble,
-                            process_leaf_diff,
+                            left_parent=None,
+                            right_parent=r_node,
+                            process_leaf_diff=process_leaf_diff,
                         )
 
             case (BranchNode(), None):
+                check_branch_node(l_node)
                 # Look for diffs in all branches of the left sub-tree
                 for i in range(0, 16):
                     self._compute_diff(
                         l_node.subnodes[i],
                         None,
                         path + bytes([i]),
-                        process_leaf_diff,
+                        left_parent=l_node,
+                        right_parent=None,
+                        process_leaf_diff=process_leaf_diff,
                     )
 
             case (BranchNode(), LeafNode()):
+                check_branch_node(l_node)
+                check_leaf_node(path, r_node)
                 # The branch was deleted and replaced by a single leaf.
                 # All branches - except the one whose first nibble matches the leaf's key - are deleted.
                 # The remaining branch is compared to the leaf.
@@ -361,7 +489,9 @@ class StateDiff:
                             l_node.subnodes[i],
                             None,
                             path + bytes([i]),
-                            process_leaf_diff,
+                            left_parent=l_node,
+                            right_parent=None,
+                            process_leaf_diff=process_leaf_diff,
                         )
                     else:
                         shortened_r_node = LeafNode(
@@ -371,7 +501,9 @@ class StateDiff:
                             l_node.subnodes[i],
                             shortened_r_node,
                             path + bytes([i]),
-                            process_leaf_diff,
+                            left_parent=l_node,
+                            right_parent=right_parent,
+                            process_leaf_diff=process_leaf_diff,
                         )
 
             case (BranchNode(), ExtensionNode()):
@@ -381,21 +513,39 @@ class StateDiff:
                     # we know that r_node.key_segment is not empty
                     # as extension nodes key_segment len is at least 1
                     if r_node.key_segment[0] == nibble:
+                        if len(r_node.key_segment) == 1:
+                            # Fully consumed by this nibble: compare to the subnode
+                            r_node_to_compare = r_node.subnode
+                            right_parent = r_node
+                        else:
+                            r_node_to_compare = ExtensionNode(
+                                key_segment=r_node.key_segment[1:],
+                                subnode=r_node.subnode,
+                            )
+                            right_parent = right_parent
                         # Remove the nibble from the extension key segment
-                        r_node.key_segment = r_node.key_segment[1:]
                         self._compute_diff(
                             l_node.subnodes[i],
-                            r_node.subnode,
+                            r_node_to_compare,
                             path + nibble,
-                            process_leaf_diff,
+                            left_parent=l_node,
+                            right_parent=right_parent,
+                            process_leaf_diff=process_leaf_diff,
                         )
                     else:
                         # Look for diffs in other branches
                         self._compute_diff(
-                            l_node.subnodes[i], None, path + nibble, process_leaf_diff
+                            l_node.subnodes[i],
+                            None,
+                            path + nibble,
+                            left_parent=l_node,
+                            right_parent=None,
+                            process_leaf_diff=process_leaf_diff,
                         )
 
             case (BranchNode(), BranchNode()):
+                check_branch_node(l_node)
+                check_branch_node(r_node)
                 # Look for diffs in all branches of the right sub-tree
                 for i in range(0, 16):
                     l_subnode = l_node.subnodes[i]
@@ -404,7 +554,9 @@ class StateDiff:
                         l_subnode,
                         r_subnode,
                         path + bytes([i]),
-                        process_leaf_diff,
+                        left_parent=l_node,
+                        right_parent=r_node,
+                        process_leaf_diff=process_leaf_diff,
                     )
 
             case _:
@@ -416,21 +568,32 @@ class StateDiff:
         self, path: Bytes32, left: Optional[LeafNode], right: Optional[LeafNode]
     ):
         address = self._address_preimages[path]
-        left_account = None if left is None else AccountNode.from_rlp(left.value)
-        right_account = None if right is None else AccountNode.from_rlp(right.value)
+        left_account = None if left is None else Account.from_rlp(left.value)
+        right_account = None if right is None else Account.from_rlp(right.value)
 
-        self._main_trie[address] = (left_account, right_account)
+        # If both accounts are the same, it's not a diff.
+        if left_account != right_account:
+            self._main_trie[address] = (left_account, right_account)
 
-        left_storage_root = None if left_account is None else left_account.storage_root
-        right_storage_root = (
-            None if right_account is None else right_account.storage_root
+        left_storage_root = (
+            EMPTY_TRIE_HASH if left_account is None else left_account.storage_root
         )
+        right_storage_root = (
+            EMPTY_TRIE_HASH if right_account is None else right_account.storage_root
+        )
+        if (
+            left_storage_root == EMPTY_TRIE_HASH
+            and right_storage_root == EMPTY_TRIE_HASH
+        ):
+            return
 
         self._compute_diff(
             left_storage_root,
             right_storage_root,
             b"",
-            partial(self._process_storage_diff, address=address),
+            left_parent=None,
+            right_parent=None,
+            process_leaf_diff=partial(self._process_storage_diff, address=address),
         )
 
     def _process_storage_diff(
@@ -442,34 +605,32 @@ class StateDiff:
     ):
         key = self._storage_key_preimages[path]
         left_decoded = (
-            U256(int.from_bytes(rlp.decode(left.value), "big")) if left else None
+            U256(int.from_bytes(rlp.decode(left.value), "big")) if left else U256(0)
         )
         right_decoded = (
-            U256(int.from_bytes(rlp.decode(right.value), "big")) if right else None
+            U256(int.from_bytes(rlp.decode(right.value), "big")) if right else U256(0)
         )
-        if left is None:
-            if address not in self._storage_tries:
-                self._storage_tries[address] = {}
-            self._storage_tries[address][key] = tuple((None, right_decoded))
-        elif right is None:
-            if address not in self._storage_tries:
-                self._storage_tries[address] = {}
-            self._storage_tries[address][key] = tuple((left_decoded, None))
-        else:
-            if address not in self._storage_tries:
-                self._storage_tries[address] = {}
-            self._storage_tries[address][key] = tuple((left_decoded, right_decoded))
+        # If both values are the same, it's not a diff.
+        if left_decoded == right_decoded:
+            return
+
+        # Values erased from the trie are considered being 0, not None.
+        if address not in self._storage_tries:
+            self._storage_tries[address] = {}
+        self._storage_tries[address][key] = tuple((left_decoded, right_decoded))
 
 
 def resolve(
-    node: Optional[Union[InternalNode, Extended]], nodes: Dict[Hash32, InternalNode]
+    node: Optional[Union[InternalNode, Extended]], nodes: Dict[Hash32, Bytes]
 ) -> InternalNode | None:
     if node is None or node == b"":
         return None
     if isinstance(node, InternalNode):
         return node
     if isinstance(node, bytes) and len(node) == 32:
-        return nodes.get(node)
+        if node not in nodes:
+            raise KeyError(f"Node not found: {node}")
+        return decode_node(nodes[node])
     if isinstance(node, list):
         return deserialize_to_internal_node(node)
     raise ValueError(f"Invalid node type: {type(node)}")

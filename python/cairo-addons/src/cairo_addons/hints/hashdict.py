@@ -8,7 +8,7 @@ from cairo_addons.hints.decorator import register_hint
 
 @register_hint
 def hashdict_read(dict_manager: DictManager, ids: VmConsts, memory: MemoryDict):
-    from starkware.cairo.lang.vm.crypto import poseidon_hash_many
+    from cairo_addons.vm import poseidon_hash_many
 
     dict_tracker = dict_manager.get_tracker(ids.dict_ptr)
     dict_tracker.current_ptr += ids.DictAccess.SIZE
@@ -42,7 +42,7 @@ def hashdict_read_from_key(
 
 @register_hint
 def hashdict_write(dict_manager: DictManager, ids: VmConsts, memory: MemoryDict):
-    from starkware.cairo.lang.vm.crypto import poseidon_hash_many
+    from cairo_addons.vm import poseidon_hash_many
 
     dict_tracker = dict_manager.get_tracker(ids.dict_ptr)
     dict_tracker.current_ptr += ids.DictAccess.SIZE
@@ -74,8 +74,8 @@ def get_keys_for_address_prefix(
     for i, preimage in enumerate(matching_preimages):
         ptr = segments.add()
         bytes32_base = segments.add()
-        segments.write_arg(bytes32_base, preimage[1:])
-        segments.write_arg(ptr, [preimage[0], bytes32_base])
+        segments.load_data(bytes32_base, preimage[1:])
+        segments.load_data(ptr, [preimage[0], bytes32_base])
         memory[base + i] = ptr
     ids.keys_len = len(matching_preimages)
     ids.keys = base
@@ -99,8 +99,8 @@ def get_storage_keys_for_address(
     for i, preimage in enumerate(matching_preimages):
         ptr = segments.add()
         bytes32_base = segments.add()
-        segments.write_arg(bytes32_base, preimage[1:])
-        segments.write_arg(ptr, [preimage[0], bytes32_base])
+        segments.load_data(bytes32_base, preimage[1:])
+        segments.load_data(ptr, [preimage[0], bytes32_base])
         memory[base + i] = ptr
     ids.keys_len = len(matching_preimages)
     ids.keys = base
@@ -112,7 +112,7 @@ def get_preimage_for_key(
     from cairo_addons.hints.hashdict import _get_preimage_for_hashed_key
 
     preimage = list(_get_preimage_for_hashed_key(ids.key, dict_manager))
-    segments.write_arg(ids.preimage_data, preimage)
+    segments.load_data(ids.preimage_data, preimage)
     ids.preimage_len = len(preimage)
 
 

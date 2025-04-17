@@ -290,7 +290,7 @@ def run_python_vm(
                 **(hint_locals or {}),
             },
             static_locals={
-                "debug_info": debug_info(cairo_program),
+                "debug_info": debug_info(cairo_program.debug_info),
                 "logger": context["logger"],
                 **(static_locals or {}),
             },
@@ -461,7 +461,7 @@ def run_rust_vm(
     request: FixtureRequest,
     coverage: Optional[Callable[[pl.DataFrame, int], pl.DataFrame]],
 ):
-    def _run(entrypoint, *args, **kwargs):
+    def _run(entrypoint, *args, verify_squashed_dicts: bool = False, **kwargs):
         # ============================================================================
         # STEP 1: SELECT PROGRAM AND PREPARE ENTRYPOINT METADATA
         # - Rationale: Determine which program contains the entrypoint (main or test)
@@ -508,6 +508,7 @@ def run_rust_vm(
             enable_traces=enable_traces,
             ordered_builtins=_builtins,
             cairo_file=cairo_file,
+            py_debug_info=cairo_program.debug_info,
         )
         serde = Serde(
             runner.segments, cairo_program.identifiers, runner.dict_manager, cairo_file
@@ -615,6 +616,11 @@ def run_rust_vm(
 
         runner.verify_secure_runner()
         runner.relocate()
+
+        if verify_squashed_dicts:
+            # Ensure all dicts are squashed properly
+            # (not implemented in python vm)
+            runner.verify_squashed_dicts()
 
         # ============================================================================
         # STEP 7: GENERATE OUTPUT FILES AND TRACE (IF REQUESTED)

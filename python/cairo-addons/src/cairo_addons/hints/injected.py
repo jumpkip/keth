@@ -75,6 +75,15 @@ def prepare_context(context: Callable[[], dict]):
 
     context()["_gen_arg"] = _gen_arg
 
+    from starkware.cairo.lang.cairo_constants import DEFAULT_PRIME
+
+    context()["PRIME"] = DEFAULT_PRIME
+
+    from cairo_addons.testing.hints import debug_info
+
+    if context().get("py_debug_info") is not None:
+        context()["debug_info"] = debug_info(context()["py_debug_info"])
+
 
 def initialize_hint_environment(context: Callable[[], dict]):
     """Initialize the hint environment with all necessary components.

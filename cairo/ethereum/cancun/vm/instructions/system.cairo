@@ -51,6 +51,7 @@ from ethereum.cancun.state import (
     move_ether,
     set_account_balance,
     get_account,
+    get_account_code,
     account_has_code_or_nonce,
     account_has_storage,
     increment_nonce,
@@ -132,11 +133,10 @@ func generic_call{
     let env = evm.value.env;
     let state = env.value.state;
     let account = get_account{state=state}(code_address);
+    let account_code = get_account_code{state=state}(code_address, account);
 
     EnvImpl.set_state{env=env}(state);
     EvmImpl.set_env(env);
-
-    let code = account.value.code;
 
     let is_static = bool(is_staticcall.value + evm.value.message.value.is_static.value);
 
@@ -174,7 +174,7 @@ func generic_call{
             value=value,
             data=calldata,
             code_address=maybe_address,
-            code=code,
+            code=account_code,
             depth=Uint(evm.value.message.value.depth.value + 1),
             should_transfer_value=should_transfer_value,
             is_static=is_static,

@@ -110,6 +110,7 @@ from ethereum.cancun.state import (
     destroy_account,
     destroy_touched_empty_accounts,
     get_account,
+    get_account_code,
     increment_nonce,
     set_account_balance,
     State,
@@ -117,7 +118,7 @@ from ethereum.cancun.state import (
     TransientStorageStruct,
     empty_transient_storage,
     process_withdrawal,
-    state_root,
+    finalize_state,
 )
 from ethereum.cancun.transactions_types import (
     TX_ACCESS_LIST_ADDRESS_COST,
@@ -179,7 +180,7 @@ from ethereum.utils.bytes import Bytes32_to_Bytes, Bytes32__eq__, Bytes256__eq__
 from cairo_core.comparison import is_zero
 
 from legacy.utils.array import count_not_zero
-from legacy.utils.dict import hashdict_write
+from legacy.utils.dict import hashdict_write, default_dict_finalize
 
 const ELASTICITY_MULTIPLIER = 2;
 const BASE_FEE_MAX_CHANGE_DENOMINATOR = 8;
@@ -833,7 +834,7 @@ func check_transaction{
     }
 
     // Empty code check for EOA
-    let sender_code = sender_account.value.code;
+    let sender_code = get_account_code{state=state}(sender_address, sender_account);
     with_attr error_message("InvalidBlock") {
         assert sender_code.value.len = 0;
     }
@@ -1036,7 +1037,9 @@ func apply_body{
 
     tempvar beacon_roots_address = Address(BEACON_ROOTS_ADDRESS);
     let beacon_roots_account = get_account(beacon_roots_address);
-    let beacon_block_roots_contract_code = beacon_roots_account.value.code;
+    let beacon_block_roots_contract_code = get_account_code{state=state}(
+        beacon_roots_address, beacon_roots_account
+    );
 
     let data = Bytes32_to_Bytes(parent_beacon_block_root);
     let code_address = OptionalAddress(&beacon_roots_address);
@@ -1130,6 +1133,23 @@ func apply_body{
 
     _process_withdrawals_inner{state=state, trie=withdrawals_trie}(0, withdrawals);
 
+    // Squash the receipts, transactions, and withdrawals dicts once they're no longer being modified.
+    default_dict_finalize(
+        cast(transactions_trie.value._data.value.dict_ptr_start, DictAccess*),
+        cast(transactions_trie.value._data.value.dict_ptr, DictAccess*),
+        0,
+    );
+    default_dict_finalize(
+        cast(receipts_trie.value._data.value.dict_ptr_start, DictAccess*),
+        cast(receipts_trie.value._data.value.dict_ptr, DictAccess*),
+        0,
+    );
+    default_dict_finalize(
+        cast(withdrawals_trie.value._data.value.dict_ptr_start, DictAccess*),
+        cast(withdrawals_trie.value._data.value.dict_ptr, DictAccess*),
+        0,
+    );
+
     // Compute all roots
     tempvar transaction_eth_trie = EthereumTries(
         new EthereumTriesEnum(
@@ -1177,7 +1197,8 @@ func apply_body{
     );
     let withdrawals_root = root(withdrawals_eth_trie, none_storage_roots);
 
-    let state_root_ = state_root(state);
+    // Finalize the state, getting unique keys for main and storage tries
+    finalize_state{state=state}();
 
     tempvar output = ApplyBodyOutput(
         new ApplyBodyOutputStruct(
@@ -1185,7 +1206,7 @@ func apply_body{
             transactions_root=transactions_root,
             receipt_root=receipts_root,
             block_logs_bloom=block_logs_bloom,
-            state_root=state_root_,
+            state_root=Bytes32(cast(0, Bytes32Struct*)),
             withdrawals_root=withdrawals_root,
             blob_gas_used=blob_gas_used,
         ),
@@ -1342,6 +1363,9 @@ func _process_withdrawals_inner{
     return _process_withdrawals_inner{state=state, trie=trie}(index + 1, withdrawals);
 }
 
+// @notice Given the historical blockchain and a block to execute, computes the STF on the initial state and updates the blockchain.
+// @dev: Note that the state_root of the new block is not computed in this `state_transition` function, and is replaced with a `0` instead.
+//       see `main.cairo`, the entrypoint of `Keth`.
 func state_transition{
     range_check_ptr,
     bitwise_ptr: BitwiseBuiltin*,
@@ -1399,10 +1423,10 @@ func state_transition{
         );
         assert transactions_root_equal.value = 1;
 
-        let state_root_equal = Bytes32__eq__(
-            output.value.state_root, block.value.header.value.state_root
-        );
-        assert state_root_equal.value = 1;
+        // Diff with EELS: Because our approach is based on state-diffs instead of re-computation of the
+        // state root, we don't check that the state root is equal to the one in the block.
+        // Instead, we assert that the State Transition is correct by ensuring the diffs it produces
+        // are the same as the one of the expected post-MPT.
 
         let receipt_root_equal = Bytes32__eq__(
             output.value.receipt_root, block.value.header.value.receipt_root

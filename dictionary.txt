@@ -24,6 +24,9 @@ BLOBBASEFEE
 BLOBHASH
 blockhash
 BLOCKHASH
+BLSF
+BLSP
+BLSPBLSP2
 branche
 bytearray
 bytecodelen
@@ -37,6 +40,7 @@ CALLDATASIZE
 callvalue
 CALLVALUE
 CASM
+ciphersuites
 cdylib
 CHAINID
 Clément
@@ -74,6 +78,7 @@ ecip
 ECMUL
 ECPAIRING
 elems
+elif
 elmt
 elmts
 elts
@@ -141,7 +146,6 @@ lambdaclass
 lastblockhash
 levelname
 libpython
-linefunc
 lllcversion
 makereport
 maturin
@@ -301,3 +305,11 @@ modelcontextprotocol
 equalto
 codehash
 PYTHONUNBUFFERED
+PYTHONPATH
+PYTHONHOME
+cpython
+flamegraph
+dotenvy
+pyproject
+unsquashed
+ptrs

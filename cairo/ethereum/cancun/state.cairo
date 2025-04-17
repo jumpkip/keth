@@ -33,6 +33,7 @@ from ethereum.cancun.fork_types import (
     ListTupleAddressBytes32,
     ListTupleAddressBytes32Struct,
 )
+from ethereum.crypto.hash import keccak256, EMPTY_HASH
 from ethereum.cancun.trie import (
     get_tuple_address_bytes32_preimage_for_key,
     root,
@@ -64,7 +65,7 @@ from ethereum.cancun.trie import (
     copy_TrieTupleAddressBytes32U256,
 )
 from ethereum.cancun.blocks import Withdrawal
-from ethereum_types.bytes import Bytes, Bytes32, Bytes32Struct
+from ethereum_types.bytes import Bytes, Bytes32, Bytes32Struct, BytesStruct, OptionalBytes
 from ethereum.crypto.hash import EMPTY_ROOT
 from ethereum_types.numeric import U256, U256Struct, Bool, bool, Uint
 from ethereum.utils.numeric import U256_le, U256_sub, U256_add, U256_mul
@@ -81,6 +82,7 @@ from legacy.utils.dict import (
     dict_update,
     dict_copy,
     default_dict_finalize,
+    dict_squash,
 )
 from ethereum.utils.hash_dicts import set_address_contains
 
@@ -210,6 +212,60 @@ func get_account_optional{poseidon_ptr: PoseidonBuiltin*, state: State}(
     return account;
 }
 
+// @notice Returns the code for the given account.
+// If the code is not cached, it is loaded from the program input. The program
+// input must contain a Dict[Tuple[Low, High], Bytes] where the key is the codehash
+// (in its cairo representation) and the value is the code.
+// @dev: Accesses to the `code` field __MUST__ be done using `get_account_code`.
+func get_account_code{
+    range_check_ptr,
+    bitwise_ptr: BitwiseBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
+    state: State,
+}(address: Address, account: Account) -> Bytes {
+    alloc_locals;
+
+    // Account code is already cached - return it
+    if (cast(account.value.code.value, felt) != 0) {
+        let res = Bytes(account.value.code.value);
+        return res;
+    }
+
+    // Account code is not cached - load it and ensure hash(code) == code_hash
+    let (code_) = alloc();
+    tempvar code = code_;
+    tempvar code_len: felt;
+    %{ get_code_from_hash %}
+    tempvar account_code = Bytes(new BytesStruct(data=code, len=code_len));
+
+    // Soundness checks: ensure that hash(account_code) == account.value.code_hash
+    let code_hash = keccak256(account_code);
+    with_attr error_message("AssertionError") {
+        assert code_hash.value.low = account.value.code_hash.value.low;
+        assert code_hash.value.high = account.value.code_hash.value.high;
+    }
+
+    // Store it in the state for later retrievals
+    tempvar account_with_code = OptionalAccount(
+        new AccountStruct(
+            nonce=account.value.nonce,
+            balance=account.value.balance,
+            code_hash=account.value.code_hash,
+            storage_root=account.value.storage_root,
+            code=OptionalBytes(account_code.value),
+        ),
+    );
+
+    set_account(address, account_with_code);
+
+    return account_code;
+}
+
+// @notice Returns the account for the given address.
+// If the account does not exist, returns the empty account.
+// @dev: The account returned by this function contains the right `codehash`, but the `code` field is lazily loaded.
+// Accesses to the `code` field __MUST__ be done using `get_account_code`.
 func get_account{poseidon_ptr: PoseidonBuiltin*, state: State}(address: Address) -> Account {
     let account = get_account_optional{state=state}(address);
 
@@ -310,7 +366,11 @@ func increment_nonce{poseidon_ptr: PoseidonBuiltin*, state: State}(address: Addr
     let new_nonce = account.value.nonce.value + 1;
     tempvar new_account = OptionalAccount(
         new AccountStruct(
-            Uint(new_nonce), account.value.balance, account.value.code, account.value.storage_root
+            nonce=Uint(new_nonce),
+            balance=account.value.balance,
+            code_hash=account.value.code_hash,
+            storage_root=account.value.storage_root,
+            code=account.value.code,
         ),
     );
     set_account(address, new_account);
@@ -504,19 +564,25 @@ func account_exists{poseidon_ptr: PoseidonBuiltin*, state: State}(address: Addre
 func account_has_code_or_nonce{poseidon_ptr: PoseidonBuiltin*, state: State}(
     address: Address
 ) -> bool {
+    alloc_locals;
+
     let account = get_account(address);
+    let (empty_hash_ptr) = get_label_location(EMPTY_HASH);
+    tempvar empty_hash = Bytes32(cast(empty_hash_ptr, Bytes32Struct*));
 
     if (account.value.nonce.value != 0) {
         tempvar res = bool(1);
         return res;
     }
 
-    if (account.value.code.value.len != 0) {
-        tempvar res = bool(1);
+    // Return 0 if codehash is hash(b"")
+    if (account.value.code_hash.value.low == empty_hash.value.low and
+        account.value.code_hash.value.high == empty_hash.value.high) {
+        tempvar res = bool(0);
         return res;
     }
 
-    tempvar res = bool(0);
+    let res = bool(1);
     return res;
 }
 
@@ -555,6 +621,8 @@ func account_has_storage{poseidon_ptr: PoseidonBuiltin*, state: State}(address: 
 func is_account_empty{poseidon_ptr: PoseidonBuiltin*, state: State}(address: Address) -> bool {
     // Get the account at the address
     let account = get_account(address);
+    let (empty_hash_ptr) = get_label_location(EMPTY_HASH);
+    tempvar empty_hash = Bytes32(cast(empty_hash_ptr, Bytes32Struct*));
 
     // Check if nonce is 0, code is empty, and balance is 0
     if (account.value.nonce.value != 0) {
@@ -562,7 +630,12 @@ func is_account_empty{poseidon_ptr: PoseidonBuiltin*, state: State}(address: Add
         return res;
     }
 
-    if (account.value.code.value.len != 0) {
+    // Check if codehash == hash(b"")
+    if (account.value.code_hash.value.low != empty_hash.value.low) {
+        tempvar res = bool(0);
+        return res;
+    }
+    if (account.value.code_hash.value.high != empty_hash.value.high) {
         tempvar res = bool(0);
         return res;
     }
@@ -815,7 +888,12 @@ func close_transaction{
     // If we're in the root state, we need to clear the created accounts
     let is_root_state = is_zero(cast(new_main_trie.value._data.value.parent_dict, felt));
     if (is_root_state != 0) {
-        // Clear created accounts
+        // Clear created accounts. Don't forget to squash the existing ones!
+        default_dict_finalize(
+            cast(state.value.created_accounts.value.dict_ptr_start, DictAccess*),
+            cast(state.value.created_accounts.value.dict_ptr, DictAccess*),
+            0,
+        );
         let (new_created_accounts_ptr) = default_dict_new(0);
         tempvar new_created_accounts = SetAddress(
             new SetAddressStruct(
@@ -823,9 +901,15 @@ func close_transaction{
                 dict_ptr=cast(new_created_accounts_ptr, SetAddressDictAccess*),
             ),
         );
+        [ap] = range_check_ptr, ap++;
+        [ap] = new_created_accounts.value, ap++;
     } else {
-        tempvar new_created_accounts = state.value.created_accounts;
+        [ap] = range_check_ptr, ap++;
+        [ap] = state.value.created_accounts.value, ap++;
     }
+
+    let range_check_ptr = [ap - 2];
+    let new_created_accounts = SetAddress(cast([ap - 1], SetAddressStruct*));
 
     tempvar state = State(
         new StateStruct(
@@ -885,17 +969,26 @@ func close_transaction{
     return ();
 }
 
-func set_code{poseidon_ptr: PoseidonBuiltin*, state: State}(address: Address, code: Bytes) {
-    // Get the current account
+func set_code{
+    range_check_ptr,
+    bitwise_ptr: BitwiseBuiltin*,
+    keccak_ptr: KeccakBuiltin*,
+    poseidon_ptr: PoseidonBuiltin*,
+    state: State,
+}(address: Address, code: Bytes) {
+    alloc_locals;
+
     let account = get_account(address);
+    let code_hash = keccak256(code);
 
     // Create new account with updated code
     tempvar new_account = OptionalAccount(
         new AccountStruct(
             nonce=account.value.nonce,
             balance=account.value.balance,
-            code=code,
+            code_hash=code_hash,
             storage_root=account.value.storage_root,
+            code=OptionalBytes(code.value),
         ),
     );
 
@@ -913,8 +1006,9 @@ func set_account_balance{poseidon_ptr: PoseidonBuiltin*, state: State}(
         new AccountStruct(
             nonce=account.value.nonce,
             balance=amount,
-            code=account.value.code,
+            code_hash=account.value.code_hash,
             storage_root=account.value.storage_root,
+            code=account.value.code,
         ),
     );
 
@@ -994,224 +1088,25 @@ func empty_transient_storage{range_check_ptr}() -> TransientStorage {
     return transient_storage;
 }
 
-func storage_roots{
-    range_check_ptr,
-    bitwise_ptr: BitwiseBuiltin*,
-    keccak_ptr: KeccakBuiltin*,
-    poseidon_ptr: PoseidonBuiltin*,
-}(state: State) -> MappingAddressBytes32 {
+// @notice Finalizes a `State` struct by squashing all of its field.
+// @dev Squashing the main_trie and storage_tries not only de-duplicates the keys, but also
+//      sorts them in ascending order of tuple (key, prev_value, new_value), which is important
+//      in the logic of producing state diffs.
+func finalize_state{range_check_ptr, state: State}() {
     alloc_locals;
-
-    if (cast(state.value._main_trie.value._data.value.parent_dict, felt) != 0) {
-        raise('AssertionError');
-    }
-
-    // Get the Trie[Tuple[Address, Bytes32], U256] storage tries, and squash them for unique keys
-    let storage_tries = state.value._storage_tries;
-    let storage_tries_start = cast(storage_tries.value._data.value.dict_ptr_start, DictAccess*);
-    let storage_tries_end = cast(storage_tries.value._data.value.dict_ptr, DictAccess*);
-
-    let (squashed_storage_tries_start, squashed_storage_tries_end) = default_dict_finalize(
-        storage_tries_start, storage_tries_end, cast(storage_tries.value.default.value, felt)
-    );
-
-    // Create a Mapping[Address, Trie[Bytes32, U256]] that will contain the "flat" tries, where we
-    // will get the storage trie of each address
-    let (map_addr_storage_start) = default_dict_new(0);
-    tempvar map_addr_storage = MappingAddressTrieBytes32U256(
-        new MappingAddressTrieBytes32U256Struct(
-            dict_ptr_start=cast(map_addr_storage_start, AddressTrieBytes32U256DictAccess*),
-            dict_ptr=cast(map_addr_storage_start, AddressTrieBytes32U256DictAccess*),
-            parent_dict=cast(0, MappingAddressTrieBytes32U256Struct*),
-        ),
-    );
-
-    build_map_addr_storage_trie{
-        map_addr_storage=map_addr_storage, storage_tries_ptr_end=squashed_storage_tries_end
-    }(squashed_storage_tries_start);
-
-    // Squash the Mapping[address, trie[bytes32, u256]] to iterate over each address
-    let (squashed_map_addr_storage_start, squashed_map_addr_storage_end) = default_dict_finalize(
-        cast(map_addr_storage.value.dict_ptr_start, DictAccess*),
-        cast(map_addr_storage.value.dict_ptr, DictAccess*),
-        0,
-    );
-
-    tempvar map_addr_storage = MappingAddressTrieBytes32U256(
-        new MappingAddressTrieBytes32U256Struct(
-            dict_ptr_start=cast(squashed_map_addr_storage_start, AddressTrieBytes32U256DictAccess*),
-            dict_ptr=cast(squashed_map_addr_storage_end, AddressTrieBytes32U256DictAccess*),
-            parent_dict=cast(0, MappingAddressTrieBytes32U256Struct*),
-        ),
-    );
-
-    // Create a Mapping[Address, Bytes32] that will contain the storage root of each address's
-    // storage trie
-    let (empty_root_ptr) = get_label_location(EMPTY_ROOT);
-    let (map_addr_storage_root_start) = default_dict_new(cast(empty_root_ptr, felt));
-    tempvar map_addr_storage_root = MappingAddressBytes32(
-        new MappingAddressBytes32Struct(
-            dict_ptr_start=cast(map_addr_storage_root_start, AddressBytes32DictAccess*),
-            dict_ptr=cast(map_addr_storage_root_start, AddressBytes32DictAccess*),
-            parent_dict=cast(0, MappingAddressBytes32Struct*),
-        ),
-    );
-
-    // Iterate over each address, and get the root of its storage trie
-    let map_addr_storage_ptr = cast(
-        squashed_map_addr_storage_start, AddressTrieBytes32U256DictAccess*
-    );
-    let map_addr_storage_ptr_end = cast(
-        squashed_map_addr_storage_end, AddressTrieBytes32U256DictAccess*
-    );
-    build_map_addr_storage_root{
-        map_addr_storage_root=map_addr_storage_root,
-        map_addr_storage_ptr_end=map_addr_storage_ptr_end,
-    }(map_addr_storage_ptr);
-
-    return map_addr_storage_root;
-}
-
-// @notice Builds a Mapping[Address, Bytes32] that contains the storage root of each address's
-// storage trie
-// @param map_addr_storage_root The mapping to write to
-// @param map_addr_storage_ptr The pointer to the current address in the Mapping[Address, Trie[Bytes32, U256]]
-// @param map_addr_storage_ptr_end The end of the Mapping[Address, Trie[Bytes32, U256]]
-func build_map_addr_storage_root{
-    range_check_ptr,
-    bitwise_ptr: BitwiseBuiltin*,
-    keccak_ptr: KeccakBuiltin*,
-    poseidon_ptr: PoseidonBuiltin*,
-    map_addr_storage_root: MappingAddressBytes32,
-    map_addr_storage_ptr_end: AddressTrieBytes32U256DictAccess*,
-}(map_addr_storage_ptr: AddressTrieBytes32U256DictAccess*) {
-    alloc_locals;
-
-    if (map_addr_storage_ptr == map_addr_storage_ptr_end) {
-        return ();
-    }
-
-    let address = map_addr_storage_ptr.key;
-    let storage_trie = map_addr_storage_ptr.new_value;
-
-    tempvar union_trie = EthereumTries(
-        new EthereumTriesEnum(
-            account=TrieAddressOptionalAccount(cast(0, TrieAddressOptionalAccountStruct*)),
-            storage=storage_trie,
-            transaction=TrieBytesOptionalUnionBytesLegacyTransaction(
-                cast(0, TrieBytesOptionalUnionBytesLegacyTransactionStruct*)
-            ),
-            receipt=TrieBytesOptionalUnionBytesReceipt(
-                cast(0, TrieBytesOptionalUnionBytesReceiptStruct*)
-            ),
-            withdrawal=TrieBytesOptionalUnionBytesWithdrawal(
-                cast(0, TrieBytesOptionalUnionBytesWithdrawalStruct*)
-            ),
-        ),
-    );
-
-    let storage_root = root(
-        union_trie, OptionalMappingAddressBytes32(cast(0, MappingAddressBytes32Struct*))
-    );
-
-    mapping_address_bytes32_write{mapping=map_addr_storage_root}(address, storage_root);
-
-    // Squash the Trie[Bytes32, U256] - it won't ever be used again.
-    let trie_ptr_start = storage_trie.value._data.value.dict_ptr_start;
-    let trie_ptr_end = storage_trie.value._data.value.dict_ptr;
-    default_dict_finalize(
-        cast(trie_ptr_start, DictAccess*),
-        cast(trie_ptr_end, DictAccess*),
-        cast(storage_trie.value.default.value, felt),
-    );
-
-    return build_map_addr_storage_root(map_addr_storage_ptr + DictAccess.SIZE);
-}
-
-// @notice Builds a Mapping[Address, Trie[Bytes32, U256]] that contains the storage trie of each
-// address
-// @param map_addr_storage The mapping to write to
-// @param storage_tries_ptr The pointer to the current entry in the Trie[Tuple[Address, Bytes32], U256]
-// @param storage_tries_ptr_end The end of the Trie[Tuple[Address, Bytes32], U256]
-func build_map_addr_storage_trie{
-    range_check_ptr,
-    poseidon_ptr: PoseidonBuiltin*,
-    map_addr_storage: MappingAddressTrieBytes32U256,
-    storage_tries_ptr_end: DictAccess*,
-}(storage_tries_ptr: DictAccess*) {
-    alloc_locals;
-
-    if (storage_tries_ptr == storage_tries_ptr_end) {
-        return ();
-    }
-
-    // Skip all None values, which are deleted trie entries. We don't need them to compute
-    // the storage roots.
-    if (cast(storage_tries_ptr.new_value, felt) == 0) {
-        return build_map_addr_storage_trie(storage_tries_ptr + DictAccess.SIZE);
-    }
-
-    let tup_address_b32 = get_tuple_address_bytes32_preimage_for_key(
-        storage_tries_ptr.key, storage_tries_ptr_end
-    );
-    build_storage_trie_for_address(
-        tup_address_b32.value.address,
-        tup_address_b32.value.bytes32,
-        U256(cast(storage_tries_ptr.new_value, U256Struct*)),
-    );
-
-    return build_map_addr_storage_trie(storage_tries_ptr + DictAccess.SIZE);
-}
-
-// @notice Modifies a Trie[Bytes32, U256], the storage trie of an address, and adds it to the
-// Mapping[Address, Trie[Bytes32, U256]]
-// @param address The address to build the storage trie for
-// @param key The key to add to the storage trie
-// @param value The value to add to the storage trie
-func build_storage_trie_for_address{
-    range_check_ptr, poseidon_ptr: PoseidonBuiltin*, map_addr_storage: MappingAddressTrieBytes32U256
-}(address: Address, key: Bytes32, value: U256) {
-    alloc_locals;
-
-    let dict_ptr = cast(map_addr_storage.value.dict_ptr, DictAccess*);
-
-    // Get storage trie for address
-    let trie = mapping_address_trie_bytes32_u256_read{mapping=map_addr_storage}(address);
-
-    // Modify storage trie for address
-    trie_set_TrieBytes32U256{poseidon_ptr=poseidon_ptr, trie=trie}(key, value);
-
-    // Update the mapping address -> trie
-    mapping_address_trie_bytes32_u256_write{mapping=map_addr_storage}(address, trie);
-
-    return ();
-}
-
-func state_root{
-    range_check_ptr,
-    bitwise_ptr: BitwiseBuiltin*,
-    keccak_ptr: KeccakBuiltin*,
-    poseidon_ptr: PoseidonBuiltin*,
-}(state: State) -> Bytes32 {
-    alloc_locals;
-
-    if (cast(state.value._main_trie.value._data.value.parent_dict, felt) != 0) {
-        raise('AssertionError');
-    }
-
     // Squash the main trie for unique keys
     let main_trie = state.value._main_trie;
     let main_trie_start = cast(main_trie.value._data.value.dict_ptr_start, DictAccess*);
     let main_trie_end = cast(main_trie.value._data.value.dict_ptr, DictAccess*);
 
-    let (squashed_main_trie_start, squashed_main_trie_end) = default_dict_finalize(
-        main_trie_start, main_trie_end, cast(main_trie.value.default.value, felt)
+    let (squashed_main_trie_start, squashed_main_trie_end) = dict_squash(
+        main_trie_start, main_trie_end
     );
 
     tempvar squashed_main_trie = TrieAddressOptionalAccount(
         new TrieAddressOptionalAccountStruct(
-            secured=bool(1),
-            default=OptionalAccount(cast(0, AccountStruct*)),
+            secured=state.value._main_trie.value.secured,
+            default=state.value._main_trie.value.default,
             _data=MappingAddressAccount(
                 new MappingAddressAccountStruct(
                     dict_ptr_start=cast(squashed_main_trie_start, AddressAccountDictAccess*),
@@ -1222,98 +1117,128 @@ func state_root{
         ),
     );
 
-    let storage_roots_ = storage_roots(state);
+    // Get the Trie[Tuple[Address, Bytes32], U256] storage tries, and squash them for unique keys
+    let storage_tries = state.value._storage_tries;
+    let storage_tries_start = cast(storage_tries.value._data.value.dict_ptr_start, DictAccess*);
+    let storage_tries_end = cast(storage_tries.value._data.value.dict_ptr, DictAccess*);
 
-    tempvar trie_union = EthereumTries(
-        new EthereumTriesEnum(
-            account=squashed_main_trie,
-            storage=TrieBytes32U256(cast(0, TrieBytes32U256Struct*)),
-            transaction=TrieBytesOptionalUnionBytesLegacyTransaction(
-                cast(0, TrieBytesOptionalUnionBytesLegacyTransactionStruct*)
-            ),
-            receipt=TrieBytesOptionalUnionBytesReceipt(
-                cast(0, TrieBytesOptionalUnionBytesReceiptStruct*)
-            ),
-            withdrawal=TrieBytesOptionalUnionBytesWithdrawal(
-                cast(0, TrieBytesOptionalUnionBytesWithdrawalStruct*)
-            ),
-        ),
+    let (squashed_storage_tries_start, squashed_storage_tries_end) = dict_squash(
+        storage_tries_start, storage_tries_end
     );
 
-    let state_root = root(trie_union, OptionalMappingAddressBytes32(storage_roots_.value));
-    return state_root;
-}
-
-// Utils function, porting this to a module would incur a lot of refactoring due to circular imports
-func mapping_address_trie_bytes32_u256_read{
-    range_check_ptr, mapping: MappingAddressTrieBytes32U256
-}(key: Address) -> TrieBytes32U256 {
-    alloc_locals;
-    let dict_ptr = cast(mapping.value.dict_ptr, DictAccess*);
-    let (value_ptr) = dict_read{dict_ptr=dict_ptr}(key.value);
-
-    if (cast(value_ptr, felt) == 0) {
-        tempvar default = new U256Struct(0, 0);
-        let (segment_start) = default_dict_new(cast(default, felt));
-        tempvar trie_ptr = new TrieBytes32U256Struct(
-            secured=bool(1),
-            default=U256(default),
-            _data=MappingBytes32U256(
-                new MappingBytes32U256Struct(
-                    dict_ptr_start=cast(segment_start, Bytes32U256DictAccess*),
-                    dict_ptr=cast(segment_start, Bytes32U256DictAccess*),
-                    parent_dict=cast(0, MappingBytes32U256Struct*),
+    // Update the state by rebinding the squashed storage tries
+    tempvar squashed_storage_tries = TrieTupleAddressBytes32U256(
+        new TrieTupleAddressBytes32U256Struct(
+            secured=storage_tries.value.secured,
+            default=storage_tries.value.default,
+            _data=MappingTupleAddressBytes32U256(
+                new MappingTupleAddressBytes32U256Struct(
+                    dict_ptr_start=cast(
+                        squashed_storage_tries_start, TupleAddressBytes32U256DictAccess*
+                    ),
+                    dict_ptr=cast(squashed_storage_tries_end, TupleAddressBytes32U256DictAccess*),
+                    parent_dict=cast(0, MappingTupleAddressBytes32U256Struct*),
                 ),
             ),
-        );
-    } else {
-        tempvar trie_ptr = cast(value_ptr, TrieBytes32U256Struct*);
-    }
-
-    tempvar mapping = MappingAddressTrieBytes32U256(
-        new MappingAddressTrieBytes32U256Struct(
-            dict_ptr_start=mapping.value.dict_ptr_start,
-            dict_ptr=cast(dict_ptr, AddressTrieBytes32U256DictAccess*),
-            parent_dict=mapping.value.parent_dict,
         ),
     );
-    let trie = TrieBytes32U256(trie_ptr);
-    return trie;
-}
 
-// Utils function, porting this to a module would incur a lot of refactoring due to circular imports
-func mapping_address_trie_bytes32_u256_write{
-    range_check_ptr, mapping: MappingAddressTrieBytes32U256
-}(key: Address, value: TrieBytes32U256) {
-    alloc_locals;
-    let dict_ptr = cast(mapping.value.dict_ptr, DictAccess*);
-    let value_felt = cast(value.value, felt);
-    dict_write{dict_ptr=dict_ptr}(key.value, value_felt);
+    // Squash the created_accounts mapping for soundness
+    let created_accounts = state.value.created_accounts;
+    let created_accounts_start = cast(created_accounts.value.dict_ptr_start, DictAccess*);
+    let created_accounts_end = cast(created_accounts.value.dict_ptr, DictAccess*);
 
-    tempvar mapping = MappingAddressTrieBytes32U256(
-        new MappingAddressTrieBytes32U256Struct(
-            dict_ptr_start=mapping.value.dict_ptr_start,
-            dict_ptr=cast(dict_ptr, AddressTrieBytes32U256DictAccess*),
-            parent_dict=mapping.value.parent_dict,
+    let (squashed_created_accounts_start, squashed_created_accounts_end) = dict_squash(
+        created_accounts_start, created_accounts_end
+    );
+
+    tempvar squashed_created_accounts = SetAddress(
+        new SetAddressStruct(
+            dict_ptr_start=cast(squashed_created_accounts_start, SetAddressDictAccess*),
+            dict_ptr=cast(squashed_created_accounts_end, SetAddressDictAccess*),
         ),
     );
+
+    // Squash the original_storage_tries mapping for soundness
+    let original_storage_tries = state.value.original_storage_tries;
+    let original_storage_tries_start = cast(
+        original_storage_tries.value._data.value.dict_ptr_start, DictAccess*
+    );
+    let original_storage_tries_end = cast(
+        original_storage_tries.value._data.value.dict_ptr, DictAccess*
+    );
+
+    let (squashed_original_storage_tries_start, squashed_original_storage_tries_end) = dict_squash(
+        original_storage_tries_start, original_storage_tries_end
+    );
+    tempvar squashed_original_storage_tries = TrieTupleAddressBytes32U256(
+        new TrieTupleAddressBytes32U256Struct(
+            secured=original_storage_tries.value.secured,
+            default=original_storage_tries.value.default,
+            _data=MappingTupleAddressBytes32U256(
+                new MappingTupleAddressBytes32U256Struct(
+                    dict_ptr_start=cast(
+                        squashed_original_storage_tries_start, TupleAddressBytes32U256DictAccess*
+                    ),
+                    dict_ptr=cast(
+                        squashed_original_storage_tries_end, TupleAddressBytes32U256DictAccess*
+                    ),
+                    parent_dict=cast(0, MappingTupleAddressBytes32U256Struct*),
+                ),
+            ),
+        ),
+    );
+
+    // Re-bind the state with the squashed dicts
+    tempvar state = State(
+        new StateStruct(
+            _main_trie=squashed_main_trie,
+            _storage_tries=squashed_storage_tries,
+            created_accounts=squashed_created_accounts,
+            original_storage_tries=squashed_original_storage_tries,
+        ),
+    );
+
     return ();
 }
 
-// Utils function, porting this to a module would incur a lot of refactoring due to circular imports
-func mapping_address_bytes32_write{range_check_ptr, mapping: MappingAddressBytes32}(
-    key: Address, value: Bytes32
-) {
+// @notice Finalizes a `TransientStorage` struct by squashing all of its field.
+func finalize_transient_storage{range_check_ptr, transient_storage: TransientStorage}() {
     alloc_locals;
-    let dict_ptr = cast(mapping.value.dict_ptr, DictAccess*);
-    let value_felt = cast(value.value, felt);
-    dict_write{dict_ptr=dict_ptr}(key.value, value_felt);
-    tempvar mapping = MappingAddressBytes32(
-        new MappingAddressBytes32Struct(
-            dict_ptr_start=mapping.value.dict_ptr_start,
-            dict_ptr=cast(dict_ptr, AddressBytes32DictAccess*),
-            parent_dict=mapping.value.parent_dict,
+
+    let transient_storage_tries = transient_storage.value._tries;
+    let transient_storage_tries_start = cast(
+        transient_storage_tries.value._data.value.dict_ptr_start, DictAccess*
+    );
+    let transient_storage_tries_end = cast(
+        transient_storage_tries.value._data.value.dict_ptr, DictAccess*
+    );
+
+    let (
+        squashed_transient_storage_tries_start, squashed_transient_storage_tries_end
+    ) = dict_squash(transient_storage_tries_start, transient_storage_tries_end);
+
+    tempvar squashed_transient_storage_tries = TrieTupleAddressBytes32U256(
+        new TrieTupleAddressBytes32U256Struct(
+            secured=transient_storage_tries.value.secured,
+            default=transient_storage_tries.value.default,
+            _data=MappingTupleAddressBytes32U256(
+                new MappingTupleAddressBytes32U256Struct(
+                    dict_ptr_start=cast(
+                        squashed_transient_storage_tries_start, TupleAddressBytes32U256DictAccess*
+                    ),
+                    dict_ptr=cast(
+                        squashed_transient_storage_tries_end, TupleAddressBytes32U256DictAccess*
+                    ),
+                    parent_dict=cast(0, MappingTupleAddressBytes32U256Struct*),
+                ),
+            ),
         ),
     );
+
+    tempvar transient_storage = TransientStorage(
+        new TransientStorageStruct(_tries=squashed_transient_storage_tries)
+    );
+
     return ();
 }

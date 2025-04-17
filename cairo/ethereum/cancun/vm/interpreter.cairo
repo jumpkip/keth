@@ -24,8 +24,14 @@ from ethereum.cancun.fork_types import (
     SetTupleAddressBytes32DictAccess,
 )
 
+from ethereum.cancun.trie import TrieTupleAddressBytes32U256, TrieTupleAddressBytes32U256Struct
 from ethereum.cancun.vm.evm_impl import Evm, EvmStruct, Message
-from ethereum.cancun.vm.env_impl import Environment, EnvironmentStruct, EnvImpl
+from ethereum.cancun.vm.env_impl import (
+    Environment,
+    EnvironmentStruct,
+    EnvImpl,
+    finalize_transient_storage,
+)
 
 from ethereum.cancun.utils.constants import STACK_DEPTH_LIMIT, MAX_CODE_SIZE
 from ethereum.cancun.vm.exceptions import (
@@ -44,6 +50,7 @@ from ethereum.cancun.vm.runtime import get_valid_jump_destinations, finalize_jum
 from ethereum.cancun.vm.stack import Stack, StackStruct, StackDictAccess
 from ethereum.utils.numeric import U256, U256Struct, U256__eq__
 from ethereum.cancun.state import (
+    StateImpl,
     account_exists_and_is_empty,
     account_has_code_or_nonce,
     account_has_storage,
@@ -472,6 +479,7 @@ func process_message_call{
         if (has_collision.value + has_storage.value != FALSE) {
             // Return early with collision error
             tempvar collision_error = new EthereumException(AddressCollision);
+            finalize_message(message);
             let msg = create_empty_message_call_output(Uint(0), collision_error);
             return msg;
         }
@@ -490,12 +498,16 @@ func process_message_call{
     } else {
         // Regular message call path
         let evm = process_message(message, env);
+        // Re-bind the evm's mutated `env` object to the original `env` object.
+        let env = evm.value.env;
 
-        // Check if account exists and is empty
-        let state = evm.value.env.value.state;
+        // Check if account exists and is empty - and rebind the `evm` object with the mutated env.state.
+        let state = env.value.state;
         let is_empty = account_exists_and_is_empty{state=state}(
             [message.value.target.value.address]
         );
+        EnvImpl.set_state{env=env}(state);
+        EvmImpl.set_env{evm=evm}(env);
 
         if (is_empty.value != FALSE) {
             // Add to touched accounts
@@ -530,8 +542,6 @@ func process_message_call{
             tempvar mul_mod_ptr = mul_mod_ptr;
             tempvar evm = evm;
         }
-        EnvImpl.set_state{env=env}(state);
-        EvmImpl.set_env{evm=evm}(env);
         tempvar range_check_ptr = range_check_ptr;
         tempvar bitwise_ptr = bitwise_ptr;
         tempvar keccak_ptr = keccak_ptr;
@@ -554,7 +564,7 @@ func process_message_call{
 
     // Prepare return values based on error state
     if (cast(evm.value.error, felt) != 0) {
-        squash_evm{evm=evm}();
+        finalize_evm{evm=evm}();
         let msg = create_empty_message_call_output(evm.value.gas_left, evm.value.error);
         return msg;
     }
@@ -562,7 +572,7 @@ func process_message_call{
     assert [range_check_ptr] = evm.value.refund_counter;
     let range_check_ptr = range_check_ptr + 1;
 
-    squash_evm{evm=evm}();
+    finalize_evm{evm=evm}();
 
     let squashed_evm = evm;
     %{
@@ -632,8 +642,33 @@ func create_empty_message_call_output(
     return msg;
 }
 
-// @dev Finalizes an `Evm` struct by squashing all of its fields except for Environment.
-func squash_evm{range_check_ptr, evm: Evm}() {
+// @notice Finalizes a `Message` struct by squashing its inner dicts
+func finalize_message{range_check_ptr}(message: Message) {
+    alloc_locals;
+
+    // INVARIANT: this should always be 0 as finalize_message can only be called on a create_tx that has a collision.
+    assert cast(message.value.parent_evm.value, felt) = 0;
+
+    let accessed_addresses = message.value.accessed_addresses;
+    let accessed_addresses_start = accessed_addresses.value.dict_ptr_start;
+    let accessed_addresses_end = cast(accessed_addresses.value.dict_ptr, DictAccess*);
+    default_dict_finalize(cast(accessed_addresses_start, DictAccess*), accessed_addresses_end, 0);
+
+    let accessed_storage_keys = message.value.accessed_storage_keys;
+    let accessed_storage_keys_start = accessed_storage_keys.value.dict_ptr_start;
+    let accessed_storage_keys_end = cast(accessed_storage_keys.value.dict_ptr, DictAccess*);
+    default_dict_finalize(
+        cast(accessed_storage_keys_start, DictAccess*), accessed_storage_keys_end, 0
+    );
+
+    return ();
+}
+
+// @notice Finalizes an `Evm` struct by squashing all of its fields except for the `state`'s main_trie
+// and storage_tries inside the Environment - which is only finalized after processing full blocks.
+// There's no need to finalize the inner `message` as well - as its dicts (accessed_addresses, accessed_storage_keys, etc)
+// are inlined in the `Evm` struct already - and the message is not consumed again after the `Evm` is finalized.
+func finalize_evm{range_check_ptr, evm: Evm}() {
     alloc_locals;
 
     // Squash stack
@@ -746,6 +781,27 @@ func squash_evm{range_check_ptr, evm: Evm}() {
         ),
     );
 
+    let env = evm.value.env;
+    let transient_storage = env.value.transient_storage;
+    finalize_transient_storage{transient_storage=transient_storage}();
+    EnvImpl.set_transient_storage{env=env}(transient_storage);
+
+    // The `original_storage_tries` are specific to each transaction in the block - and as such MUST be squashed and reset
+    // at the end of each execution.
+    // Consequently, we must also set back the `parent_dict` of the `main_trie` to `0`
+    let state = env.value.state;
+    let original_storage_tries = state.value.original_storage_tries;
+    dict_squash(
+        cast(original_storage_tries.value._data.value.dict_ptr_start, DictAccess*),
+        cast(original_storage_tries.value._data.value.dict_ptr, DictAccess*),
+    );
+    StateImpl.set_original_storage_tries{state=state}(
+        TrieTupleAddressBytes32U256(cast(0, TrieTupleAddressBytes32U256Struct*))
+    );
+    // INVARIANT: there should not be a parent_dict to the main_trie at this point.
+    assert cast(state.value._main_trie.value._data.value.parent_dict, felt) = 0;
+    EnvImpl.set_state{env=env}(state);
+
     // Rebind all dicts to the evm struct
     tempvar evm = Evm(
         new EvmStruct(
@@ -754,7 +810,7 @@ func squash_evm{range_check_ptr, evm: Evm}() {
             memory=new_memory,
             code=evm.value.code,
             gas_left=evm.value.gas_left,
-            env=evm.value.env,
+            env=env,
             valid_jump_destinations=new_valid_jump_destinations,
             logs=evm.value.logs,
             refund_counter=evm.value.refund_counter,

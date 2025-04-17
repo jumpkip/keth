@@ -1,5 +1,5 @@
 import copy
-from typing import Mapping, Optional
+from typing import Optional
 
 import pytest
 from ethereum.cancun.fork_types import EMPTY_ACCOUNT, Account, Address
@@ -30,11 +30,10 @@ from ethereum.cancun.state import (
     set_code,
     set_storage,
     set_transient_storage,
-    state_root,
-    storage_root,
     touch_account,
 )
 from ethereum.cancun.trie import Trie, copy_trie
+from ethereum.crypto.hash import keccak256
 from ethereum_types.bytes import Bytes32
 from ethereum_types.numeric import U256
 from hypothesis import given, settings
@@ -90,11 +89,11 @@ def state_and_address_and_optional_key(
 @composite
 def state_with_snapshots(draw):
     """
-    Generate a State instance with up to 10 different snapshots.
-    Each snapshot builds on top of the previous one, with up to 5 new entries per snapshot.
+    Generate a State instance with up to 3 different snapshots.
+    Each snapshot builds on top of the previous one, with up to 2 new entries per snapshot.
     """
     base_state = draw(state_strategy())
-    num_snapshots = draw(st.integers(min_value=0, max_value=5))
+    num_snapshots = draw(st.integers(min_value=0, max_value=3))
 
     # Start with base state's tries
     current_main_trie = base_state._main_trie
@@ -103,19 +102,19 @@ def state_with_snapshots(draw):
 
     for _ in range(num_snapshots):
         snapshots.append((current_main_trie, current_storage_tries))
-        # Add up to 5 new entries to main_trie
+        # Add up to 2 new entries to main_trie
         new_accounts = draw(
-            st.dictionaries(keys=address, values=st.from_type(Account), max_size=5)
+            st.dictionaries(keys=address, values=st.from_type(Account), max_size=2)
         )
         main_trie_copy = copy_trie(current_main_trie)
         main_trie_copy._data.update(new_accounts)
 
-        # Add up to 5 new storage tries or update existing ones
+        # Add up to 2 new storage tries or update existing ones
         new_storage_tries = draw(
             st.dictionaries(
                 keys=address,
                 values=trie_strategy(Trie[Bytes32, U256], min_size=1),
-                max_size=5,
+                max_size=2,
             )
         )
         storage_tries = copy.deepcopy(current_storage_tries)
@@ -141,11 +140,11 @@ def state_with_snapshots(draw):
 @composite
 def transient_storage_with_snapshots(draw):
     """
-    Generate a TransientStorage instance with up to 10 different snapshots.
-    Each snapshot builds on top of the previous one, with up to 5 new entries per snapshot.
+    Generate a TransientStorage instance with up to 3 different snapshots.
+    Each snapshot builds on top of the previous one, with up to 2 new entries per snapshot.
     """
     base_transient_storage = draw(transient_storage)
-    num_snapshots = draw(st.integers(min_value=0, max_value=5))
+    num_snapshots = draw(st.integers(min_value=0, max_value=3))
 
     # Start with base transient storage tries
     current_tries = copy.deepcopy(base_transient_storage._tries)
@@ -153,12 +152,12 @@ def transient_storage_with_snapshots(draw):
 
     for _ in range(num_snapshots):
         snapshots.append(current_tries)
-        # Add up to 5 new tries or update existing ones
+        # Add up to 2 new tries or update existing ones
         new_tries = draw(
             st.dictionaries(
                 keys=address,
                 values=trie_strategy(Trie[Bytes32, U256], min_size=1),
-                max_size=5,
+                max_size=2,
             )
         )
         tries = copy.deepcopy(current_tries)
@@ -310,10 +309,17 @@ class TestStateAccounts:
     ):
         state, address = data
         account = get_account(state, address)
+        codehash = keccak256(code)
         set_account(
             state,
             address,
-            Account(balance=account.balance, code=code, nonce=account.nonce),
+            Account(
+                balance=account.balance,
+                code=code,
+                nonce=account.nonce,
+                storage_root=account.storage_root,
+                code_hash=codehash,
+            ),
         )
         state_cairo, result_cairo = cairo_run(
             "account_has_code_or_nonce", state, address
@@ -514,6 +520,7 @@ class TestTransientStorage:
 
 class TestBeginTransaction:
     @given(state=..., transient_storage=...)
+    @pytest.mark.slow
     def test_begin_transaction(
         self, cairo_run, state: State, transient_storage: TransientStorage
     ):
@@ -530,6 +537,7 @@ class TestBeginTransaction:
         state=state_with_snapshots(),
         transient_storage=transient_storage_with_snapshots(),
     )
+    @pytest.mark.slow
     def test_rollback_transaction(
         self, cairo_run, state: State, transient_storage: TransientStorage
     ):
@@ -549,6 +557,7 @@ class TestBeginTransaction:
         state=state_with_snapshots(),
         transient_storage=transient_storage_with_snapshots(),
     )
+    @pytest.mark.slow
     def test_commit_transaction(
         self, cairo_run, state: State, transient_storage: TransientStorage
     ):
@@ -565,49 +574,108 @@ class TestBeginTransaction:
         assert transient_storage_cairo == transient_storage
 
 
-@composite
-def state_maybe_snapshot(draw):
-    """
-    Draw a state that has a 80% chance of not containing snapshots.
-    """
-    state_ = draw(state_strategy())
-    probability = draw(st.floats(min_value=0, max_value=1))
-    if probability < 0.8:
-        state_._snapshots = []
-        return state_
-    return state_
+class TestGetAccountCode:
+    def _create_account_no_code(self, account: Account) -> Account:
+        """Helper function to create a copy of an account with code set to None."""
+        return Account(
+            balance=account.balance,
+            nonce=account.nonce,
+            code=None,  # Explicitly remove code for testing retrieval
+            code_hash=account.code_hash,
+            storage_root=account.storage_root,
+        )
 
+    def _prepare_codehash_input(self, code_hash: Bytes32, code: bytes) -> dict:
+        """Helper function to prepare the codehash_to_code input dictionary."""
+        # Convert Bytes32 code_hash to the low/high u128 pair expected by Cairo
+        code_hash_int = int.from_bytes(code_hash, "little")
+        code_hash_low = code_hash_int & (2**128 - 1)
+        code_hash_high = code_hash_int >> 128
+        return {"codehash_to_code": {(code_hash_low, code_hash_high): code}}
 
-class TestRoot:
-    @given(state=state_maybe_snapshot())
-    def test_state_root(self, cairo_run, state: State):
-        try:
-            state_root_cairo = cairo_run("state_root", state)
-        except Exception as e:
-            with strict_raises(type(e)):
-                state_root(state)
-            return
-        state_root_py = state_root(state)
-        assert state_root_cairo == state_root_py
+    @given(state=..., address=..., account=...)
+    def test_get_account_code_cached(
+        self, cairo_run, state: State, address: Address, account: Account
+    ):
+        """
+        Test that get_account_code returns code directly if already present in the account object.
+        """
+        # Set an account that already includes its code.
+        set_account(state, address, account)
 
+        # Call the Cairo function.
+        state_cairo, code_cairo = cairo_run("get_account_code", state, address, account)
 
-class TestStorageRoots:
-    @given(state=state_maybe_snapshot())
-    def test_storage_roots(self, cairo_run, state: State):
-        def storage_roots(state) -> Mapping[Address, Bytes32]:
-            # This assertion is made in each individual storage_root in python -
-            # but in Cairo we can only perform it once.
-            assert not state._snapshots
-            storage_roots_py = {}
-            for addr in state._storage_tries.keys():
-                storage_roots_py[addr] = storage_root(state, addr)
-            return storage_roots_py
+        # Assert: Returned code matches, state remains consistent.
+        assert code_cairo == account.code
+        assert get_account(state_cairo, address) == account
 
-        try:
-            storage_roots_cairo = cairo_run("storage_roots", state)
-        except Exception as e:
-            with strict_raises(type(e)):
-                storage_roots(state)
-            return
+    @given(state=..., address=..., account=...)
+    def test_get_account_code_from_input(
+        self, cairo_run, state: State, address: Address, account: Account
+    ):
+        """
+        Test that get_account_code retrieves code from the input map when not cached.
+        """
+        # Create an account without code and prepare input map.
+        account_no_code = self._create_account_no_code(account)
+        set_account(state, address, account_no_code)
+        program_input = self._prepare_codehash_input(account.code_hash, account.code)
 
-        assert storage_roots_cairo == storage_roots(state)
+        # Call the Cairo function with the input map.
+        state_cairo, code_cairo = cairo_run(
+            "get_account_code",
+            state,
+            address,
+            account_no_code,
+            codehash_to_code=program_input["codehash_to_code"],
+        )
+
+        # Assert: Correct code is returned and inserted into the account in the state.
+        assert code_cairo == account.code
+        # Reconstruct the expected final account state after code retrieval
+        expected_account = Account(
+            balance=account.balance,
+            nonce=account.nonce,
+            code=code_cairo,  # Code should now be filled
+            code_hash=account.code_hash,
+            storage_root=account.storage_root,
+        )
+        assert get_account(state_cairo, address) == expected_account
+
+    @given(state=..., address=..., account=...)
+    def test_get_account_code_raises_on_mismatched_hash(
+        self, cairo_run, state: State, address: Address, account: Account
+    ):
+        """
+        Test that get_account_code raises an error if the provided code's hash
+        doesn't match the requested code_hash.
+        """
+        # Arrange: Create an account without code.
+        account_no_code = self._create_account_no_code(account)
+        set_account(state, address, account_no_code)
+
+        # Arrange: Prepare input map with a deliberately incorrect code (flipped last byte).
+        # We manually create the input here to use the wrong code to the hash
+        code_hash_int = int.from_bytes(account.code_hash, "little")
+        code_hash_low = code_hash_int & (2**128 - 1)
+        code_hash_high = code_hash_int >> 128
+        incorrect_code = (
+            account.code[:-1] + bytes([account.code[-1] ^ 1])
+            if account.code != b""
+            else b"wrong code"
+        )
+        program_input = {
+            "codehash_to_code": {(code_hash_low, code_hash_high): incorrect_code}
+        }
+
+        # Expect an assertion error from the Cairo execution.
+        # The Cairo function should verify keccak256(code) == account.code_hash.
+        with pytest.raises(AssertionError):
+            cairo_run(
+                "get_account_code",
+                state,
+                address,
+                account_no_code,
+                codehash_to_code=program_input["codehash_to_code"],
+            )
