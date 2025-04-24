@@ -8,7 +8,7 @@ from cairo_addons.hints.decorator import register_hint
 
 @register_hint
 def hashdict_read(dict_manager: DictManager, ids: VmConsts, memory: MemoryDict):
-    from cairo_addons.vm import poseidon_hash_many
+    from cairo_addons.rust_bindings.vm import poseidon_hash_many
 
     dict_tracker = dict_manager.get_tracker(ids.dict_ptr)
     dict_tracker.current_ptr += ids.DictAccess.SIZE
@@ -42,7 +42,7 @@ def hashdict_read_from_key(
 
 @register_hint
 def hashdict_write(dict_manager: DictManager, ids: VmConsts, memory: MemoryDict):
-    from cairo_addons.vm import poseidon_hash_many
+    from cairo_addons.rust_bindings.vm import poseidon_hash_many
 
     dict_tracker = dict_manager.get_tracker(ids.dict_ptr)
     dict_tracker.current_ptr += ids.DictAccess.SIZE
@@ -56,29 +56,6 @@ def hashdict_write(dict_manager: DictManager, ids: VmConsts, memory: MemoryDict)
 
     hashed_key = poseidon_hash_many(preimage) if len(preimage) != 1 else preimage[0]
     dict_manager.preimages[hashed_key] = preimage
-
-
-@register_hint
-def get_keys_for_address_prefix(
-    dict_manager: DictManager,
-    ids: VmConsts,
-    segments: MemorySegmentManager,
-    memory: MemoryDict,
-):
-    dict_tracker = dict_manager.get_tracker(ids.dict_ptr)
-    prefix = tuple([memory[ids.prefix + i] for i in range(ids.prefix_len)])
-    matching_preimages = [
-        key for key in dict_tracker.data.keys() if key[: len(prefix)] == prefix
-    ]
-    base = segments.add()
-    for i, preimage in enumerate(matching_preimages):
-        ptr = segments.add()
-        bytes32_base = segments.add()
-        segments.load_data(bytes32_base, preimage[1:])
-        segments.load_data(ptr, [preimage[0], bytes32_base])
-        memory[base + i] = ptr
-    ids.keys_len = len(matching_preimages)
-    ids.keys = base
 
 
 @register_hint

@@ -1,6 +1,6 @@
 import functools
 from collections import defaultdict
-from dataclasses import dataclass, fields, make_dataclass
+from dataclasses import dataclass, field, fields, make_dataclass
 from typing import (
     ClassVar,
     List,
@@ -38,8 +38,8 @@ from ethereum_types.bytes import (
 from ethereum_types.frozen import slotted_freezable
 from ethereum_types.numeric import U256, FixedUnsigned, Uint, _max_value
 from starkware.cairo.lang.cairo_constants import DEFAULT_PRIME
-from starkware.cairo.lang.vm.crypto import poseidon_hash_many
 
+from cairo_addons.rust_bindings.vm import poseidon_hash_many
 from cairo_addons.utils.uint256 import int_to_uint256
 
 EMPTY_TRIE_HASH = Hash32.fromhex(
@@ -158,11 +158,14 @@ class MessageCallOutput(
         namespace={"__doc__": MessageCallOutputBase.__doc__},
     )
 ):
+
+    accessed_storage_keys: Set[Tuple[Address, Bytes32]] = field(default_factory=set)
+
     def __eq__(self, other):
         return all(
             getattr(self, field.name) == getattr(other, field.name)
             for field in fields(self)
-            if field.name != "error"
+            if field.name != "error" and field.name != "accessed_storage_keys"
         ) and type(self.error) is type(other.error)
 
 
@@ -275,6 +278,14 @@ def encode_account(raw_account_data: Account, storage_root: Bytes) -> Bytes:
     )
 
 
+def account_exists_and_is_empty(state: State, address: Address) -> bool:
+    from ethereum.cancun.state import get_account_optional
+
+    account = get_account_optional(state, address)
+    # The storage root is intended not to be taken into account here.
+    return account is not None and account == EMPTY_ACCOUNT
+
+
 # TODO PR in EELS?
 def is_account_alive(state: State, address: Address) -> bool:
     from ethereum.cancun.state import get_account_optional
@@ -283,12 +294,9 @@ def is_account_alive(state: State, address: Address) -> bool:
     if account is None:
         return False
     else:
-        # Modified to use EMPTY_ACCOUNT - we want to make sure the storage root and code_hash are
-        # empty.
-        # Remember: Account__eq__ does not take into account the storage root.
-        return (
-            not account == EMPTY_ACCOUNT or not account.storage_root == EMPTY_TRIE_HASH
-        )
+        # Modified to use EMPTY_ACCOUNT - we want to make sure the code_hash is empty instead.
+        # Remember: Account__eq__ does not take into account the storage root. (intended, see eip-158)
+        return not account == EMPTY_ACCOUNT
 
 
 def set_code(state: State, address: Address, code: Bytes) -> None:
@@ -356,9 +364,13 @@ class FlatState:
     """
 
     _main_trie: Trie[Address, Optional[Account]]
-    _storage_tries: Trie[Tuple[Address, Bytes32], U256]
+    # Note: Explicit Optional[U256] to allow args_gen to generate entries for 0 values.
+    _storage_tries: Trie[Tuple[Address, Bytes32], Optional[U256]]
     _snapshots: List[
-        Tuple[Trie[Address, Optional[Account]], Trie[Tuple[Address, Bytes32], U256]]
+        Tuple[
+            Trie[Address, Optional[Account]],
+            Trie[Tuple[Address, Bytes32], Optional[U256]],
+        ]
     ]
     created_accounts: Set[Address]
 
@@ -468,7 +480,11 @@ class AddressAccountDiffEntry:
                 int.from_bytes(self.key, "little"),
                 *(self.prev_value.hash_args() if self.prev_value else []),
                 # We don't hash the new storage_root, as we can't compute it from the partial state changes
-                *self.new_value.hash_args(with_storage_root=False),
+                *(
+                    self.new_value.hash_args(with_storage_root=False)
+                    if self.new_value
+                    else []
+                ),
             ]
         )
 
@@ -476,15 +492,23 @@ class AddressAccountDiffEntry:
 @dataclass
 class StorageDiffEntry:
     key: Uint
-    prev_value: U256
-    new_value: U256
+    prev_value: Optional[U256]
+    new_value: Optional[U256]
 
     def hash_poseidon(self):
         return poseidon_hash_many(
             [
                 int(self.key),
-                *int_to_uint256(int(self.prev_value)),
-                *int_to_uint256(int(self.new_value)),
+                *(
+                    int_to_uint256(int(self.prev_value))
+                    if self.prev_value is not None
+                    else []
+                ),
+                *(
+                    int_to_uint256(int(self.new_value))
+                    if self.new_value is not None
+                    else []
+                ),
             ]
         )
 

@@ -457,7 +457,7 @@ dev = [
 requires-dist = [
     { name = "cairo-addons", editable = "python/cairo-addons" },
     { name = "cairo-lang", specifier = ">=0.13.3" },
-    { name = "garaga", git = "https://github.com/keep-starknet-strange/garaga.git?rev=hydra_upd" },
+    { name = "garaga" },
 ]
 
 [package.metadata.requires-dev]
@@ -1341,7 +1341,7 @@ wheels = [
 [[package]]
 name = "garaga"
 version = "0.16.0"
-source = { git = "https://github.com/keep-starknet-strange/garaga.git?rev=hydra_upd#a94e0b410df89adff7063dd20cdb474646e052e5" }
+source = { git = "https://github.com/keep-starknet-strange/garaga.git?tag=v0.16.0#c3db6b78efc0a4b8eb6a8c06df7f053257728ea7" }
 dependencies = [
     { name = "fastecdsa" },
     { name = "filelock" },
@@ -1356,7 +1356,7 @@ dependencies = [
 [[package]]
 name = "garaga-zero"
 version = "0.0.1"
-source = { git = "https://github.com/kkrt-labs/garaga-zero?rev=f294b46c9fed3f2d430a21d4c8db1699a14cab42#f294b46c9fed3f2d430a21d4c8db1699a14cab42" }
+source = { git = "https://github.com/kkrt-labs/garaga-zero?rev=08e80a99c60a11adc5715c329a4390937d12d77d#08e80a99c60a11adc5715c329a4390937d12d77d" }
 dependencies = [
     { name = "cairo-lang" },
     { name = "garaga" },
@@ -1968,8 +1968,8 @@ requires-dist = [
     { name = "colorama", specifier = ">=0.4.6" },
     { name = "eth-rpc", editable = "python/eth-rpc" },
     { name = "ethereum" },
-    { name = "garaga", git = "https://github.com/keep-starknet-strange/garaga.git?rev=hydra_upd" },
-    { name = "garaga-zero", git = "https://github.com/kkrt-labs/garaga-zero?rev=f294b46c9fed3f2d430a21d4c8db1699a14cab42" },
+    { name = "garaga" },
+    { name = "garaga-zero", git = "https://github.com/kkrt-labs/garaga-zero?rev=08e80a99c60a11adc5715c329a4390937d12d77d" },
     { name = "keth-types", editable = "python/keth-types" },
     { name = "marshmallow-dataclass", specifier = ">=8.6.1" },
     { name = "mpt", editable = "python/mpt" },

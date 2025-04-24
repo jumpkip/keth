@@ -1,4 +1,5 @@
 use lazy_static::lazy_static;
+use revm::primitives::Address;
 use std::collections::HashMap;
 
 use cairo_vm::{
@@ -21,9 +22,7 @@ use cairo_vm::{
 };
 
 use crate::vm::{hint_utils::serialize_sequence, hints::Hint};
-use revm_precompile::{
-    blake2, bn128, hash, identity, kzg_point_evaluation, modexp, secp256k1, Address,
-};
+use revm_precompile::{blake2, bn128, hash, identity, kzg_point_evaluation, modexp, secp256k1};
 
 pub const HINTS: &[fn() -> Hint] = &[
     bytes__eq__,
@@ -36,6 +35,7 @@ pub const HINTS: &[fn() -> Hint] = &[
     jumpdest_check_push_last_32_bytes,
     jumpdest_continue_general_case,
     jumpdest_continue_no_push_case,
+    compare_relocatable_segment_index,
 ];
 
 lazy_static! {
@@ -393,6 +393,30 @@ pub fn jumpdest_continue_no_push_case() -> Hint {
             insert_value_from_var_name(
                 "cond",
                 MaybeRelocatable::from(cond),
+                vm,
+                ids_data,
+                ap_tracking,
+            )?;
+            Ok(())
+        },
+    )
+}
+
+pub fn compare_relocatable_segment_index() -> Hint {
+    Hint::new(
+        String::from("compare_relocatable_segment_index"),
+        |vm: &mut VirtualMachine,
+         _exec_scopes: &mut ExecutionScopes,
+         ids_data: &HashMap<String, HintReference>,
+         ap_tracking: &ApTracking,
+         _constants: &HashMap<String, Felt252>|
+         -> Result<(), HintError> {
+            let lhs = get_ptr_from_var_name("lhs", vm, ids_data, ap_tracking)?;
+            let rhs = get_ptr_from_var_name("rhs", vm, ids_data, ap_tracking)?;
+            let cond = lhs.segment_index == rhs.segment_index;
+            insert_value_from_var_name(
+                "segment_equal",
+                Felt252::from(cond),
                 vm,
                 ids_data,
                 ap_tracking,

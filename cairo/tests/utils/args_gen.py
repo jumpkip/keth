@@ -140,10 +140,14 @@ from starkware.cairo.lang.compiler.scoped_name import ScopedName
 from starkware.cairo.lang.vm.memory_segments import MemorySegmentManager
 from starkware.cairo.lang.vm.relocatable import RelocatableValue
 
-from cairo_addons.vm import DictTracker as RustDictTracker
-from cairo_addons.vm import MemorySegmentManager as RustMemorySegmentManager
-from cairo_addons.vm import Relocatable as RustRelocatable
-from cairo_addons.vm import poseidon_hash_many
+from cairo_addons.rust_bindings.vm import DictTracker as RustDictTracker
+from cairo_addons.rust_bindings.vm import (
+    MemorySegmentManager as RustMemorySegmentManager,
+)
+from cairo_addons.rust_bindings.vm import Relocatable as RustRelocatable
+from cairo_addons.rust_bindings.vm import (
+    poseidon_hash_many,
+)
 from cairo_ec.curve import ECBase
 from keth_types.types import (
     U384,
@@ -243,6 +247,7 @@ _cairo_struct_to_python_type: Dict[Tuple[str, ...], Any] = {
     ("cairo_core", "numeric", "U64"): U64,
     ("cairo_core", "numeric", "Uint"): Uint,
     ("cairo_core", "numeric", "U256"): U256,
+    ("cairo_core", "numeric", "OptionalU256"): Optional[U256],
     ("cairo_core", "numeric", "SetUint"): Set[Uint],
     ("cairo_core", "numeric", "UnionUintU256"): Union[Uint, U256],
     ("cairo_core", "numeric", "U384"): U384,
@@ -960,6 +965,12 @@ def generate_state_arg(
     segments: Union[MemorySegmentManager, RustMemorySegmentManager],
     arg: State,
 ):
+    """
+    Fills the Cairo Memory with the state.
+
+    Note: We explicitly mark the Storage Tries as Optional[U256], as we want to be able to represent
+    storage values absent from the initial State as None.
+    """
     flat_state = FlatState.from_state(arg)
 
     parent_main_trie_data = 0
@@ -978,7 +989,7 @@ def generate_state_arg(
         snap_storage_tries = generate_trie_arg(
             dict_manager,
             segments,
-            Trie[Tuple[Address, Bytes32], U256],
+            Trie[Tuple[Address, Bytes32], Optional[U256]],
             storage_tries,
             parent_trie_data=parent_storage_tries_data,
         )
@@ -998,7 +1009,7 @@ def generate_state_arg(
     storage_tries = generate_trie_arg(
         dict_manager,
         segments,
-        Trie[Tuple[Address, Bytes32], U256],
+        Trie[Tuple[Address, Bytes32], Optional[U256]],
         flat_state._storage_tries,
         parent_trie_data=parent_storage_tries_data,
     )
@@ -1032,7 +1043,7 @@ def generate_transient_storage_arg(
         snap_trie = generate_trie_arg(
             dict_manager,
             segments,
-            Trie[Tuple[Address, Bytes32], U256],
+            Trie[Tuple[Address, Bytes32], Optional[U256]],
             snap,
             parent_trie_data=parent_trie_data,
         )
@@ -1042,7 +1053,7 @@ def generate_transient_storage_arg(
     main_transient_storage_trie = generate_trie_arg(
         dict_manager,
         segments,
-        Trie[Tuple[Address, Bytes32], U256],
+        Trie[Tuple[Address, Bytes32], Optional[U256]],
         flat_transient_storage._tries,
         parent_trie_data=parent_trie_data,
     )
