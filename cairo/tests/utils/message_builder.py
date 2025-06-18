@@ -1,21 +1,58 @@
-from ethereum.cancun.fork_types import Address
-from ethereum.cancun.vm import Message
-from ethereum_types.numeric import U256, Optional, Uint
+from ethereum.crypto.hash import Hash32
+from ethereum.prague.fork_types import Address
+from ethereum.prague.state import TransientStorage
+from ethereum.prague.vm import BlockEnvironment, Message, TransactionEnvironment
+from ethereum_types.bytes import Bytes32
+from ethereum_types.numeric import U64, U256, Uint
 from hypothesis import strategies as st
 
 from tests.utils.strategies import (
     accessed_addresses,
     accessed_storage_keys,
     address_zero,
+    block_environment_lite,
     code,
+    empty_state,
     gas_left,
     small_bytes,
+    transaction_environment_lite,
+)
+
+empty_block_environment = st.builds(
+    BlockEnvironment,
+    chain_id=st.just(U64(0)),
+    state=empty_state,
+    block_gas_limit=st.just(Uint(0)),
+    block_hashes=st.just([]),  # List[Hash32]
+    coinbase=st.just(address_zero),
+    number=st.just(Uint(0)),
+    base_fee_per_gas=st.just(Uint(0)),
+    time=st.just(U256(0)),
+    prev_randao=st.just(Bytes32(b"\x00" * 32)),
+    excess_blob_gas=st.just(U64(0)),
+    parent_beacon_block_root=st.just(Hash32(Bytes32(b"\x00" * 32))),
+)
+
+empty_transaction_environment = st.builds(
+    TransactionEnvironment,
+    origin=st.just(address_zero),
+    gas_price=st.just(Uint(0)),
+    gas=st.just(Uint(0)),
+    access_list_addresses=st.just(set()),  # Set[Address]
+    access_list_storage_keys=st.just(set()),  # Set[Tuple[Address, Bytes32]]
+    transient_storage=st.just(TransientStorage()),
+    blob_versioned_hashes=st.just(tuple()),  # Tuple[VersionedHash, ...]
+    index_in_block=st.just(None),  # Optional[Uint]
+    authorizations=st.just(tuple()),  # Tuple[Authorization, ...]
+    tx_hash=st.just(None),  # Optional[Hash32]
 )
 
 
 class MessageBuilder:
 
     def __init__(self):
+        self._block_env = empty_block_environment
+        self._tx_env = empty_transaction_environment
         self._caller = st.just(address_zero)
         self._target = st.just(address_zero)
         self._current_target = st.just(address_zero)
@@ -30,6 +67,7 @@ class MessageBuilder:
         self._accessed_addresses = st.builds(set, st.just(set()))
         self._accessed_storage_keys = st.builds(set, st.just(set()))
         self._parent_evm = st.none()
+        self._disable_precompiles = st.just(False)
 
     def with_caller(self, strategy=st.from_type(Address)):
         self._caller = strategy
@@ -55,7 +93,7 @@ class MessageBuilder:
         self._data = strategy
         return self
 
-    def with_code_address(self, strategy=st.from_type(Optional[Address])):
+    def with_code_address(self, strategy=st.from_type(Address) | st.none()):
         self._code_address = strategy
         return self
 
@@ -90,9 +128,23 @@ class MessageBuilder:
         self._parent_evm = strategy
         return self
 
+    def with_block_env(self, strategy=block_environment_lite):
+        self._block_env = strategy
+        return self
+
+    def with_tx_env(self, strategy=transaction_environment_lite):
+        self._tx_env = strategy
+        return self
+
+    def with_disable_precompiles(self, strategy=st.booleans()):
+        self._disable_precompiles = strategy
+        return self
+
     def build(self):
         return st.builds(
             Message,
+            block_env=self._block_env,
+            tx_env=self._tx_env,
             caller=self._caller,
             target=self._target,
             current_target=self._current_target,
@@ -106,5 +158,6 @@ class MessageBuilder:
             is_static=self._is_static,
             accessed_addresses=self._accessed_addresses,
             accessed_storage_keys=self._accessed_storage_keys,
+            disable_precompiles=self._disable_precompiles,
             parent_evm=self._parent_evm,
         )

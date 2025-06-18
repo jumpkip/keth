@@ -1,5 +1,284 @@
 # AI-Reports
 
+## AI-REPORT: Cairo PIE Support and AR Inputs Generation for External Users (May 30, 2025)
+
+### Context & Motivation
+
+As Keth integrates with external partners like SHARP for Applicative Recursion
+(AR) workflows, we needed to provide an easy-to-use CLI interface that allows
+external users to test Keth efficiently. SHARP is currently working with Cairo
+PIE files until STWO integrates SHARP, transitioning to prover input formats.
+
+### Implementation: Cairo PIE Support
+
+#### 1. **Rust Bindings Enhancement (`crates/cairo-addons/src/vm/runner.rs`)**
+
+- **New Parameter**: Added `cairo_pie: bool` parameter to the `generate_trace`
+  function
+- **Execution Mode Logic**: Modified `prepare_cairo_execution` to handle two
+  distinct modes:
+  - **Proof Mode** (`proof_mode=true`, `cairo_pie=false`): Optimized for STWO
+    proving with trace padding and strict builtin requirements
+  - **Cairo PIE Mode** (`proof_mode=false`, `cairo_pie=true`): Generates Cairo
+    PIE files for SHARP STONE compatibility
+- **Mutual Exclusivity**: Added validation to prevent simultaneous use of proof
+  mode and Cairo PIE mode, as they have incompatible requirements.
+- **Output Handling**:
+  - Cairo PIE files are written using `cairo_pie_result.write_zip_file()` as ZIP
+    archives
+  - Prover input files continue as JSON/binary format
+
+#### 2. **Python CLI Integration (`cairo/scripts/keth.py`)**
+
+- **New Parameter**: Added `--cairo-pie` flag to both `trace` and
+  `generate_ar_inputs` commands
+- **Filename Pattern**: Implemented consistent naming convention:
+  - **Cairo PIE**: `cairo_pie_{block}_{step}_{args}.zip`
+  - **Prover Input**: `prover_input_info_{block}_{step}_{args}.json`
+- **StepHandler Enhancement**: Updated `get_output_filename()` to generate
+  appropriate filenames based on output type
+
+### Implementation: AR Inputs Generation Command
+
+#### **New Command: `generate_ar_inputs`**
+
+This command provides a one-stop solution for generating all traces related to a
+block:
+
+1. **Automated Step Execution**: Runs `generate_trace` for each required step:
+
+   - `init` step
+   - `body` steps (chunked by configurable `--body-chunk-size`, default 10
+     transactions)
+   - `teardown` step
+
+2. **Consistent Naming**: Ensures prover input/Cairo PIE naming follows the
+   established pattern:
+
+   - Init: `{type}_{block}_init.{ext}`
+   - Body: `{type}_{block}_body_{start}_{len}.{ext}`
+   - Teardown: `{type}_{block}_teardown.{ext}`
+
+3. **Flexible Output**: Supports both Cairo PIE (with `--cairo-pie`) and prover
+   input formats
+
+4. **Smart Chunking**: Automatically determines the number of body chunks based
+   on total transactions and chunk size
+
+### Impact & Benefits
+
+#### **For External Partners**
+
+- **Single Command**: Generate all required traces with one command
+- **SHARP Compatibility**: Cairo PIE support until STWO integration
+- **Easy Testing**: Simplified workflow for external validation
+
+#### **For Keth Development**
+
+- **Modular Design**: Clean separation between proof and PIE modes
+- **Consistent Interface**: Uniform naming and parameter patterns
+- **Future-Proof**: Ready for STWO transition while maintaining SHARP support
+
+### Technical Decisions
+
+#### **Why Mutual Exclusivity?**
+
+Proof mode and Cairo PIE mode have fundamentally different requirements:
+
+- **Proof mode** needs trace padding and strict validation for STWO proving
+- **Cairo PIE mode** requires relaxed settings for SHARP compatibility
+
+#### **Why ZIP Format for Cairo PIE?**
+
+Cairo PIE files use the ZIP format as specified by the Cairo VM's
+`write_zip_file()` method, maintaining compatibility with existing SHARP
+infrastructure.
+
+## AI-REPORT: Fix State Compatibility for EELS in Teardown Tests (May 3, 2025)
+
+### Problem
+
+A test failure occurred, particularly noticeable with the
+`test_data/22615247.json` fixture, during the execution of the EELS `apply_body`
+function within the Python `load_teardown_input` utility
+(`cairo/utils/fixture_loader.py`). The issue stemmed from a mismatch between
+Keth's internal `State` representation and the format expected by EELS:
+
+1.  Keth's ZKPI loading and internal Python `State` object use `None` to
+    represent accounts or storage slots that are absent or empty after being
+    touched in a transaction - the reason being that any key accessed during the
+    Cairo execution **must** appear in the python object.
+2.  The EELS `apply_body` function expects such absent entries to be entirely
+    missing from the state trie data structures, not represented as `None`. It
+    also expects specific representations for zero/empty values (e.g., `b""` for
+    code). Passing a `State` object containing `None` values directly to EELS
+    `apply_body` led to incorrect execution or errors (like gas inconsistencies
+    or `InvalidBlock` exceptions in direct EELS calls).
+
+### Solution
+
+The fix involved ensuring the `State` object is formatted correctly before being
+passed to EELS `apply_body` and handling the ZKPI representation consistently:
+
+1.  **Consistent ZKPI Loading**: Updated `mpt.ethereum_tries.PreState.from_data`
+    to correctly interpret storage values of `0` from the ZKPI data as `None` in
+    the Python `Trie` structure, representing absence/nullity in the pre-state,
+    aligning with the April 22 changes.
+2.  **EELS State Formatting**: Introduced a new utility function
+    `format_state_for_eels` in `cairo/utils/fixture_loader.py`. This function
+    cleans the `State` object by:
+    - Removing account entries where the value is `None`.
+    - Setting `code` to `b""` for accounts where it's `None`.
+    - Removing storage entries where the value is `None`.
+    - Removing entire storage tries if they become empty after cleaning.
+3.  **Applying Formatting**: Modified `prepare_body_input` and
+    `load_teardown_input` to call `format_state_for_eels` on the `State` object
+    _before_ passing it to EELS functions like `apply_body`.
+4.  **State Restoration**: Ensured that `load_teardown_input` correctly restores
+    the `None` representations back into the `State` object _after_ the
+    `apply_body` call, maintaining consistency with Keth's internal logic for
+    subsequent steps (like teardown).
+5.  **Testing**: Added `test_data/22615247.json` to `test_teardown.py` and
+    introduced `test_e2e_eels` in `test_e2e.py` to specifically test EELS
+    compatibility and verify gas calculations even when full state root
+    verification fails due to partial ZKPI state.
+
+### Impact
+
+This change ensures that the `State` object passed to EELS functions conforms to
+its expected format, resolving errors previously encountered during the Python
+execution phase of teardown tests. It correctly handles the distinction between
+absent/null values (`None` in Keth Python) and zero values (`U256(0)`, empty
+accounts) when interacting with EELS.
+
+## AI-REPORT: New Cairo Program Proving Script (May 2, 2025)
+
+### Overview
+
+A new script, `prove_cairo.py`, has been added to the Keth project under
+`cairo/scripts/`. This script is designed to be an unopinionated tool focused on
+a single feature: running and proving any compiled Cairo program, independent of
+Keth-specific logic. This addition enhances the flexibility of the proving
+toolchain by allowing users to work with arbitrary Cairo programs, which might
+be useful for testing and development purposes.
+
+### What Was Done
+
+- **New Script Creation**: Created `prove_cairo.py` as a standalone CLI tool
+  using the Typer framework for command-line interface development.
+- **Integration with Existing Bindings**: Utilized existing Rust bindings from
+  `cairo_addons.rust_bindings` for trace generation (`run_generate_trace`),
+  proof generation (`run_prove`), and verification (`run_verify`).
+- **Feature Implementation**: Implemented a single command `run_and_prove` that
+  handles running a compiled Cairo program, generating a proof with STWO, and
+  optionally verifying the proof.
+- **Support for Cairo-Compatible Serialization**: Added support for serializing
+  proofs to a Cairo-compatible format using the `--serde-cairo` flag, aligning
+  with features in `keth.py`.
+- **Performance Improvements**: Used a CanonicalWithoutPedersen preprocessed
+  trace variant when using `prove_cairo`, which is faster to setup. We don't
+  need proving of pedersen hashes.
+
+### Why It Was Done
+
+- **Flexibility**: To provide a tool that can run and prove any Cairo program,
+  not just those related to Ethereum block processing as in `keth.py`. This
+  allows developers to use the STWO proving system for a broader range of
+  applications.
+- **Simplification**: To offer a focused, unopinionated interface that avoids
+  the complexity and specific assumptions baked into the Keth workflow, making
+  it easier for users to integrate with custom Cairo projects.
+
+### How to Use the New Script
+
+The `prove_cairo.py` script can be invoked from the command line with the
+following options:
+
+- **Command**: `run_and_prove`
+- **Options**:
+  - `--compiled-program <PROGRAM_PATH>`: (Required) Path to the compiled Cairo
+    program to run and prove.
+  - `--entrypoint <ENTRYPOINT>`: (Default: "main") The entrypoint function name
+    to execute in the program.
+  - `--arguments <ARGUMENTS>`: (Default: "") Serialized arguments as
+    comma-separated felts for the program.
+  - `--output-dir <OUTPUT_DIR>`: (Default: "output") Directory to save trace
+    artifacts and the generated proof.
+  - `--serde-cairo`: (Default: False) Serialize the proof to a Cairo-compatible
+    format.
+  - `--verify`: (Default: False) Verify the proof after generation.
+
+**Example Usage**:
+
+```bash
+uv run prove_cairo --compiled-program build/my_program_compiled.json --entrypoint main --arguments "1,2,3" --output-dir output --serde-cairo --verify
+```
+
+This command runs the specified Cairo program, generates a proof, saves
+artifacts to the `output` directory, serializes the proof in Cairo-compatible
+format, and verifies the proof.
+
+## AI-REPORT: State Root Restoration and Hash Function Abstraction (April 23, 2025)
+
+### Context & Goal
+
+Following the previous refactor (see AI-REPORT April 11, 2025) that moved to a
+diff-based state validation aligned with EELS, this change restores the
+capability to compute the full `state_root` and `storage_root` directly within
+Keth. The primary goal is for the MPT `root` function to support multiple
+cryptographic hash functions (Keccak for final roots, Blake2s for intermediate
+in our applicative-recursion commitments, and eventually Poseidon later) for
+these computations, bringing better flexibility.
+
+### Implementation: Hash Function Abstraction
+
+The core challenge is abstracting the hash function used within the `root`
+computation (for the main state trie) and the `storage_roots` computation (for
+individual account storage tries). Cairo's language design makes traditional
+dynamic dispatch or passing function closures complex (functions take different
+arguments, we can only `call abs` on the function label, etc.)
+
+**Pattern Chosen**: We use implicit arguments to manage hash function selection
+and execution:
+
+1.  **Builtin Pointers**: Functions supporting multiple hashing functions now
+    include implicit arguments for all potentially needed hash builtins (e.g.,
+    `keccak_ptr`, `poseidon_ptr`). This ensures that regardless of the function
+    chosen at runtime, we have the right segments available.
+2.  **Hash Function Identifier & Dispatch**: The actual hash computation is
+    delegated to a central `hash_with` function (located in
+    `cairo/ethereum/crypto/hash.cairo`). This function takes an explicit
+    `hash_function_name: felt` argument (e.g., `'keccak256'`, `'blake2s'`) which
+    identifies the desired hash algorithm. Inside `hash_with`, conditional logic
+    uses this name to select the appropriate hash implementation (e.g., `keccak`
+    or `blake2s`) and use the corresponding implicit builtin pointers (like
+    `keccak_ptr`, if used). This approach avoids the complexity of using
+    `call abs` with function labels, which would require branching to manage the
+    differing implicit arguments required by each hash function. Functions like
+    `root`, `state_root` or `storage_roots` propagate the necessary builtins and
+    the `hash_function_name` down to where `hash_with` is called.
+3.  **Hash-Specific Constants**: Constants like `EMPTY_ROOT` and `EMPTY_HASH`
+    were renamed to `EMPTY_ROOT_KECCAK` and `EMPTY_HASH_KECCAK` to distinguish
+    them, as different hash functions have different default empty values.
+4.  We use the newly introduced opcode in the VM and proven by STWO to compute
+    Blake2s hashes (see cairo_core.hash.blake2s)
+
+### Changes
+
+- **`state.cairo`**: Re-implemented `state_root` and introduced `storage_roots`
+  and helper functions. These functions now include implicit arguments for
+  various hash builtins (`poseidon_ptr`, `keccak_ptr` where relevant). They will
+  be used to compute intermediate state roots (with blake2s) when splitting our
+  state transition into chunks.
+- **`fork_types.cairo`, `state.cairo`**: Renamed `EMPTY_ROOT`/`EMPTY_HASH` to
+  `EMPTY_ROOT_KECCAK`/`EMPTY_HASH_KECCAK`.
+
+### Implications
+
+The hash abstraction pattern prepares the codebase for using alternative hash
+functions like Blake2s, more efficient than Poseidon-F252, for future features
+like intermediate state commitments.
+
 ## AI-REPORT: Differentiating Null and Zero in State/Storage Diffs (April 22, 2025)
 
 ### Problem
@@ -167,7 +446,7 @@ python's module system, and the patches would not be effective everywhere.
 ### Challenges with Python Module Loading
 
 Python's module loading order poses a challenge. Modules are cached in
-`sys.modules`, and if EELS modules (e.g., `ethereum.cancun.vm`) load before
+`sys.modules`, and if EELS modules (e.g., `ethereum.prague.vm`) load before
 patches, original types are used instead of Keth's. This did happen because of
 pytest plugins that initialized earlier than `conftest.py` hooks.
 
@@ -210,7 +489,7 @@ recalculation.
 
 ### Changes
 
-1. **cairo/ethereum/cancun/main.cairo (Entrypoint)**
+1. **cairo/ethereum/prague/main.cairo (Entrypoint)**
 
    - **Logic Shift**: Orchestrates diff comparison:
      - Runs STF (`state_transition`) to generate account/storage diffs.
@@ -231,7 +510,7 @@ recalculation.
    - **Rationale**: Validates state changes incrementally, reducing STF
      complexity by offloading root hash computation.
 
-2. **cairo/ethereum/cancun/fork.cairo (STF)**
+2. **cairo/ethereum/prague/fork.cairo (STF)**
 
    - **Change**: Removed `state_root` equality check
      (`output.value.state_root == block.value.header.value.state_root`).
@@ -239,7 +518,7 @@ recalculation.
    - **Rationale**: Avoids redundant root computation, relying on diff-based
      correctness.
 
-3. **cairo/ethereum/cancun/fork_types.cairo (Data Structures)**
+3. **cairo/ethereum/prague/fork_types.cairo (Data Structures)**
 
    - **New Function**: `account_eq_without_storage_root` compares
      `OptionalAccount` instances, ignoring `storage_root`.
@@ -248,7 +527,7 @@ recalculation.
      diffs for independent validation, as storage changes are tracked
      separately.
 
-4. **cairo/ethereum/cancun/state.cairo (State Management)**
+4. **cairo/ethereum/prague/state.cairo (State Management)**
 
    - **Change**: Replaced `default_dict_finalize` with `dict_squash` in
      `finalize_state` for `main_trie` and `storage_tries`.
@@ -272,9 +551,9 @@ recalculation.
      preparation, ensures Python-Cairo consistency. We want the pre-state to be
      loaded from zkpi, which contains all touched accounts / storage slots.
 
-6. **cairo/tests/ef_tests/cancun/test_state_transition.py (Tests)**
+6. **cairo/tests/ef_tests/prague/test_state_transition.py (Tests)**
 
-   - **Change**: Ignores `wrongStateRoot_Cancun` test, obsolete due to
+   - **Change**: Ignores `wrongStateRoot_Prague` test, obsolete due to
      diff-based validation;
    - **Rationale**: Tests focusing on state root mismatches are irrelevant as we
      don't recompute a new state root, we don't need to test for it: our

@@ -1,3 +1,4 @@
+// cairo-lint: disable-file
 // The Cairo type system implementation that mirrors Python types for VM interaction.
 //
 // This module implements a "soft type system" that allows seamless conversion between Python
@@ -49,7 +50,10 @@ from cairo_core.bytes import (
     TupleBytes32,
     Bytes1DictAccess,
     ListBytes4Struct,
+    ListBytes,
+    ListBytesStruct,
     ListBytes4,
     OptionalBytes,
     OptionalBytes32,
+    OptionalHash32,
 )

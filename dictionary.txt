@@ -180,6 +180,7 @@ nodeid
 noncanonical
 nondet
 norecursedirs
+normalised
 notive
 numprocesses
 OMMER
@@ -315,3 +316,13 @@ unsquashed
 ptrs
 pyerr
 samply
+typer
+syscall
+scarb
+bootloaders
+tempvar
+dhat
+EEST
+exitstatus
+PREDEPLOY
+bilinearity

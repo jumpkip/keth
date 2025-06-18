@@ -1,15 +1,16 @@
+import hashlib
 from typing import Optional
 
 import pytest
-from ethereum.cancun.fork_types import Address
-from ethereum.cancun.vm.gas import (
-    BLOB_GASPRICE_UPDATE_FRACTION,
+from ethereum.prague.fork_types import Address
+from ethereum.prague.vm.gas import (
+    BLOB_BASE_FEE_UPDATE_FRACTION,
     MIN_BLOB_GASPRICE,
     TARGET_BLOB_GAS_PER_BLOCK,
 )
 from ethereum.utils.numeric import ceil32, taylor_exponential
 from ethereum_types.bytes import Bytes, Bytes32
-from ethereum_types.numeric import U64, U256, Uint
+from ethereum_types.numeric import U8, U64, U256, Uint
 from hypothesis import example, given
 from hypothesis import strategies as st
 from starkware.cairo.lang.instances import PRIME
@@ -77,7 +78,7 @@ class TestNumeric:
         numerator=st.integers(
             min_value=1, max_value=10 * int(TARGET_BLOB_GAS_PER_BLOCK)
         ).map(Uint),
-        denominator=st.just(BLOB_GASPRICE_UPDATE_FRACTION),
+        denominator=st.just(BLOB_BASE_FEE_UPDATE_FRACTION),
     )
     def test_taylor_exponential(
         self, cairo_run, factor: Uint, numerator: Uint, denominator: Uint
@@ -89,7 +90,7 @@ class TestNumeric:
     @given(
         factor=st.just(MIN_BLOB_GASPRICE),
         numerator=st.integers(min_value=1, max_value=100_000_000_000_000_000).map(Uint),
-        denominator=st.just(BLOB_GASPRICE_UPDATE_FRACTION),
+        denominator=st.just(BLOB_BASE_FEE_UPDATE_FRACTION),
     )
     def test_taylor_exponential_limited(
         self, cairo_run, factor: Uint, numerator: Uint, denominator: Uint
@@ -113,14 +114,34 @@ class TestNumeric:
         expected = U64.from_be_bytes(bytes)
         assert result == expected
 
-    # @dev Note Uint type from EELS is unbounded.
-    # But Uint_from_be_bytes panics if len(bytes) > 31
-    @given(bytes=small_bytes)
-    def test_Uint_from_be_bytes(self, cairo_run, bytes: Bytes):
-        try:
-            assert Uint.from_be_bytes(bytes) == cairo_run("Uint_from_be_bytes", bytes)
-        except Exception:
-            assert len(bytes) > 31
+    class TestUint:
+        @given(bytes=small_bytes)
+        def test_U8_from_be_bytes(self, cairo_run, bytes: Bytes):
+            try:
+                assert U8.from_be_bytes(bytes) == cairo_run("U8_from_be_bytes", bytes)
+            except Exception as e:
+                with strict_raises(type(e)):
+                    U8.from_be_bytes(bytes)
+                return
+
+        # @dev Note Uint type from EELS is unbounded.
+        # But Uint_from_be_bytes panics if len(bytes) > 31
+        @given(bytes=small_bytes)
+        def test_Uint_from_be_bytes(self, cairo_run, bytes: Bytes):
+            try:
+                assert Uint.from_be_bytes(bytes) == cairo_run(
+                    "Uint_from_be_bytes", bytes
+                )
+            except Exception:
+                assert len(bytes) > 31
+
+        @given(value=...)
+        def test_Uint__hash__(self, cairo_run, value: Uint):
+            # blake2s takes 32 bytes as input
+            value_bytes = value.to_bytes(32, "little")
+            assert hashlib.blake2s(value_bytes).digest() == cairo_run(
+                "Uint__hash__", value
+            )
 
     @given(bytes=small_bytes)
     def test_Bytes32_from_be_bytes(self, cairo_run, bytes: Bytes):
@@ -276,6 +297,13 @@ class TestNumeric:
             result = cairo_run("U256_max", a, b)
             expected = max(a, b)
             assert result == expected
+
+        @given(value=...)
+        def test_U256__hash__(self, cairo_run, value: U256):
+            value_bytes = U256.to_le_bytes32(value)
+            assert hashlib.blake2s(value_bytes).digest() == cairo_run(
+                "U256__hash__", value
+            )
 
     class TestU384:
         @given(value=...)

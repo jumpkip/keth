@@ -1,21 +1,42 @@
+import copy
 import json
 import logging
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from ethereum.cancun.blocks import Block, Withdrawal
-from ethereum.cancun.fork import (
+from ethereum.crypto.hash import keccak256
+from ethereum.prague.blocks import Block, Log, Receipt, Withdrawal
+from ethereum.prague.fork import (
+    BEACON_ROOTS_ADDRESS,
+    HISTORY_STORAGE_ADDRESS,
     BlockChain,
+    get_last_256_block_hashes,
+    process_transaction,
+    process_unchecked_system_transaction,
 )
-from ethereum.cancun.fork_types import EMPTY_ACCOUNT, Address
-from ethereum.cancun.state import State
-from ethereum.cancun.transactions import (
+from ethereum.prague.fork_types import (
+    EMPTY_ACCOUNT,
+    Account,
+    Address,
+)
+from ethereum.prague.state import (
+    State,
+    TransientStorage,
+)
+from ethereum.prague.transactions import (
     LegacyTransaction,
+    decode_transaction,
     encode_transaction,
 )
-from ethereum.cancun.trie import Trie, root, trie_get
-from ethereum.crypto.hash import keccak256
+from ethereum.prague.trie import Trie, copy_trie, root, trie_get
+from ethereum.prague.vm import (
+    BlockEnvironment,
+    BlockOutput,
+)
+from ethereum.prague.vm.gas import (
+    calculate_excess_blob_gas,
+)
 from ethereum.utils.hexadecimal import (
     hex_to_bytes,
     hex_to_bytes32,
@@ -27,7 +48,7 @@ from ethereum_spec_tools.evm_tools.loaders.fixture_loader import Load
 from ethereum_spec_tools.evm_tools.loaders.fork_loader import ForkLoad
 from ethereum_spec_tools.evm_tools.loaders.transaction_loader import TransactionLoad
 from ethereum_types.bytes import Bytes, Bytes0
-from ethereum_types.numeric import U64, U256
+from ethereum_types.numeric import U64, U256, Uint
 
 from keth_types.types import EMPTY_BYTES_HASH, EMPTY_TRIE_HASH
 from mpt.ethereum_tries import ZkPi
@@ -37,7 +58,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-CANCUN_FORK_BLOCK = 19426587  # First Cancun block
+PRAGUE_FORK_BLOCK = 22431084  # First Prague block
 
 
 class LoadKethFixture(Load):
@@ -169,10 +190,23 @@ def load_zkpi_fixture(zkpi_path: Union[Path, str]) -> Dict[str, Any]:
         logger.error(f"Error loading ZKPI file from {zkpi_path}: {e}")
         raise e
 
-    load = LoadKethFixture("Cancun", "cancun")
+    load = LoadKethFixture("Prague", "prague")
     if len(prover_inputs["blocks"]) > 1:
         raise ValueError("Only one block is supported")
+
+    # TODO(zkpi): Remove requestsHash key if null from block header and all ancestors
     input_block = prover_inputs["blocks"][0]
+    if (
+        "requestsHash" in input_block["header"]
+        and input_block["header"]["requestsHash"] is None
+    ):
+        del input_block["header"]["requestsHash"]
+
+    # Also remove from ancestors
+    for ancestor in prover_inputs["witness"]["ancestors"]:
+        if "requestsHash" in ancestor and ancestor["requestsHash"] is None:
+            del ancestor["requestsHash"]
+
     block_transactions = input_block["transaction"]
     transactions = process_block_transactions(block_transactions)
 
@@ -229,6 +263,292 @@ def load_zkpi_fixture(zkpi_path: Union[Path, str]) -> Dict[str, Any]:
     return program_input
 
 
+def zkpi_fixture_eels_compatible(zkpi_path: Union[Path, str]) -> Dict[str, Any]:
+    """
+    Load and convert ZKPI fixture to EELS-compatible public inputs.
+    """
+    zkpi_program_input = load_zkpi_fixture(zkpi_path=zkpi_path)
+
+    blockchain = zkpi_program_input["blockchain"]
+    format_state_for_eels(blockchain.state)
+    return zkpi_program_input
+
+
+def format_state_for_eels(state: State) -> State:
+    """
+    Format the state to run with EELS.
+    """
+    # EELS expects "None" accounts to not be in the state.
+    accounts_to_delete = [
+        address
+        for address, account in state._main_trie._data.items()
+        if account is None
+    ]
+    for address in accounts_to_delete:
+        del state._main_trie._data[address]
+
+    # EELS expects code of accounts without code to be an empty bytearray.
+    for address, account in state._main_trie._data.items():
+        if account and not account.code:
+            state._main_trie._data[address] = Account(
+                nonce=account.nonce,
+                balance=account.balance,
+                code_hash=account.code_hash,
+                storage_root=account.storage_root,
+                code=b"",
+            )
+
+    for address in state._storage_tries:
+        # EELS expects empty storage values to be deleted.
+        # If a trie has no remaining value, then it's entirely deleted.
+        storage_trie = state._storage_tries[address]
+        keys_to_delete = [k for k, v in storage_trie._data.items() if v is None]
+        for key in keys_to_delete:
+            del storage_trie._data[key]
+
+    tries_to_delete = [
+        address
+        for address in state._storage_tries
+        if not state._storage_tries[address]._data
+    ]
+    for address in tries_to_delete:
+        del state._storage_tries[address]
+
+    return
+
+
+def transient_storage_for_eels() -> TransientStorage:
+    """
+    Format the transient storage to run with EELS.
+    """
+    return TransientStorage(_data=defaultdict(lambda: None, {}), _snapshots=[])
+
+
+def prepare_body_input(
+    block_env: BlockEnvironment,
+    transactions: Tuple[Union[LegacyTransaction, Bytes], ...],
+) -> Dict[str, Any]:
+    """
+    Prepare the input for the body step.
+    Runs the STF on the subset of transactions passed as argument.
+    Outputs the state post-transactions (new state, remaining gas, etc.)
+    """
+    transactions_trie: Trie[Bytes, Optional[Union[Bytes, LegacyTransaction]]] = Trie(
+        secured=False, default=None, _data=defaultdict(lambda: None)
+    )
+    receipts_trie: Trie[Bytes, Optional[Union[Bytes, Receipt]]] = Trie(
+        secured=False, default=None, _data=defaultdict(lambda: None)
+    )
+    withdrawals_trie: Trie[Bytes, Optional[Union[Bytes, Withdrawal]]] = Trie(
+        secured=False, default=None, _data=defaultdict(lambda: None)
+    )
+    block_logs: Tuple[Log, ...] = ()
+
+    block_output = BlockOutput(
+        block_gas_used=Uint(0),
+        transactions_trie=transactions_trie,
+        receipts_trie=receipts_trie,
+        receipt_keys=[],
+        block_logs=block_logs,
+        withdrawals_trie=withdrawals_trie,
+        blob_gas_used=U64(0),
+    )
+
+    format_state_for_eels(block_env.state)
+
+    process_unchecked_system_transaction(
+        block_env=block_env,
+        target_address=BEACON_ROOTS_ADDRESS,
+        data=block_env.parent_beacon_block_root,
+    )
+
+    process_unchecked_system_transaction(
+        block_env=block_env,
+        target_address=HISTORY_STORAGE_ADDRESS,
+        data=block_env.block_hashes[-1],  # The parent hash
+    )
+
+    for i, tx in enumerate(map(decode_transaction, transactions)):
+        process_transaction(block_env, block_output, tx, Uint(i))
+
+    # process_withdrawals(block_env, block_output, withdrawals)
+
+    # Cairo expects code of accounts to be initially None, as they're lazily loaded
+    # during execution.
+    state = block_env.state
+    for address, account in state._main_trie._data.items():
+        if account and account.code_hash == EMPTY_BYTES_HASH:
+            state._main_trie._data[address] = Account(
+                nonce=account.nonce,
+                balance=account.balance,
+                code_hash=account.code_hash,
+                storage_root=account.storage_root,
+                code=None,
+            )
+
+    for address, storage_trie in state._storage_tries.items():
+        for storage_key, storage_value in storage_trie._data.items():
+            if storage_value == U256(0):
+                storage_trie._data[storage_key] = None
+
+    return {
+        "block_env": block_env,
+        "block_output": block_output,
+    }
+
+
+def load_body_input(
+    zkpi_path: Union[Path, str], start_index: int, chunk_size: int
+) -> Dict[str, Any]:
+    """
+    Load and convert ZKPI fixture to Keth-compatible public inputs for the body step.
+    Advances the state by the number of transactions specified by `start_index` and `chunk_size`.
+    """
+    zkpi_program_input = load_zkpi_fixture(zkpi_path=zkpi_path)
+    chain = zkpi_program_input["blockchain"]
+    block = zkpi_program_input["block"]
+    parent_header = chain.blocks[-1].header
+    excess_blob_gas = calculate_excess_blob_gas(parent_header)
+
+    # We need to save the pre-state of the state to be able to inject it as original snapshot
+    main_trie_snapshot = copy_trie(chain.state._main_trie)
+    storage_tries_snapshot = copy.deepcopy(chain.state._storage_tries)
+
+    block_env = BlockEnvironment(
+        chain_id=chain.chain_id,
+        state=chain.state,
+        block_gas_limit=block.header.gas_limit,
+        block_hashes=get_last_256_block_hashes(chain),
+        coinbase=block.header.coinbase,
+        number=block.header.number,
+        base_fee_per_gas=block.header.base_fee_per_gas,
+        time=block.header.timestamp,
+        prev_randao=block.header.prev_randao,
+        excess_blob_gas=excess_blob_gas,
+        parent_beacon_block_root=block.header.parent_beacon_block_root,
+    )
+
+    transactions = block.transactions[:start_index]
+
+    body_input = prepare_body_input(
+        block_env,
+        transactions,
+    )
+    # One thing to keep in mind here is that running EELS will delete any value from the account /
+    # storage trie that's set to the default value (EMPTY_ACCOUNT / U256(0)).  This means that we
+    # must _manually_ put back an entry for each value that was deleted from the tries.
+    updated_state = body_input["block_env"].state
+    for address, account in main_trie_snapshot._data.items():
+        if address not in updated_state._main_trie._data:
+            updated_state._main_trie._data[address] = None
+
+        if address not in updated_state._storage_tries:
+            updated_state._storage_tries[address] = Trie(
+                secured=True, default=U256(0), _data={}
+            )
+
+    for address in storage_tries_snapshot:
+        for storage_key, storage_value in storage_tries_snapshot[address]._data.items():
+            if storage_key not in updated_state._storage_tries[address]._data:
+                updated_state._storage_tries[address]._data[storage_key] = None
+    # Inject the original state as the first snapshot
+    body_input["block_env"].state._snapshots = [
+        (
+            main_trie_snapshot,
+            storage_tries_snapshot,
+        )
+    ]
+    code_hashes = map_code_hashes_to_code(body_input["block_env"].state)
+    program_input = {
+        **body_input,
+        "codehash_to_code": code_hashes,
+        "block_header": block.header,
+        "block_transactions": block.transactions,
+        "start_index": start_index,
+        "len": min(chunk_size, len(block.transactions) - start_index),
+    }
+    return program_input
+
+
+def load_teardown_input(zkpi_path: Union[Path, str]) -> Dict[str, Any]:
+    """
+    Load and convert ZKPI fixture to Keth-compatible public inputs for the teardown step.
+    Because we need the state input of the cairo program to be filled in memory with (key, prev_value, new_value) tuples,
+    we format the state object so that there's one single snapshot object, corresponding to the initial state of the block.
+    """
+    zkpi_program_input = load_zkpi_fixture(zkpi_path=zkpi_path)
+    chain = zkpi_program_input["blockchain"]
+    block = zkpi_program_input["block"]
+    withdrawals_trie: Trie[Bytes, Optional[Union[Bytes, Withdrawal]]] = Trie(
+        secured=False, default=None, _data=defaultdict(lambda: None)
+    )
+    main_trie_snapshot = copy_trie(chain.state._main_trie)
+    storage_tries_snapshot = copy.deepcopy(chain.state._storage_tries)
+
+    parent_header = chain.blocks[-1].header
+    excess_blob_gas = calculate_excess_blob_gas(parent_header)
+
+    block_env = BlockEnvironment(
+        chain_id=chain.chain_id,
+        state=chain.state,
+        block_gas_limit=block.header.gas_limit,
+        block_hashes=get_last_256_block_hashes(chain),
+        coinbase=block.header.coinbase,
+        number=block.header.number,
+        base_fee_per_gas=block.header.base_fee_per_gas,
+        time=block.header.timestamp,
+        prev_randao=block.header.prev_randao,
+        excess_blob_gas=excess_blob_gas,
+        parent_beacon_block_root=block.header.parent_beacon_block_root,
+    )
+
+    body_input = prepare_body_input(
+        block_env,
+        block.transactions,
+    )
+
+    if body_input["block_output"].block_gas_used != block.header.gas_used:
+        raise ValueError(
+            f"Block gas used mismatch: {body_input['block_output'].block_gas_used} != {block.header.gas_used}"
+        )
+
+    # One thing to keep in mind here is that running EELS will delete any value from the account /
+    # storage trie that's set to the default value (EMPTY_ACCOUNT / U256(0)).  This means that we
+    # must _manually_ put back an entry for each value that was deleted from the tries.
+    updated_state = body_input["block_env"].state
+    for address in main_trie_snapshot._data.keys():
+        if address not in updated_state._main_trie._data:
+            updated_state._main_trie._data[address] = None
+
+        if address not in updated_state._storage_tries:
+            updated_state._storage_tries[address] = Trie(
+                secured=True, default=U256(0), _data={}
+            )
+
+    for address in storage_tries_snapshot:
+        for storage_key in storage_tries_snapshot[address]._data.keys():
+            if storage_key not in updated_state._storage_tries[address]._data:
+                updated_state._storage_tries[address]._data[storage_key] = None
+
+    body_input["block_env"].state = updated_state
+    body_input["block_env"].state._snapshots = [
+        (
+            main_trie_snapshot,
+            storage_tries_snapshot,
+        )
+    ]
+
+    program_input = {
+        # Glue with init.cairo
+        **zkpi_program_input,
+        "withdrawals_trie": withdrawals_trie,
+        # Glue with body.cairo
+        **body_input,
+        "block_transactions": block.transactions,
+    }
+    return program_input
+
+
 def normalize_transaction(tx: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalize transaction fields to match what TransactionLoad expects.
@@ -237,6 +557,10 @@ def normalize_transaction(tx: Dict[str, Any]) -> Dict[str, Any]:
     tx["gasLimit"] = tx.pop("gas")
     tx["data"] = tx.pop("input")
     tx["to"] = tx["to"] if tx["to"] is not None else ""
+    # ZKPI returns `yParity` field, expected is `v`
+    if "authorizationList" in tx:
+        for authorization in tx["authorizationList"]:
+            authorization["v"] = authorization["yParity"]
     return tx
 
 
@@ -245,7 +569,7 @@ def process_block_transactions(
 ) -> Tuple[Tuple[LegacyTransaction, ...], Tuple[Dict[str, Any], ...]]:
 
     transactions = tuple(
-        TransactionLoad(normalize_transaction(tx), ForkLoad("cancun")).read()
+        TransactionLoad(normalize_transaction(tx), ForkLoad("prague")).read()
         for tx in block_transactions
     )
     encoded_transactions = tuple(

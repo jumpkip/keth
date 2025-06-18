@@ -1,5 +1,4 @@
 from starkware.cairo.common.alloc import alloc
-from starkware.cairo.common.registers import get_fp_and_pc
 from starkware.cairo.common.cairo_builtins import BitwiseBuiltin
 from starkware.cairo.common.math import assert_nn_le, unsigned_div_rem
 from starkware.cairo.common.math_cmp import is_le_felt
@@ -9,14 +8,17 @@ from starkware.cairo.common.pow import pow
 from starkware.cairo.common.cairo_sha256.sha256_utils import (
     compute_message_schedule,
     BATCH_SIZE,
-    ALL_ONES,
-    sha2_compress,
-    get_round_constants,
     finalize_sha256,
 )
+from ethereum_types.bytes import Bytes, Bytes4, ListBytes4, ListBytes4Struct
+from ethereum.utils.bytes import Bytes_to_be_ListBytes4, ListBytes4_be_to_bytes
 
 // The hints are whitelisted with 'BLOCK_SIZE' in the rust VM but starkware renamed to 'BATCH_SIZE'
 const BLOCK_SIZE = BATCH_SIZE;
+
+EMPTY_SHA256:
+dw 0x24b96f99c8f4fb9a141cfc9842c4b0e3;
+dw 0x55b852781b9995a44c939b64e441ae27;
 
 // Source: https://github.com/cartridge-gg/cairo-sha256/blob/8d2ae515ab5cc9fc530c2dcf3ed1172bd181136e/src/sha256.cairo
 const SHA256_INPUT_CHUNK_SIZE_FELTS = 16;
@@ -25,6 +27,17 @@ const SHA256_STATE_SIZE_FELTS = 8;
 // Each instance consists of 16 words of message, 8 words for the input state and 8 words
 // for the output state.
 const SHA256_INSTANCE_SIZE = SHA256_INPUT_CHUNK_SIZE_FELTS + 2 * SHA256_STATE_SIZE_FELTS;
+
+func sha256_bytes{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(buffer: Bytes) -> Bytes {
+    alloc_locals;
+    let list_bytes4_be = Bytes_to_be_ListBytes4(buffer);
+    // The number of bytes to hash is taken from the original input
+    let hash = sha256_be_output(list_bytes4_be.value.data, buffer.value.len);
+    tempvar hash_bytes4 = ListBytes4(new ListBytes4Struct(cast(hash, Bytes4*), 8));
+    // Split words and return bytes hash code.
+    let hash_bytes = ListBytes4_be_to_bytes(hash_bytes4);
+    return hash_bytes;
+}
 
 // Computes SHA256 of 'input'. Inputs of arbitrary length are supported.
 // To use this function, split the input into (up to) 14 words of 32 bits (big endian).

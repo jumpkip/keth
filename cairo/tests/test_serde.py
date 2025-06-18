@@ -2,34 +2,6 @@ from collections import ChainMap
 from typing import Annotated, Any, List, Mapping, Optional, Set, Tuple, Type, Union
 
 import pytest
-from ethereum.cancun.blocks import Block, Header, Log, Receipt, Withdrawal
-from ethereum.cancun.fork import ApplyBodyOutput, BlockChain
-from ethereum.cancun.fork_types import Account, Address, Bloom, Root, VersionedHash
-from ethereum.cancun.state import State, TransientStorage
-from ethereum.cancun.transactions import (
-    AccessListTransaction,
-    BlobTransaction,
-    FeeMarketTransaction,
-    LegacyTransaction,
-    Transaction,
-)
-from ethereum.cancun.trie import (
-    BranchNode,
-    ExtensionNode,
-    InternalNode,
-    LeafNode,
-    Node,
-    Trie,
-)
-from ethereum.cancun.vm import Environment, Evm, Message
-from ethereum.cancun.vm.exceptions import (
-    InvalidOpcode,
-    Revert,
-    StackOverflowError,
-    StackUnderflowError,
-)
-from ethereum.cancun.vm.gas import ExtendMemory, MessageCallGas
-from ethereum.cancun.vm.interpreter import MessageCallOutput
 from ethereum.crypto.alt_bn128 import BNF, BNF2, BNF12, BNP, BNP2
 from ethereum.crypto.hash import Hash32
 from ethereum.crypto.kzg import FQ, FQ2, BLSFieldElement, KZGCommitment, KZGProof
@@ -38,6 +10,48 @@ from ethereum.exceptions import (
     InvalidSignatureError,
     InvalidTransaction,
 )
+from ethereum.prague.blocks import Block, Header, Log, Receipt, Withdrawal
+from ethereum.prague.fork import BlockChain
+from ethereum.prague.fork_types import (
+    Account,
+    Address,
+    Authorization,
+    Bloom,
+    Root,
+    VersionedHash,
+)
+from ethereum.prague.state import State, TransientStorage
+from ethereum.prague.transactions import (
+    Access,
+    AccessListTransaction,
+    BlobTransaction,
+    FeeMarketTransaction,
+    LegacyTransaction,
+    SetCodeTransaction,
+    Transaction,
+)
+from ethereum.prague.trie import (
+    BranchNode,
+    ExtensionNode,
+    InternalNode,
+    LeafNode,
+    Node,
+    Trie,
+)
+from ethereum.prague.vm import (
+    BlockEnvironment,
+    Evm,
+    Message,
+    TransactionEnvironment,
+)
+from ethereum.prague.vm.exceptions import (
+    InvalidOpcode,
+    Revert,
+    StackOverflowError,
+    StackUnderflowError,
+)
+from ethereum.prague.vm.gas import ExtendMemory, MessageCallGas
+from ethereum.prague.vm.interpreter import MessageCallOutput
 from ethereum_types.bytes import (
     Bytes,
     Bytes0,
@@ -47,7 +61,7 @@ from ethereum_types.bytes import (
     Bytes48,
     Bytes256,
 )
-from ethereum_types.numeric import U64, U256, Uint
+from ethereum_types.numeric import U8, U64, U256, Uint
 from hypothesis import HealthCheck, assume, given, settings
 from py_ecc.fields import optimized_bls12_381_FQ as BLSF
 from py_ecc.fields import optimized_bls12_381_FQ2 as BLSF2
@@ -232,11 +246,14 @@ class TestSerde:
             bool,
             U64,
             Uint,
+            Optional[Uint],
             U256,
             Bytes0,
             Bytes8,
             Bytes20,
             Bytes32,
+            Optional[Bytes32],
+            Optional[Hash32],
             Tuple[Bytes32, ...],
             Bytes256,
             Bytes,
@@ -255,15 +272,16 @@ class TestSerde:
             Bloom,
             VersionedHash,
             Tuple[VersionedHash, ...],
-            Tuple[Address, Uint, Tuple[VersionedHash, ...]],
+            Tuple[Address, Uint, Tuple[VersionedHash, ...], U64],
             Union[Bytes0, Address],
+            Access,
+            Tuple[Access, ...],
             LegacyTransaction,
             AccessListTransaction,
             FeeMarketTransaction,
             BlobTransaction,
+            SetCodeTransaction,
             Transaction,
-            Tuple[Tuple[Address, Tuple[Bytes32, ...]], ...],
-            Tuple[Address, Tuple[Bytes32, ...]],
             MessageCallGas,
             LeafNode,
             ExtensionNode,
@@ -295,7 +313,8 @@ class TestSerde:
                 ]
             ],
             List[Hash32],
-            Environment,
+            BlockEnvironment,
+            TransactionEnvironment,
             Stack[U256],
             Memory,
             Evm,
@@ -319,7 +338,6 @@ class TestSerde:
             Trie[Bytes, Optional[Union[Bytes, LegacyTransaction]]],
             Trie[Bytes, Optional[Union[Bytes, Receipt]]],
             Trie[Bytes, Optional[Union[Bytes, Withdrawal]]],
-            ApplyBodyOutput,
             U384,
             Optional[U384],
             BNF12,
@@ -348,6 +366,9 @@ class TestSerde:
             BLSF12,
             Tuple[FQ, FQ2],
             Tuple[Tuple[FQ, FQ2], Tuple[FQ, FQ2]],
+            Authorization,
+            Tuple[Authorization, ...],
+            U8,
         ],
     ):
         assume(no_empty_sequence(b))
@@ -379,7 +400,9 @@ class TestSerde:
     ):
         base = segments.gen_arg([gen_arg(type(err), err)])
         result = serde.serialize(to_cairo_type(type(err)), base, shift=0)
-        assert issubclass(result.__class__, Exception)
+        assert type(result) is type(err)
+        if hasattr(err, "message"):
+            assert result.message == err.message
 
     @pytest.mark.parametrize(
         "error_type",

@@ -3,15 +3,16 @@ from pathlib import Path
 from typing import Dict, Mapping, Optional, Tuple, Union
 
 import pytest
-from ethereum.cancun.fork_types import EMPTY_ACCOUNT, Account, Address
-from ethereum.cancun.trie import (
+from ethereum.crypto.hash import Hash32, keccak256
+from ethereum.prague.fork_types import EMPTY_ACCOUNT, Account, Address
+from ethereum.prague.trie import (
     BranchNode,
     ExtensionNode,
     InternalNode,
     LeafNode,
+    bytes_to_nibble_list,
     encode_internal_node,
 )
-from ethereum.crypto.hash import Hash32, keccak256
 from ethereum_rlp import rlp
 from ethereum_rlp.rlp import Extended
 from ethereum_types.bytes import Bytes, Bytes32
@@ -20,9 +21,11 @@ from hypothesis import assume, given
 from hypothesis import strategies as st
 from hypothesis.strategies import composite
 
-from cairo_addons.rust_bindings.vm import poseidon_hash_many
+from cairo_addons.rust_bindings.vm import blake2s_hash_many
 from cairo_addons.utils.uint256 import int_to_uint256
-from mpt.ethereum_tries import EthereumTrieTransitionDB
+from keth_types.types import EMPTY_TRIE_HASH, encode_account
+from mpt.ethereum_tries import EthereumTries, EthereumTrieTransitionDB
+from mpt.trie_builder import TrieTestBuilder
 from mpt.trie_diff import StateDiff, resolve
 from mpt.utils import decode_node
 
@@ -62,6 +65,98 @@ def embedded_node_strategy(draw):
     }
 
 
+@composite
+def invalid_mpt_strategy(draw, invalid_case: str):
+    """
+    Creates a EthereumTries that is invalid.
+    Invalid cases:
+    1. Branch Node:
+        - Non-empty value.
+        - Less than two non-null subnodes.
+    2. Extension Node:
+        - Empty key segment.
+        - None subnode.
+    3. Leaf Node:
+        - Empty value.
+        - Length of rest_of_key plus path > 64.
+    """
+
+    builder = TrieTestBuilder()
+
+    address = draw(st.from_type(Address))
+    nibble_path = bytes_to_nibble_list(keccak256(address))
+    other_address = draw(st.from_type(Address))
+    other_nibble_path = bytes_to_nibble_list(keccak256(other_address))
+    # Ensure the first nibble is different
+    assume(nibble_path[0] != other_nibble_path[0])
+
+    account = draw(st.from_type(Account))
+    assume(account != EMPTY_ACCOUNT)
+    leaf_value = encode_account(account, EMPTY_TRIE_HASH)
+
+    match invalid_case:
+        case "NonEmptyBytesValue":
+            branch = builder.branch()
+            branch.with_value(leaf_value)
+            branch.with_leaf(nibble_path[0], nibble_path[1:], leaf_value)
+            builder.build()
+
+        case "LTTwoNonNullSubnodes":
+            branch = builder.branch()
+            length = draw(st.integers(min_value=0, max_value=1))
+            match length:
+                case 0:
+                    pass
+                case 1:
+                    branch.with_leaf(nibble_path[0], nibble_path[1:], leaf_value)
+            builder.build()
+
+        case "EmptyKeySegment":
+            extension = builder.extension(b"")
+            extension.with_leaf(nibble_path, leaf_value)
+            builder.build()
+
+        case "EmptySubnode":
+            branch = builder.branch()
+            branch.with_extension(nibble_path[0], nibble_path[1:])
+            branch.with_leaf(other_nibble_path[0], other_nibble_path[1:], leaf_value)
+            builder.build()
+
+        case "EmptyValue":
+            branch = builder.branch()
+            branch.with_leaf(nibble_path[0], nibble_path[1:], b"")
+            branch.with_leaf(other_nibble_path[0], other_nibble_path[1:], leaf_value)
+            builder.build()
+
+        case "InvalidFullPath":
+            branch = builder.branch()
+            # Incorrect: use the first nibble and the full path (65 nibbles)
+            branch.with_leaf(nibble_path[0], nibble_path, leaf_value)
+            # Correct: use the first nibble and the rest of the path (64 nibbles)
+            branch.with_leaf(other_nibble_path[0], other_nibble_path[1:], leaf_value)
+            builder.build()
+
+        case "InvalidParent":
+            extension = builder.extension(nibble_path[0:1])
+            ext_child = extension.with_extension(nibble_path[1:2])
+            ext_child.with_leaf(nibble_path[2:], leaf_value)
+            builder.build()
+
+    return builder.to_ethereum_tries(addresses=[address, other_address])
+
+
+@pytest.fixture(scope="session")
+def empty_ethereum_tries():
+    """Provides an empty, valid EthereumTrie instance."""
+    return EthereumTries(
+        nodes={},
+        codes={},
+        address_preimages={},
+        storage_key_preimages={},
+        state_root=EMPTY_TRIE_HASH,
+    )
+
+
 @pytest.fixture
 def ethereum_trie_transition_db(data_path):
     return EthereumTrieTransitionDB.from_json(data_path)
@@ -78,7 +173,7 @@ def node_store(zkpi):
 
 class TestTrieDiff:
     @pytest.mark.parametrize(
-        "data_path", [Path("test_data/21688509.json")], scope="session"
+        "data_path", [Path("test_data/22615247.json")], scope="session"
     )
     def test_trie_diff(
         self,
@@ -105,7 +200,6 @@ class TestTrieDiff:
             storage_key_preimages=ethereum_trie_transition_db.storage_key_preimages,
             left=ethereum_trie_transition_db.state_root,
             right=ethereum_trie_transition_db.post_state_root,
-            account_address=None,
         )
 
         accounts_lookup: Dict[Address, Tuple[Optional[Account], Optional[Account]]] = {
@@ -132,12 +226,49 @@ class TestTrieDiff:
                 address
             ].items():
                 key = int_to_uint256(int.from_bytes(key, "little"))
-                key_hashed = poseidon_hash_many(
+                key_hashed = blake2s_hash_many(
                     (int.from_bytes(address, "little"), *key)
                 )
                 assert (prev_value, new_value) == storage_lookup[key_hashed]
                 keys_in_address += 1
             assert keys_in_address == len(state_diff._storage_tries[address].keys())
+
+    @pytest.mark.parametrize(
+        "invalid_case",
+        [
+            "NonEmptyBytesValue",
+            "LTTwoNonNullSubnodes",
+            "EmptyKeySegment",
+            "EmptySubnode",
+            "EmptyValue",
+            "InvalidFullPath",
+            "InvalidParent",
+        ],
+    )
+    @given(data=st.data())
+    def test_invalid_trie_diff(
+        self,
+        cairo_run,
+        empty_ethereum_tries,
+        data,
+        invalid_case,
+    ):
+        invalid_post_trie = data.draw(invalid_mpt_strategy(invalid_case=invalid_case))
+
+        trie = EthereumTrieTransitionDB.from_pre_and_post_tries(
+            empty_ethereum_tries, invalid_post_trie
+        )
+        with pytest.raises(Exception, match=re.escape(invalid_case)):
+            cairo_run(
+                "compute_diff_entrypoint",
+                node_store=trie.nodes,
+                address_preimages=trie.address_preimages,
+                storage_key_preimages=trie.storage_key_preimages,
+                left=trie.state_root,
+                right=trie.post_state_root,
+            )
+        with pytest.raises(Exception, match=re.escape(invalid_case)):
+            StateDiff.from_tries(trie)
 
     @pytest.mark.parametrize(
         "data_path", [Path("test_data/22081873.json")], scope="session"
@@ -377,7 +508,7 @@ class TestTrieDiff:
 
         for key, (prev_value, new_value) in diff_cls._storage_tries[address].items():
             key = int_to_uint256(int.from_bytes(key, "little"))
-            hashed_key = poseidon_hash_many((int.from_bytes(address, "little"), *key))
+            hashed_key = blake2s_hash_many((int.from_bytes(address, "little"), *key))
             assert (prev_value, new_value) == result_lookup[hashed_key]
 
     @given(storage_key=..., address=..., data=st.data())

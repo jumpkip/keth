@@ -1,10 +1,10 @@
 from starkware.cairo.common.alloc import alloc
-from starkware.cairo.common.cairo_builtins import BitwiseBuiltin, KeccakBuiltin
-from starkware.cairo.common.math_cmp import is_le, is_not_zero
-from starkware.cairo.common.math import assert_not_zero, split_int
+from starkware.cairo.common.cairo_builtins import BitwiseBuiltin
+from starkware.cairo.common.math_cmp import is_le
+from starkware.cairo.common.math import assert_not_zero
 from starkware.cairo.common.memcpy import memcpy
 
-from ethereum_types.numeric import Bool, U256, Uint, U64, U256Struct, bool
+from ethereum_types.numeric import Bool, U256, U256Struct, U64, Uint, bool
 from ethereum_types.bytes import (
     Bytes,
     Bytes0,
@@ -12,23 +12,25 @@ from ethereum_types.bytes import (
     BytesStruct,
     Bytes8,
     Bytes32,
-    Bytes32Struct,
-    TupleBytes,
+    Bytes256,
     String,
     StringStruct,
     TupleBytes32,
     TupleBytes32Struct,
 )
-from ethereum.cancun.blocks import (
+from ethereum.prague.blocks import (
     Log,
+    LogStruct,
+    TupleLogStruct,
     TupleLog,
     Receipt,
+    ReceiptStruct,
     Withdrawal,
     Header,
     UnionBytesLegacyTransactionEnum,
     UnionBytesLegacyTransaction,
 )
-from ethereum.cancun.fork_types import (
+from ethereum.prague.fork_types import (
     Address,
     Account,
     AccountStruct,
@@ -36,34 +38,40 @@ from ethereum.cancun.fork_types import (
     Address_from_felt_be,
     TupleVersionedHash,
     TupleVersionedHashStruct,
+    TupleAuthorization,
+    TupleAuthorizationStruct,
+    Authorization,
+    AuthorizationStruct,
 )
-from ethereum.cancun.transactions_types import (
+from ethereum.prague.transactions_types import (
     LegacyTransaction,
     To,
-    AccessList,
+    Access,
+    AccessStruct,
     ToStruct,
-    TupleAccessList,
+    TupleAccess,
     AccessListTransaction,
     FeeMarketTransaction,
     BlobTransaction,
+    SetCodeTransaction,
     Transaction,
-    TupleAccessListStruct,
-    AccessListStruct,
+    TupleAccessStruct,
     LegacyTransactionStruct,
     AccessListTransactionStruct,
     FeeMarketTransactionStruct,
     BlobTransactionStruct,
+    SetCodeTransactionStruct,
 )
-from ethereum.crypto.hash import keccak256, Hash32
+from ethereum.crypto.hash import Hash32
 from ethereum.utils.numeric import (
     U256_from_be_bytes,
     Bytes32_from_be_bytes,
     Uint_from_be_bytes,
     U64_from_be_bytes,
+    U8_from_be_bytes,
 )
 from ethereum.utils.bytes import Bytes8_to_Bytes, Bytes__eq__, Bytes_to_Bytes32
 from cairo_core.comparison import is_zero
-from legacy.utils.array import reverse
 from legacy.utils.bytes import (
     felt_to_bytes,
     bytes_to_felt,
@@ -71,8 +79,6 @@ from legacy.utils.bytes import (
     felt_to_bytes20_little,
     uint256_to_bytes_little,
     uint256_to_bytes,
-    felt_to_bytes16_little,
-    uint256_from_bytes_be,
 )
 from cairo_core.control_flow import raise
 
@@ -473,9 +479,7 @@ func encode_bytes8{range_check_ptr}(raw_bytes8: Bytes8) -> Bytes {
     return result;
 }
 
-func encode_account{range_check_ptr, bitwise_ptr: BitwiseBuiltin*, keccak_ptr: KeccakBuiltin*}(
-    raw_account_data: Account, storage_root: Bytes
-) -> Bytes {
+func encode_account{range_check_ptr}(raw_account_data: Account, storage_root: Bytes) -> Bytes {
     alloc_locals;
     let (local dst) = alloc();
     let body_ptr = dst + PREFIX_LEN_MAX;
@@ -629,7 +633,7 @@ func encode_withdrawal{range_check_ptr}(raw_withdrawal: Withdrawal) -> Bytes {
     return result;
 }
 
-func encode_tuple_access_list{range_check_ptr}(raw_tuple_access_list: TupleAccessList) -> Bytes {
+func encode_tuple_access_list{range_check_ptr}(raw_tuple_access_list: TupleAccess) -> Bytes {
     alloc_locals;
     let (local dst) = alloc();
     let len = _encode_tuple_access_list(dst, raw_tuple_access_list);
@@ -637,14 +641,14 @@ func encode_tuple_access_list{range_check_ptr}(raw_tuple_access_list: TupleAcces
     return result;
 }
 
-func encode_access_list{range_check_ptr}(raw_access_list: AccessList) -> Bytes {
+func encode_access_list{range_check_ptr}(raw_access_list: Access) -> Bytes {
     alloc_locals;
     let (local dst) = alloc();
     let body_ptr = dst + PREFIX_LEN_MAX;
 
-    let address_len = _encode_address(body_ptr, raw_access_list.value.address);
+    let address_len = _encode_address(body_ptr, raw_access_list.value.account);
     let body_ptr = body_ptr + address_len;
-    let storage_keys_len = _encode_tuple_bytes32(body_ptr, raw_access_list.value.storage_keys);
+    let storage_keys_len = _encode_tuple_bytes32(body_ptr, raw_access_list.value.slots);
     let body_ptr = body_ptr + storage_keys_len;
 
     let body_len = body_ptr - dst - PREFIX_LEN_MAX;
@@ -828,6 +832,68 @@ func encode_blob_transaction{range_check_ptr}(transaction: BlobTransaction) -> B
     return result;
 }
 
+func encode_set_code_transaction{range_check_ptr}(transaction: SetCodeTransaction) -> Bytes {
+    alloc_locals;
+    let (local dst) = alloc();
+    let body_ptr = dst + PREFIX_LEN_MAX;  // Leave space for prefix
+
+    // Encode all fields as a sequence
+    let chain_id_len = _encode_uint(body_ptr, transaction.value.chain_id.value);
+    let body_ptr = body_ptr + chain_id_len;
+
+    tempvar nonce_u256 = U256(new U256Struct(transaction.value.nonce.value, 0));
+    let nonce_len = _encode_u256(body_ptr, nonce_u256);
+    let body_ptr = body_ptr + nonce_len;
+
+    let max_priority_fee_per_gas_len = _encode_uint(
+        body_ptr, transaction.value.max_priority_fee_per_gas.value
+    );
+    let body_ptr = body_ptr + max_priority_fee_per_gas_len;
+
+    let max_fee_per_gas_len = _encode_uint(body_ptr, transaction.value.max_fee_per_gas.value);
+    let body_ptr = body_ptr + max_fee_per_gas_len;
+
+    let gas_len = _encode_uint(body_ptr, transaction.value.gas.value);
+    let body_ptr = body_ptr + gas_len;
+
+    let to_len = _encode_address(body_ptr, transaction.value.to);
+    let body_ptr = body_ptr + to_len;
+
+    let value_len = _encode_u256(body_ptr, transaction.value.value);
+    let body_ptr = body_ptr + value_len;
+
+    let data_len = _encode_bytes(body_ptr, transaction.value.data);
+    let body_ptr = body_ptr + data_len;
+
+    let access_list_len = _encode_tuple_access_list(body_ptr, transaction.value.access_list);
+    let body_ptr = body_ptr + access_list_len;
+
+    let authorizations_len = _encode_tuple_authorization(
+        body_ptr, transaction.value.authorizations
+    );
+    let body_ptr = body_ptr + authorizations_len;
+
+    let y_parity_len = _encode_u256(body_ptr, transaction.value.y_parity);
+    let body_ptr = body_ptr + y_parity_len;
+
+    let r_len = _encode_u256(body_ptr, transaction.value.r);
+    let body_ptr = body_ptr + r_len;
+
+    let s_len = _encode_u256(body_ptr, transaction.value.s);
+    let body_ptr = body_ptr + s_len;
+
+    // Calculate body length and encode prefix
+    let body_len = body_ptr - dst - PREFIX_LEN_MAX;
+    let body_ptr = dst + PREFIX_LEN_MAX;
+    let prefix_len = _encode_prefix_len(body_ptr, body_len);
+
+    // Prepend type byte (0x04)
+    assert [body_ptr - prefix_len - 1] = 0x04;
+
+    tempvar result = Bytes(new BytesStruct(body_ptr - prefix_len - 1, prefix_len + body_len + 1));
+    return result;
+}
+
 func encode_transaction{range_check_ptr}(transaction: Transaction) -> UnionBytesLegacyTransaction {
     alloc_locals;
 
@@ -880,10 +946,55 @@ func encode_transaction{range_check_ptr}(transaction: Transaction) -> UnionBytes
         return result;
     }
 
+    if (cast(transaction.value.set_code_transaction.value, felt) != 0) {
+        let encoded_set_code_transaction = encode_set_code_transaction(
+            transaction.value.set_code_transaction
+        );
+        tempvar result = UnionBytesLegacyTransaction(
+            new UnionBytesLegacyTransactionEnum(
+                bytes=encoded_set_code_transaction,
+                legacy_transaction=LegacyTransaction(cast(0, LegacyTransactionStruct*)),
+            ),
+        );
+        return result;
+    }
+
     // Should never happen - one pointer must be non-null
     with_attr error_message("InvalidTransactionType") {
         jmp raise.raise_label;
     }
+}
+
+func encode_authorization{range_check_ptr}(authorization: Authorization) -> Bytes {
+    alloc_locals;
+    let (local dst) = alloc();
+    let body_ptr = dst + PREFIX_LEN_MAX;
+
+    let chain_id_len = _encode_u256(body_ptr, authorization.value.chain_id);
+    let body_ptr = body_ptr + chain_id_len;
+
+    let address_len = _encode_address(body_ptr, authorization.value.address);
+    let body_ptr = body_ptr + address_len;
+
+    let nonce_len = _encode_uint(body_ptr, authorization.value.nonce.value);
+    let body_ptr = body_ptr + nonce_len;
+
+    let y_parity_len = _encode_uint(body_ptr, authorization.value.y_parity.value);
+    let body_ptr = body_ptr + y_parity_len;
+
+    let r_len = _encode_u256(body_ptr, authorization.value.r);
+    let body_ptr = body_ptr + r_len;
+
+    let s_len = _encode_u256(body_ptr, authorization.value.s);
+    let body_ptr = body_ptr + s_len;
+
+    // Calculate body length and encode prefix
+    let body_len = body_ptr - dst - PREFIX_LEN_MAX;
+    let body_ptr = dst + PREFIX_LEN_MAX;
+    let prefix_len = _encode_prefix_len(body_ptr, body_len);
+
+    tempvar result = Bytes(new BytesStruct(body_ptr - prefix_len, prefix_len + body_len));
+    return result;
 }
 
 //
@@ -1457,6 +1568,245 @@ func decode_to_access_list_transaction{range_check_ptr, bitwise_ptr: BitwiseBuil
     return tx;
 }
 
+func decode_to_set_code_transaction{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
+    encoded_data: Bytes
+) -> SetCodeTransaction {
+    alloc_locals;
+    // Decode the RLP-encoded data into a Simple structure
+    let decoded = decode(encoded_data);
+
+    // Verify it's a sequence (list of items)
+    with_attr error_message("Invalid SetCode transaction: expected sequence") {
+        assert cast(decoded.value.bytes.value, felt) = 0;
+    }
+    let items_len = decoded.value.sequence.value.len;
+    let items = decoded.value.sequence.value.data;
+
+    // EIP-7702 (SetCode) transactions must have 13 fields
+    with_attr error_message("Invalid SetCode transaction: wrong number of fields") {
+        assert items_len = 13;
+    }
+
+    // Decode chain_id (U64)
+    with_attr error_message("Invalid chain_id: expected bytes") {
+        assert cast(items[0].value.sequence.value, felt) = 0;
+    }
+    let chain_id = U64_from_be_bytes(items[0].value.bytes);
+
+    // Decode nonce (U64) - encoded as U256, parsed as U64
+    with_attr error_message("Invalid nonce: expected bytes") {
+        assert cast(items[1].value.sequence.value, felt) = 0;
+    }
+    let nonce = U64_from_be_bytes(items[1].value.bytes);
+
+    // Decode max_priority_fee_per_gas (Uint)
+    with_attr error_message("Invalid max_priority_fee_per_gas: expected bytes") {
+        assert cast(items[2].value.sequence.value, felt) = 0;
+    }
+    let max_priority_fee_per_gas = Uint_from_be_bytes(items[2].value.bytes);
+
+    // Decode max_fee_per_gas (Uint)
+    with_attr error_message("Invalid max_fee_per_gas: expected bytes") {
+        assert cast(items[3].value.sequence.value, felt) = 0;
+    }
+    let max_fee_per_gas = Uint_from_be_bytes(items[3].value.bytes);
+
+    // Decode gas (Uint)
+    with_attr error_message("Invalid gas: expected bytes") {
+        assert cast(items[4].value.sequence.value, felt) = 0;
+    }
+    let gas = Uint_from_be_bytes(items[4].value.bytes);
+
+    // Decode to (Address)
+    with_attr error_message("Invalid to: expected bytes") {
+        assert cast(items[5].value.sequence.value, felt) = 0;
+    }
+    let to_bytes = items[5].value.bytes;
+    let to_felt = bytes_to_felt(to_bytes.value.len, to_bytes.value.data);
+    let to = Address_from_felt_be(to_felt);
+
+    // Decode value (U256)
+    with_attr error_message("Invalid value: expected bytes") {
+        assert cast(items[6].value.sequence.value, felt) = 0;
+    }
+    let value = U256_from_be_bytes(items[6].value.bytes);
+
+    // Decode data (Bytes)
+    with_attr error_message("Invalid data: expected bytes") {
+        assert cast(items[7].value.sequence.value, felt) = 0;
+    }
+    let data = items[7].value.bytes;
+
+    // Decode access_list (TupleAccess)
+    with_attr error_message("Invalid access_list: expected sequence") {
+        assert cast(items[8].value.bytes.value, felt) = 0;
+    }
+    let access_list = _decode_access_list(items[8].value.sequence);
+
+    // Decode authorizations (TupleAuthorization)
+    with_attr error_message("Invalid authorizations: expected sequence") {
+        assert cast(items[9].value.bytes.value, felt) = 0;
+    }
+    let authorizations = _decode_authorizations(items[9].value.sequence);
+
+    // Decode y_parity (U256)
+    with_attr error_message("Invalid y_parity: expected bytes") {
+        assert cast(items[10].value.sequence.value, felt) = 0;
+    }
+    let y_parity = U256_from_be_bytes(items[10].value.bytes);
+
+    // Decode r (U256)
+    with_attr error_message("Invalid r: expected bytes") {
+        assert cast(items[11].value.sequence.value, felt) = 0;
+    }
+    let r = U256_from_be_bytes(items[11].value.bytes);
+
+    // Decode s (U256)
+    with_attr error_message("Invalid s: expected bytes") {
+        assert cast(items[12].value.sequence.value, felt) = 0;
+    }
+    let s = U256_from_be_bytes(items[12].value.bytes);
+
+    // Create and return the SetCodeTransaction
+    tempvar tx = SetCodeTransaction(
+        new SetCodeTransactionStruct(
+            chain_id=chain_id,
+            nonce=nonce,
+            max_priority_fee_per_gas=max_priority_fee_per_gas,
+            max_fee_per_gas=max_fee_per_gas,
+            gas=gas,
+            to=to,
+            value=value,
+            data=data,
+            access_list=access_list,
+            authorizations=authorizations,
+            y_parity=y_parity,
+            r=r,
+            s=s,
+        ),
+    );
+    return tx;
+}
+
+func decode_to_receipt{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
+    encoded_data: Bytes
+) -> Receipt {
+    alloc_locals;
+    let decoded = decode(encoded_data);
+
+    with_attr error_message("Invalid receipt: expected sequence") {
+        assert cast(decoded.value.bytes.value, felt) = 0;
+    }
+
+    let items_len = decoded.value.sequence.value.len;
+    let items = decoded.value.sequence.value.data;
+
+    with_attr error_message("Invalid receipt: wrong number of fields") {
+        assert items_len = 4;
+    }
+
+    let succeeded_bytes = items[0].value.bytes;
+    local succeeded;
+    if (succeeded_bytes.value.len != 0) {
+        assert succeeded = succeeded_bytes.value.data[0];
+    } else {
+        assert succeeded = 0;
+    }
+    let cumulative_gas_used = Uint_from_be_bytes(items[1].value.bytes);
+    let bloom_bytes = items[2].value.bytes;
+    assert bloom_bytes.value.len = 256;
+    let bloom = Bytes256(bloom_bytes.value.data);
+    let logs = _decode_logs(items[3].value.sequence);
+
+    tempvar receipt = Receipt(
+        new ReceiptStruct(
+            succeeded=bool(succeeded),
+            cumulative_gas_used=cumulative_gas_used,
+            bloom=bloom,
+            logs=logs,
+        ),
+    );
+    return receipt;
+}
+
+func _decode_logs{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
+    sequence: SequenceSimple
+) -> TupleLog {
+    alloc_locals;
+    let (logs: Log*) = alloc();
+    let logs_len = _decode_logs_inner(logs, sequence.value.len, sequence.value.data);
+
+    tempvar tuple_logs = TupleLog(new TupleLogStruct(data=logs, len=logs_len));
+    return tuple_logs;
+}
+
+func _decode_logs_inner{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
+    logs: Log*, len: felt, items: Simple*
+) -> felt {
+    alloc_locals;
+    if (len == 0) {
+        return 0;
+    }
+
+    with_attr error_message("Invalid log: expected sequence") {
+        assert cast(items[0].value.bytes.value, felt) = 0;
+    }
+
+    let log = items[0].value.sequence;
+
+    with_attr error_message("Invalid log: wrong number of fields") {
+        assert log.value.len = 3;
+    }
+
+    let address_felt = bytes_to_felt(
+        log.value.data[0].value.bytes.value.len, log.value.data[0].value.bytes.value.data
+    );
+    let address = Address_from_felt_be(address_felt);
+    let topics = _decode_topics(log.value.data[1].value.sequence);
+    let data = log.value.data[2].value.bytes;
+
+    assert [logs] = Log(new LogStruct(address=address, topics=topics, data=data));
+
+    let remaining_len = _decode_logs_inner(logs + Log.SIZE, len - 1, items + Simple.SIZE);
+    return 1 + remaining_len;
+}
+
+func _decode_topics{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
+    sequence: SequenceSimple
+) -> TupleBytes32 {
+    alloc_locals;
+    let (topics: Bytes32*) = alloc();
+    let topics_len = _decode_topics_inner(topics, sequence.value.len, sequence.value.data);
+
+    tempvar tuple_topics = TupleBytes32(new TupleBytes32Struct(data=topics, len=topics_len));
+    return tuple_topics;
+}
+
+func _decode_topics_inner{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
+    topics: Bytes32*, len: felt, items: Simple*
+) -> felt {
+    alloc_locals;
+    if (len == 0) {
+        return 0;
+    }
+
+    with_attr error_message("Invalid topic: expected bytes") {
+        assert cast(items[0].value.sequence.value, felt) = 0;
+    }
+
+    let topic_bytes = items[0].value.bytes;
+
+    with_attr error_message("Invalid topic: wrong number of fields") {
+        assert topic_bytes.value.len = 32;
+    }
+
+    let topic = Bytes32_from_be_bytes(topic_bytes);
+    assert [topics] = topic;
+
+    let remaining_len = _decode_topics_inner(topics + Bytes32.SIZE, len - 1, items + Simple.SIZE);
+    return 1 + remaining_len;
+}
+
 // Helper function to decode To type
 func _decode_to{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(bytes: Bytes) -> To {
     if (bytes.value.len == 0) {
@@ -1471,37 +1821,37 @@ func _decode_to{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(bytes: Bytes) -> 
     return to;
 }
 
-// Helper function to decode AccessList
+// Helper function to decode Access
 func _decode_access_list{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
     sequence: SequenceSimple
-) -> TupleAccessList {
+) -> TupleAccess {
     alloc_locals;
-    let (access_list: AccessList*) = alloc();
+    let (access_list: Access*) = alloc();
     let access_list_len = _decode_access_list_inner(
         access_list, sequence.value.len, sequence.value.data
     );
 
-    tempvar tuple_access_list = TupleAccessList(
-        new TupleAccessListStruct(data=access_list, len=access_list_len)
+    tempvar tuple_access_list = TupleAccess(
+        new TupleAccessStruct(data=access_list, len=access_list_len)
     );
     return tuple_access_list;
 }
 
 func _decode_access_list_inner{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
-    access_list: AccessList*, len: felt, items: Simple*
+    access_list: Access*, len: felt, items: Simple*
 ) -> felt {
     alloc_locals;
     if (len == 0) {
         return 0;
     }
 
-    // Each item should be a sequence of [address, storage_keys]
+    // Each item should be a sequence of [account, slots]
     with_attr error_message("Invalid access list entry: expected sequence") {
         assert cast(items[0].value.bytes.value, felt) = 0;
     }
     let entry = items[0].value.sequence;
 
-    // Entry should have exactly 2 items (address and storage_keys)
+    // Entry should have exactly 2 items (account and slots)
     with_attr error_message("Invalid access list entry: wrong number of fields") {
         assert entry.value.len = 2;
     }
@@ -1519,16 +1869,14 @@ func _decode_access_list_inner{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
     with_attr error_message("Invalid storage keys: expected sequence") {
         assert cast(entry.value.data[1].value.bytes.value, felt) = 0;
     }
-    let storage_keys = _decode_storage_keys(entry.value.data[1].value.sequence);
+    let slots = _decode_storage_keys(entry.value.data[1].value.sequence);
 
-    // Create AccessList entry
-    assert [access_list] = AccessList(
-        new AccessListStruct(address=address, storage_keys=storage_keys)
-    );
+    // Create Access entry
+    assert [access_list] = Access(new AccessStruct(account=address, slots=slots));
 
     // Process next entry
     let remaining_len = _decode_access_list_inner(
-        access_list + AccessList.SIZE, len - 1, items + Simple.SIZE
+        access_list + Access.SIZE, len - 1, items + Simple.SIZE
     );
     return 1 + remaining_len;
 }
@@ -1537,19 +1885,19 @@ func _decode_storage_keys{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
     sequence: SequenceSimple
 ) -> TupleBytes32 {
     alloc_locals;
-    let (storage_keys: Bytes32*) = alloc();
+    let (slots: Bytes32*) = alloc();
     let storage_keys_len = _decode_storage_keys_inner(
-        storage_keys, sequence.value.len, sequence.value.data
+        slots, sequence.value.len, sequence.value.data
     );
 
     tempvar tuple_storage_keys = TupleBytes32(
-        new TupleBytes32Struct(data=storage_keys, len=storage_keys_len)
+        new TupleBytes32Struct(data=slots, len=storage_keys_len)
     );
     return tuple_storage_keys;
 }
 
 func _decode_storage_keys_inner{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
-    storage_keys: Bytes32*, len: felt, items: Simple*
+    slots: Bytes32*, len: felt, items: Simple*
 ) -> felt {
     if (len == 0) {
         return 0;
@@ -1560,13 +1908,101 @@ func _decode_storage_keys_inner{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
     }
 
     let key = Bytes32_from_be_bytes(items[0].value.bytes);
-    assert [storage_keys] = key;
+    assert [slots] = key;
 
     // Process next storage key
     let remaining_len = _decode_storage_keys_inner(
-        storage_keys + Bytes32.SIZE, len - 1, items + Simple.SIZE
+        slots + Bytes32.SIZE, len - 1, items + Simple.SIZE
     );
     return 1 + remaining_len;
+}
+
+func _decode_authorizations_inner{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
+    authorizations_ptr: Authorization*, len: felt, items: Simple*
+) -> felt {
+    alloc_locals;
+    if (len == 0) {
+        return 0;
+    }
+
+    // Each item in 'items' is an RLP-decoded Simple, which itself should be a sequence representing an Authorization
+    with_attr error_message("Invalid authorization entry: expected sequence") {
+        assert cast(items[0].value.bytes.value, felt) = 0;
+    }
+    let auth_sequence: SequenceSimple = items[0].value.sequence;
+
+    // An Authorization is RLP-encoded as a sequence of 6 fields
+    with_attr error_message("Invalid authorization entry: wrong number of fields") {
+        assert auth_sequence.value.len = 6;
+    }
+    let auth_fields: Simple* = auth_sequence.value.data;
+
+    // Decode chain_id (U256)
+    with_attr error_message("Invalid authorization chain_id: expected bytes") {
+        assert cast(auth_fields[0].value.sequence.value, felt) = 0;
+    }
+    let chain_id = U256_from_be_bytes(auth_fields[0].value.bytes);
+
+    // Decode address (Address)
+    with_attr error_message("Invalid authorization address: expected bytes") {
+        assert cast(auth_fields[1].value.sequence.value, felt) = 0;
+    }
+    let address_bytes = auth_fields[1].value.bytes;
+    let address_felt = bytes_to_felt(address_bytes.value.len, address_bytes.value.data);
+    let address = Address_from_felt_be(address_felt);
+
+    // Decode nonce (Uint)
+    with_attr error_message("Invalid authorization nonce: expected bytes") {
+        assert cast(auth_fields[2].value.sequence.value, felt) = 0;
+    }
+    let nonce = U64_from_be_bytes(auth_fields[2].value.bytes);
+
+    // Decode y_parity (U8)
+    with_attr error_message("Invalid authorization y_parity: expected bytes") {
+        assert cast(auth_fields[3].value.sequence.value, felt) = 0;
+    }
+    let y_parity = U8_from_be_bytes(auth_fields[3].value.bytes);
+
+    // Decode r (U256)
+    with_attr error_message("Invalid authorization r: expected bytes") {
+        assert cast(auth_fields[4].value.sequence.value, felt) = 0;
+    }
+    let r = U256_from_be_bytes(auth_fields[4].value.bytes);
+
+    // Decode s (U256)
+    with_attr error_message("Invalid authorization s: expected bytes") {
+        assert cast(auth_fields[5].value.sequence.value, felt) = 0;
+    }
+    let s = U256_from_be_bytes(auth_fields[5].value.bytes);
+
+    // Construct Authorization
+    // Assuming AuthorizationStruct matches these fields and types based on encode_authorization
+    assert [authorizations_ptr] = Authorization(
+        new AuthorizationStruct(
+            chain_id=chain_id, address=address, nonce=nonce, y_parity=y_parity, r=r, s=s
+        ),
+    );
+
+    // Process next authorization
+    let remaining_len = _decode_authorizations_inner(
+        authorizations_ptr + Authorization.SIZE, len - 1, items + Simple.SIZE
+    );
+    return 1 + remaining_len;
+}
+
+func _decode_authorizations{range_check_ptr, bitwise_ptr: BitwiseBuiltin*}(
+    sequence: SequenceSimple
+) -> TupleAuthorization {
+    alloc_locals;
+    let (authorizations_array_ptr: Authorization*) = alloc();
+    let authorizations_array_len = _decode_authorizations_inner(
+        authorizations_array_ptr, sequence.value.len, sequence.value.data
+    );
+
+    tempvar tuple_authorizations = TupleAuthorization(
+        new TupleAuthorizationStruct(data=authorizations_array_ptr, len=authorizations_array_len)
+    );
+    return tuple_authorizations;
 }
 
 //
@@ -1808,7 +2244,7 @@ func _encode_tuple_log_inner{range_check_ptr}(dst: felt*, len: felt, raw_tuple_l
 }
 
 func _encode_tuple_access_list_inner{range_check_ptr}(
-    dst: felt*, len: felt, raw_tuple_access_list: AccessList*
+    dst: felt*, len: felt, raw_tuple_access_list: Access*
 ) -> felt {
     alloc_locals;
     if (len == 0) {
@@ -1828,7 +2264,7 @@ func _encode_tuple_access_list_inner{range_check_ptr}(
 }
 
 func _encode_tuple_access_list{range_check_ptr}(
-    dst: felt*, tuple_access_list: TupleAccessList
+    dst: felt*, tuple_access_list: TupleAccess
 ) -> felt {
     alloc_locals;
     if (tuple_access_list.value.len == 0) {
@@ -1887,6 +2323,45 @@ func _encode_bytes8{range_check_ptr}(dst: felt*, raw_bytes8: Bytes8) -> felt {
     alloc_locals;
     let bytes = Bytes8_to_Bytes(raw_bytes8);
     return _encode_bytes(dst, bytes);
+}
+
+func _encode_tuple_authorization_inner{range_check_ptr}(
+    dst: felt*, len: felt, raw_tuple_authorization: Authorization*
+) -> felt {
+    alloc_locals;
+    if (len == 0) {
+        return 0;
+    }
+
+    let authorization_encoded = encode_authorization(raw_tuple_authorization[0]);
+    memcpy(dst, authorization_encoded.value.data, authorization_encoded.value.len);
+
+    let remaining_len = _encode_tuple_authorization_inner(
+        dst + authorization_encoded.value.len, len - 1, raw_tuple_authorization + 1
+    );
+
+    return authorization_encoded.value.len + remaining_len;
+}
+
+func _encode_tuple_authorization{range_check_ptr}(
+    dst: felt*, raw_tuple_authorization: TupleAuthorization
+) -> felt {
+    alloc_locals;
+    if (raw_tuple_authorization.value.len == 0) {
+        assert [dst] = 0xc0;
+        return 1;
+    }
+
+    let (local tmp) = alloc();
+    let body_ptr = tmp + PREFIX_LEN_MAX;
+    let body_len = _encode_tuple_authorization_inner(
+        body_ptr, raw_tuple_authorization.value.len, raw_tuple_authorization.value.data
+    );
+    let prefix_len = _encode_prefix_len(body_ptr, body_len);
+
+    memcpy(dst, body_ptr - prefix_len, prefix_len + body_len);
+
+    return prefix_len + body_len;
 }
 
 //
@@ -2153,6 +2628,61 @@ func encode_eip155_transaction_for_signing{range_check_ptr}(
     return result;
 }
 
+func encode_eip7702_transaction_for_signing{range_check_ptr}(
+    transaction: SetCodeTransaction
+) -> Bytes {
+    alloc_locals;
+    let (local dst) = alloc();
+    let body_ptr = dst + PREFIX_LEN_MAX;  // Leave space for prefix
+
+    // Encode all fields as a sequence
+    let chain_id_len = _encode_uint(body_ptr, transaction.value.chain_id.value);
+    let body_ptr = body_ptr + chain_id_len;
+
+    tempvar nonce_u256 = U256(new U256Struct(transaction.value.nonce.value, 0));
+    let nonce_len = _encode_u256(body_ptr, nonce_u256);
+    let body_ptr = body_ptr + nonce_len;
+
+    let max_priority_fee_per_gas_len = _encode_uint(
+        body_ptr, transaction.value.max_priority_fee_per_gas.value
+    );
+    let body_ptr = body_ptr + max_priority_fee_per_gas_len;
+
+    let max_fee_per_gas_len = _encode_uint(body_ptr, transaction.value.max_fee_per_gas.value);
+    let body_ptr = body_ptr + max_fee_per_gas_len;
+
+    let gas_len = _encode_uint(body_ptr, transaction.value.gas.value);
+    let body_ptr = body_ptr + gas_len;
+
+    let to_len = _encode_address(body_ptr, transaction.value.to);
+    let body_ptr = body_ptr + to_len;
+
+    let value_len = _encode_u256(body_ptr, transaction.value.value);
+    let body_ptr = body_ptr + value_len;
+
+    let data_len = _encode_bytes(body_ptr, transaction.value.data);
+    let body_ptr = body_ptr + data_len;
+
+    let access_list_len = _encode_tuple_access_list(body_ptr, transaction.value.access_list);
+    let body_ptr = body_ptr + access_list_len;
+
+    let authorizations_len = _encode_tuple_authorization(
+        body_ptr, transaction.value.authorizations
+    );
+    let body_ptr = body_ptr + authorizations_len;
+
+    // Calculate body length and encode prefix
+    let body_len = body_ptr - dst - PREFIX_LEN_MAX;
+    let body_ptr = dst + PREFIX_LEN_MAX;
+    let prefix_len = _encode_prefix_len(body_ptr, body_len);
+
+    // Prepend type byte (0x04)
+    assert [body_ptr - prefix_len - 1] = 0x04;
+
+    tempvar result = Bytes(new BytesStruct(body_ptr - prefix_len - 1, prefix_len + body_len + 1));
+    return result;
+}
+
 func encode_header{range_check_ptr}(header: Header) -> Bytes {
     alloc_locals;
     let (local dst) = alloc();
@@ -2220,6 +2750,9 @@ func encode_header{range_check_ptr}(header: Header) -> Bytes {
         body_ptr, header.value.parent_beacon_block_root
     );
     let body_ptr = body_ptr + parent_beacon_block_root_len;
+
+    let requests_hash_len = _encode_bytes32(body_ptr, header.value.requests_hash);
+    let body_ptr = body_ptr + requests_hash_len;
 
     // Calculate body length and encode prefix
     let body_len = body_ptr - dst - PREFIX_LEN_MAX;

@@ -1,7 +1,6 @@
 %builtins range_check
 
 from starkware.cairo.common.alloc import alloc
-from starkware.cairo.common.uint256 import Uint256
 
 from cairo_core.numeric import U256
 from cairo_core.bytes import Bytes
@@ -13,6 +12,7 @@ from legacy.utils.bytes import (
     uint256_to_bytes,
     uint256_to_bytes32,
     bytes_to_bytes8_little_endian,
+    bytes_to_bytes4_little_endian,
     bytes_to_felt,
     bytes_to_felt_le,
 )
@@ -59,6 +59,13 @@ func test__bytes_to_bytes8_little_endian{range_check_ptr}(bytes: Bytes) -> felt*
     bytes_to_bytes8_little_endian(bytes8, bytes.value.len, bytes.value.data);
 
     return bytes8;
+}
+
+func test__bytes_to_bytes4_little_endian{range_check_ptr}(bytes: Bytes) -> felt* {
+    alloc_locals;
+    let (bytes4) = alloc();
+    bytes_to_bytes4_little_endian(bytes4, bytes.value.len, bytes.value.data);
+    return bytes4;
 }
 
 func test__bytes_to_felt(bytes: Bytes) -> felt {

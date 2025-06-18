@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "An EVM proving backend in Cairo"
 readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT OR Apache-2.0" }
 
 dependencies = [
   "keth-types",
@@ -23,12 +24,14 @@ dependencies = [
   "pytest-timeout>=2.3.1",
   "pytest-randomly>=3.16.0",
   "pytest-timeout>=2.3.1",
-  "ethereum",
+  "ethereum-execution",
   "garaga-zero",
+  "requests-cache>=1.2.1",
 ]
 
 [tool.uv]
 dev-dependencies = [
+  "cairo-lint",
   "gprof2dot>=2024.6.6",
   "jupyter>=1.1.1",
   "snakeviz>=2.2.2",
@@ -48,12 +51,14 @@ dev-dependencies = [
 ]
 
 [tool.uv.sources]
+ethereum-execution = { git = "https://github.com/kkrt-labs/execution-specs.git", rev = "9e5f36b4d7f8e8ae2d8831d2460fbd88648fcdee" }
 cairo-addons = { workspace = true }
 cairo-ec = { workspace = true }
 cairo-core = { workspace = true }
 eth-rpc = { workspace = true }
 keth-types = { workspace = true }
 mpt = { workspace = true }
+cairo-lint = { workspace = true }
 garaga-zero = { git = "https://github.com/kkrt-labs/garaga-zero", rev = "08e80a99c60a11adc5715c329a4390937d12d77d" }
 
 [tool.uv.workspace]
@@ -176,6 +181,8 @@ markers = [
   "slow",
   "cairo_file(path): mark test with cairo source file path to compile",
   "bigmem",
+  "unit",
+  "integration",
 ]
 norecursedirs = ".* cairo/tests/ef_tests/fixtures"
 addopts = [
@@ -193,8 +200,8 @@ known_first_party = [
   "cairo_addons",
   "eth_rpc",
   "mpt",
-  "tests",
   "utils",
+  "tests",
   "keth_types",
 ]
 
@@ -212,6 +219,9 @@ check-hidden = ''
 [tool.bandit]
 exclude_dirs = ["tests"]
 
+[tool.cairo-lint]
+exclude_dirs = ["python/cairo-lint/tests/test_data"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -223,6 +233,7 @@ packages = ["cairo/src", "cairo/tests", "cairo/scripts"]
 compile = "scripts.compile_cairo:main"
 compile_keth = "scripts.compile_cairo:compile_keth"
 keth = "scripts.keth:app"
+prove-cairo = "scripts.prove_cairo:app"
 test-fast = "scripts.test:test_fast"
 test-unit = "scripts.test:test_unit"
 test-ef = "scripts.test:test_ef"

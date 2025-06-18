@@ -12,7 +12,7 @@
 //
 // This is an error:
 // ```
-// from ethereum.cancun.vm.exceptions import StackUnderflowError
+// from ethereum.prague.vm.exceptions import StackUnderflowError
 // tempvar error = new EthereumException(StackUnderflowError);
 // ```
 
@@ -30,6 +30,7 @@ struct OptionalEthereumException {
 
 const ValueError = 'ValueError';
 const AssertionError = 'AssertionError';
+const InvalidSignatureError = 'InvalidSignatureError';
 
 // Generic exception type.
 using Exception = EthereumException;

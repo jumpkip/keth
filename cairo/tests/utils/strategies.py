@@ -15,31 +15,6 @@ from typing import (
 )
 
 from eth_keys.datatypes import PrivateKey
-from ethereum.cancun.blocks import Header, Log, Receipt, Withdrawal
-from ethereum.cancun.fork_types import (
-    Account,
-    Address,
-    Bloom,
-    Root,
-    VersionedHash,
-)
-from ethereum.cancun.state import State, TransientStorage
-from ethereum.cancun.transactions import (
-    AccessListTransaction,
-    BlobTransaction,
-    FeeMarketTransaction,
-    LegacyTransaction,
-)
-from ethereum.cancun.trie import (
-    BranchNode,
-    ExtensionNode,
-    LeafNode,
-    Trie,
-    copy_trie,
-    encode_internal_node,
-)
-from ethereum.cancun.trie import root as compute_root
-from ethereum.cancun.vm import Environment, Evm, Message
 from ethereum.crypto.alt_bn128 import (
     BNF,
     BNF2,
@@ -52,7 +27,41 @@ from ethereum.crypto.finite_field import GaloisField
 from ethereum.crypto.hash import Hash32, keccak256
 from ethereum.crypto.kzg import BLS_MODULUS, BLSFieldElement, KZGCommitment, KZGProof
 from ethereum.exceptions import EthereumException
+from ethereum.prague.blocks import Header, Log, Receipt, Withdrawal
+from ethereum.prague.fork_types import (
+    Account,
+    Address,
+    Authorization,
+    Bloom,
+    Root,
+    VersionedHash,
+)
+from ethereum.prague.state import State, TransientStorage
+from ethereum.prague.transactions import (
+    AccessListTransaction,
+    BlobTransaction,
+    FeeMarketTransaction,
+    LegacyTransaction,
+    SetCodeTransaction,
+)
+from ethereum.prague.trie import (
+    BranchNode,
+    ExtensionNode,
+    LeafNode,
+    Trie,
+    copy_trie,
+    encode_internal_node,
+)
+from ethereum.prague.trie import root as compute_root
+from ethereum.prague.vm import (
+    BlockEnvironment,
+    BlockOutput,
+    Evm,
+    Message,
+    TransactionEnvironment,
+)
 from ethereum_types.bytes import (
+    Bytes,
     Bytes0,
     Bytes4,
     Bytes8,
@@ -62,7 +71,7 @@ from ethereum_types.bytes import (
     Bytes64,
     Bytes256,
 )
-from ethereum_types.numeric import U64, U256, FixedUnsigned, Uint
+from ethereum_types.numeric import U8, U64, U256, FixedUnsigned, Uint
 from hypothesis import strategies as st
 from py_ecc.bls.hash_to_curve import (
     map_to_curve_G1,
@@ -157,7 +166,11 @@ MAX_TOUCHED_ACCOUNTS_SIZE = int(os.getenv("HYPOTHESIS_MAX_TOUCHED_ACCOUNTS_SIZE"
 MAX_TUPLE_SIZE = int(os.getenv("HYPOTHESIS_MAX_TUPLE_SIZE", 10))
 
 
-small_bytes = st.binary(max_size=256)
+# Hypothesis generates examples that shrink towards 0, creating very few large examples.
+# By converting an integer instead, we maximize the amount of large examples created, while being faster.
+small_bytes = st.integers(min_value=0, max_value=2 ** (256 * 8) - 1).map(
+    lambda x: Uint(x).to_le_bytes()
+)
 code = st.binary(max_size=MAX_CODE_SIZE)
 pc = st.integers(min_value=0, max_value=MAX_CODE_SIZE * 2).map(Uint)
 
@@ -317,7 +330,7 @@ def dict_strategy(thing):
             lambda x: TypedDict[key_type, value_type](x)
         )
     else:
-        return st.dictionaries()
+        return st.dictionaries(st.text(), st.booleans(), max_size=0)
 
 
 gas_left = st.integers(min_value=0, max_value=BLOCK_GAS_LIMIT).map(Uint)
@@ -343,24 +356,6 @@ memory_lite_start_position = bounded_u256_strategy(max_value=memory_lite_size //
 memory_lite_access_size = bounded_u256_strategy(max_value=memory_lite_size // 2)
 memory_lite_destination = bounded_u256_strategy(max_value=memory_lite_size * 2)
 
-
-message_lite = st.builds(
-    Message,
-    caller=address,
-    target=st.one_of(bytes0, address),
-    current_target=address,
-    gas=uint,
-    value=uint256,
-    data=st.just(b""),
-    code_address=st.none() | address,
-    code=code,
-    depth=uint,
-    should_transfer_value=st.booleans(),
-    is_static=st.booleans(),
-    accessed_addresses=st.builds(set, st.just(set())),
-    accessed_storage_keys=st.builds(set, st.just(set())),
-    parent_evm=st.none(),
-)
 
 # Using this list instead of the hash32 strategy to avoid data_to_large errors
 BLOCK_HASHES_LIST = [Hash32(Bytes32(bytes([i] * 32))) for i in range(256)]
@@ -389,34 +384,67 @@ transient_storage = st.sets(
     )
 )
 
-# Fork
-environment_lite = st.integers(
+block_environment_lite = st.integers(
     min_value=0, max_value=2**64 - 1
 ).flatmap(  # Generate block number first
     lambda number: st.builds(
-        Environment,
-        caller=address,
+        BlockEnvironment,
+        chain_id=uint64,
+        state=st.from_type(State),
+        block_gas_limit=uint,
         block_hashes=st.lists(
             st.sampled_from(BLOCK_HASHES_LIST),
             min_size=min(number, 256),  # number or 256 if number is greater
             max_size=min(number, 256),
         ),
-        origin=address,
         coinbase=address,
         number=st.just(Uint(number)),  # Use the same number
         base_fee_per_gas=uint,
-        gas_limit=uint,
-        gas_price=uint,
         time=uint256,
         prev_randao=bytes32,
-        state=st.from_type(State),
-        chain_id=uint64,
         excess_blob_gas=excess_blob_gas,
-        blob_versioned_hashes=st.lists(
-            st.from_type(VersionedHash), min_size=0, max_size=5
-        ).map(tuple),
-        transient_storage=transient_storage,
+        parent_beacon_block_root=bytes32,
     )
+)
+
+
+transaction_environment_lite = st.builds(
+    TransactionEnvironment,
+    origin=address,
+    gas_price=uint,
+    gas=uint,
+    access_list_addresses=st.builds(set, st.just(set())),
+    access_list_storage_keys=st.builds(set, st.just(set())),
+    transient_storage=transient_storage,
+    blob_versioned_hashes=st.lists(
+        st.from_type(VersionedHash), max_size=MAX_TUPLE_SIZE
+    ).map(tuple),
+    authorizations=st.lists(st.from_type(Authorization), max_size=MAX_TUPLE_SIZE).map(
+        tuple
+    ),
+    index_in_block=st.none() | uint,
+    tx_hash=st.none() | hash32,
+)
+
+message_lite = st.builds(
+    Message,
+    block_env=block_environment_lite,
+    tx_env=transaction_environment_lite,
+    caller=address,
+    target=st.one_of(bytes0, address),
+    current_target=address,
+    gas=uint,
+    value=uint256,
+    data=st.just(b""),
+    code_address=st.none() | address,
+    code=code,
+    depth=uint,
+    should_transfer_value=st.booleans(),
+    is_static=st.booleans(),
+    accessed_addresses=st.builds(set, st.just(set())),
+    accessed_storage_keys=st.builds(set, st.just(set())),
+    disable_precompiles=st.just(False),
+    parent_evm=st.none(),
 )
 
 valid_jump_destinations_lite = st.sets(uint, max_size=MAX_JUMP_DESTINATIONS_SET_SIZE)
@@ -440,6 +468,8 @@ evm_strategy = st.deferred(lambda: evm)
 
 message = st.builds(
     Message,
+    block_env=block_environment_lite,
+    tx_env=transaction_environment_lite,
     caller=address,
     target=st.one_of(bytes0, address),
     current_target=address,
@@ -453,6 +483,7 @@ message = st.builds(
     is_static=st.booleans(),
     accessed_addresses=accessed_addresses,
     accessed_storage_keys=accessed_storage_keys,
+    disable_precompiles=st.booleans(),
     parent_evm=st.none() | evm_strategy,
 )
 
@@ -463,7 +494,6 @@ evm = st.builds(
     memory=memory,
     code=code,
     gas_left=gas_left,
-    env=st.from_type(Environment),
     valid_jump_destinations=st.sets(st.from_type(Uint)),
     logs=st.from_type(Tuple[Log, ...]),
     refund_counter=felt,
@@ -471,7 +501,6 @@ evm = st.builds(
     message=message,
     output=small_bytes,
     accounts_to_delete=st.sets(st.from_type(Address), max_size=MAX_ADDRESS_SET_SIZE),
-    touched_accounts=st.sets(st.from_type(Address), max_size=MAX_ADDRESS_SET_SIZE),
     return_data=small_bytes,
     error=st.none() | st.from_type(EthereumException),
     accessed_addresses=accessed_addresses,
@@ -538,6 +567,47 @@ empty_state = st.builds(
         max_size=1,
     ),
     created_accounts=st.builds(set, st.just(set())),
+)
+
+empty_block_output = st.builds(
+    BlockOutput,
+    block_gas_used=st.just(Uint(0)),
+    transactions_trie=st.builds(
+        Trie[Bytes, Optional[Union[Bytes, LegacyTransaction]]],
+        secured=st.just(False),
+        default=st.just(None),
+        _data=st.just(defaultdict(lambda: None)),
+    ),
+    receipts_trie=st.builds(
+        Trie[Bytes, Optional[Union[Bytes, Receipt]]],
+        secured=st.just(False),
+        default=st.just(None),
+        _data=st.just(defaultdict(lambda: None)),
+    ),
+    receipt_keys=st.just(set()),
+    block_logs=st.just(list()),
+    withdrawals_trie=st.builds(
+        Trie[Bytes, Optional[Union[Bytes, Withdrawal]]],
+        secured=st.just(False),
+        default=st.just(None),
+        _data=st.just(defaultdict(lambda: None)),
+    ),
+    blob_gas_used=st.just(U64(0)),
+    requests=st.just(tuple()),
+)
+
+block_output_strategy = st.builds(
+    BlockOutput,
+    block_gas_used=uint,
+    transactions_trie=trie_strategy(
+        Trie[Bytes, Optional[Union[Bytes, LegacyTransaction]]]
+    ),
+    receipts_trie=trie_strategy(Trie[Bytes, Optional[Union[Bytes, Receipt]]]),
+    receipt_keys=st.from_type(Tuple[Bytes, ...]),
+    block_logs=st.from_type(Tuple[Log, ...]),
+    withdrawals_trie=trie_strategy(Trie[Bytes, Optional[Union[Bytes, Withdrawal]]]),
+    blob_gas_used=uint64,
+    requests=st.lists(small_bytes, max_size=MAX_TUPLE_SIZE).map(tuple),
 )
 
 # https://github.com/ethereum/EIPs/blob/master/EIPS/eip-4788.md
@@ -649,6 +719,7 @@ header = st.builds(
     prev_randao=bytes32,
     nonce=bytes8,
     base_fee_per_gas=uint,
+    requests_hash=hash32,
 )
 
 
@@ -714,6 +785,7 @@ assertion_error = st.builds(AssertionError, st.text())
 
 
 def register_type_strategies():
+    st.register_type_strategy(U8, uint8.map(U8))
     st.register_type_strategy(U64, uint64)
     st.register_type_strategy(Uint, uint)
     st.register_type_strategy(FixedUnsigned, uint)
@@ -749,6 +821,9 @@ def register_type_strategies():
     )
     st.register_type_strategy(
         BlobTransaction, st.builds(BlobTransaction, data=small_bytes)
+    )
+    st.register_type_strategy(
+        SetCodeTransaction, st.builds(SetCodeTransaction, data=small_bytes)
     )
     # See https://github.com/ethereum/execution-specs/issues/1043
     st.register_type_strategy(
@@ -809,13 +884,15 @@ def register_type_strategies():
     st.register_type_strategy(Stack, stack_strategy)
     st.register_type_strategy(Memory, memory)
     st.register_type_strategy(Evm, evm)
+    st.register_type_strategy(Message, message)
     st.register_type_strategy(tuple, tuple_strategy)
     st.register_type_strategy(dict, dict_strategy)
     st.register_type_strategy(ChainMap, dict_strategy)
     st.register_type_strategy(State, state_strategy())
     st.register_type_strategy(TransientStorage, transient_storage)
     st.register_type_strategy(MutableBloom, bloom.map(MutableBloom))
-    st.register_type_strategy(Environment, environment_lite)
+    st.register_type_strategy(BlockEnvironment, block_environment_lite)
+    st.register_type_strategy(TransactionEnvironment, transaction_environment_lite)
     st.register_type_strategy(Header, header)
     st.register_type_strategy(
         VersionedHash,
@@ -836,3 +913,5 @@ def register_type_strategies():
     st.register_type_strategy(KZGProof, bytes48.map(KZGProof))
     st.register_type_strategy(ValueError, value_error)
     st.register_type_strategy(AssertionError, assertion_error)
+    st.register_type_strategy(Authorization, st.builds(Authorization))
+    st.register_type_strategy(BlockOutput, block_output_strategy)

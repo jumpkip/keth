@@ -4,7 +4,7 @@ use cairo_vm::{
     hint_processor::{
         builtin_hint_processor::{
             dict_hint_utils::DICT_ACCESS_SIZE,
-            dict_manager::DictKey,
+            dict_manager::{DictKey, Dictionary},
             hint_utils::{
                 get_integer_from_var_name, get_maybe_relocatable_from_var_name,
                 get_ptr_from_var_name, insert_value_from_var_name,
@@ -22,10 +22,10 @@ use cairo_vm::{
     },
     Felt252,
 };
+use num_bigint::BigUint;
 use num_traits::Zero;
-use starknet_crypto::poseidon_hash_many;
 
-use crate::vm::hints::Hint;
+use crate::vm::{hash::blake2s_hash_many, hints::Hint};
 
 pub const HINTS: &[fn() -> Hint] = &[
     hashdict_read,
@@ -34,6 +34,7 @@ pub const HINTS: &[fn() -> Hint] = &[
     get_preimage_for_key,
     copy_hashdict_tracker_entry,
     get_storage_keys_for_address,
+    get_default_value,
 ];
 
 pub fn hashdict_read() -> Hint {
@@ -339,6 +340,35 @@ pub fn copy_hashdict_tracker_entry() -> Hint {
     )
 }
 
+pub fn get_default_value() -> Hint {
+    Hint::new(
+        String::from("get_default_value"),
+        |vm: &mut VirtualMachine,
+         exec_scopes: &mut ExecutionScopes,
+         ids_data: &HashMap<String, HintReference>,
+         ap_tracking: &ApTracking,
+         _constants: &HashMap<String, Felt252>|
+         -> Result<(), HintError> {
+            let dict_ptr = get_ptr_from_var_name("dict_ptr", vm, ids_data, ap_tracking)?;
+            let dict_manager_ref = exec_scopes.get_dict_manager()?;
+            let dict_manager = dict_manager_ref.borrow();
+            let tracker = dict_manager.get_tracker(dict_ptr)?;
+            match &tracker.data {
+                Dictionary::DefaultDictionary { default_value, .. } => insert_value_from_var_name(
+                    "default_value",
+                    default_value,
+                    vm,
+                    ids_data,
+                    ap_tracking,
+                ),
+                _ => Err(HintError::CustomHint(
+                    "Tracker is not a default dictionary".to_string().into(),
+                )),
+            }
+        },
+    )
+}
+
 fn build_compound_key(
     vm: &VirtualMachine,
     key: &cairo_vm::types::relocatable::Relocatable,
@@ -370,8 +400,10 @@ fn compute_hash_key(dict_key: &DictKey, key_len: usize) -> Felt252 {
     if key_len != 1 {
         match dict_key {
             DictKey::Compound(values) => {
-                let ints: Vec<Felt252> = values.iter().map(|v| v.get_int().unwrap()).collect();
-                poseidon_hash_many(&ints)
+                let ints: Vec<BigUint> =
+                    values.iter().map(|v| v.get_int().unwrap().to_biguint()).collect();
+                let hash = blake2s_hash_many(ints);
+                Felt252::from(hash)
             }
             DictKey::Simple(_) => panic!("Unreachable"),
         }

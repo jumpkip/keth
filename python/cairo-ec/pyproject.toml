@@ -37,15 +37,24 @@ dev-dependencies = [
   "cairo-lang>=0.13.0",
   "hypothesis>=6.124.3",
   "jupyter>=1.1.1",
-  "ethereum",
+  "ethereum-execution",
 ]
 
 [tool.isort]
 profile = "black"
 known_third_party = ["ethereum", "ethereum_rlp", "ethereum_types"]
-known_first_party = ["cairo_ec", "cairo_core", "cairo_addons", "eth_rpc", "mpt"]
+known_first_party = [
+  "cairo_ec",
+  "cairo_core",
+  "cairo_addons",
+  "eth_rpc",
+  "mpt",
+  "utils",
+  "tests",
+  "keth_types",
+]
 
 [tool.uv.sources]
-ethereum = { git = "https://github.com/kkrt-labs/execution-specs.git", branch = "kakarot-changes" }
+ethereum-execution = { git = "https://github.com/kkrt-labs/execution-specs.git", rev = "9e5f36b4d7f8e8ae2d8831d2460fbd88648fcdee" }
 cairo-addons = { workspace = true }
 cairo-core = { workspace = true }

@@ -5,16 +5,16 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping
 
-from ethereum.cancun.fork_types import Account, Address
-from ethereum.cancun.state import State, set_account, set_storage
-from ethereum.cancun.trie import (
+from ethereum.crypto.hash import Hash32, keccak256
+from ethereum.prague.fork_types import Account, Address
+from ethereum.prague.state import State, set_account, set_storage
+from ethereum.prague.trie import (
     BranchNode,
     ExtensionNode,
     InternalNode,
     LeafNode,
     Trie,
 )
-from ethereum.crypto.hash import Hash32, keccak256
 from ethereum_rlp import rlp
 from ethereum_types.bytes import Bytes, Bytes20, Bytes32
 from ethereum_types.numeric import U256, Uint
@@ -298,22 +298,29 @@ class EthereumTrieTransitionDB(EthereumTries):
 
     post_state_root: Hash32
 
-    @staticmethod
-    def from_pre_and_post_tries(pre_trie: EthereumTries, post_trie: EthereumTries):
-        return EthereumTrieTransitionDB(
-            nodes={**pre_trie.nodes, **post_trie.nodes},
-            codes={**pre_trie.codes, **post_trie.codes},
-            address_preimages={
-                **pre_trie.address_preimages,
-                **post_trie.address_preimages,
-            },
-            storage_key_preimages={
-                **pre_trie.storage_key_preimages,
-                **post_trie.storage_key_preimages,
-            },
-            pre_state_root=pre_trie.state_root,
-            post_state_root=post_trie.state_root,
+    @classmethod
+    def from_pre_and_post_tries(
+        cls, pre_trie: EthereumTries, post_trie: EthereumTries
+    ) -> "EthereumTrieTransitionDB":
+        nodes = {**pre_trie.nodes, **post_trie.nodes}
+        codes = {**pre_trie.codes, **post_trie.codes}
+        address_preimages = {
+            **pre_trie.address_preimages,
+            **post_trie.address_preimages,
+        }
+        storage_key_preimages = {
+            **pre_trie.storage_key_preimages,
+            **post_trie.storage_key_preimages,
+        }
+        instance = cls(
+            nodes=nodes,
+            codes=codes,
+            address_preimages=address_preimages,
+            storage_key_preimages=storage_key_preimages,
+            state_root=pre_trie.state_root,
         )
+        instance.post_state_root = post_trie.state_root
+        return instance
 
     @classmethod
     def from_json(cls, path: Path) -> "EthereumTrieTransitionDB":
@@ -363,6 +370,23 @@ class PreState:
                 # If the account is not present in the preState data, we want it explicitly set to NONE instead of being a non-existent entry.
                 # This is very important for the args_gen purpose, as we need all touched accounts to be present in the initial state dict.
                 pre_state._main_trie._data[address] = None
+
+                # If this account has storage that will be accessed or initialized, we need to add it to the storage tries.
+                # Find the access list entry for this address if it exists
+                access_entry = next(
+                    (
+                        entry
+                        for entry in data["extra"]["accessList"]
+                        if entry["address"] == address_hex
+                    ),
+                    None,
+                )
+                if access_entry:
+                    for storage_key in access_entry["storageKeys"]:
+                        storage_key_bytes = Bytes32.fromhex(storage_key[2:])
+                        pre_state._storage_tries[address]._data[
+                            storage_key_bytes
+                        ] = None
                 continue
 
             # Initialize the account
@@ -393,9 +417,11 @@ class PreState:
             # Note: the ZKPI provides `0` values for empty storage slots instead of null values.
             for storage_key_hex, value in account["storage"].items():
                 storage_key_bytes = Bytes32.fromhex(storage_key_hex[2:])
-                storage_key_int = U256(int(value[2:], 16))
-                storage_key = None if int(storage_key_int) == 0 else storage_key_int
-                pre_state._storage_tries[address]._data[storage_key_bytes] = storage_key
+                storage_value_int = U256(int(value[2:], 16))
+                storage_value = storage_value_int if storage_value_int != 0 else None
+                pre_state._storage_tries[address]._data[
+                    storage_key_bytes
+                ] = storage_value
 
         return pre_state
 

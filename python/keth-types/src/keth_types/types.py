@@ -11,25 +11,24 @@ from typing import (
     Union,
 )
 
-from ethereum.cancun.blocks import Receipt, Withdrawal
-from ethereum.cancun.fork_types import (
-    Address,
-)
-from ethereum.cancun.state import State, TransientStorage
-from ethereum.cancun.transactions import (
+from ethereum.crypto.hash import Hash32
+from ethereum.exceptions import EthereumException
+from ethereum.prague.blocks import Receipt, Withdrawal
+from ethereum.prague.fork_types import Address
+from ethereum.prague.state import State, TransientStorage
+from ethereum.prague.transactions import (
     LegacyTransaction,
 )
-from ethereum.cancun.trie import (
+from ethereum.prague.trie import (
     Trie,
     trie_get,
     trie_set,
 )
-from ethereum.cancun.vm import Environment as EnvironmentBase
-from ethereum.cancun.vm import Evm as EvmBase
-from ethereum.cancun.vm import Message as MessageBase
-from ethereum.cancun.vm.interpreter import MessageCallOutput as MessageCallOutputBase
-from ethereum.crypto.hash import Hash32
-from ethereum.exceptions import EthereumException
+from ethereum.prague.vm import BlockEnvironment as BlockEnvironmentBase
+from ethereum.prague.vm import Evm as EvmBase
+from ethereum.prague.vm import Message as MessageBase
+from ethereum.prague.vm import TransactionEnvironment as TransactionEnvironmentBase
+from ethereum.prague.vm.interpreter import MessageCallOutput as MessageCallOutputBase
 from ethereum_rlp import rlp
 from ethereum_types.bytes import (
     Bytes,
@@ -39,7 +38,7 @@ from ethereum_types.frozen import slotted_freezable
 from ethereum_types.numeric import U256, FixedUnsigned, Uint, _max_value
 from starkware.cairo.lang.cairo_constants import DEFAULT_PRIME
 
-from cairo_addons.rust_bindings.vm import poseidon_hash_many
+from cairo_addons.rust_bindings.vm import blake2s_hash_many
 from cairo_addons.utils.uint256 import int_to_uint256
 
 EMPTY_TRIE_HASH = Hash32.fromhex(
@@ -126,11 +125,11 @@ class Stack(List[T]):
 
 # All these classes are auto-patched in test imports in cairo/tests/conftests.py
 @dataclass
-class Environment(
+class BlockEnvironment(
     make_dataclass(
-        "Environment",
-        [(f.name, f.type, f) for f in fields(EnvironmentBase) if f.name != "traces"],
-        namespace={"__doc__": EnvironmentBase.__doc__},
+        "BlockEnvironment",
+        [(f.name, f.type, f) for f in fields(BlockEnvironmentBase)],
+        namespace={"__doc__": BlockEnvironmentBase.__doc__},
     )
 ):
     def __eq__(self, other):
@@ -139,7 +138,26 @@ class Environment(
             for field in fields(self)
         )
 
-    @functools.wraps(EnvironmentBase.__init__)
+
+@dataclass
+class TransactionEnvironment(
+    make_dataclass(
+        "TransactionEnvironment",
+        [
+            (f.name, f.type, f)
+            for f in fields(TransactionEnvironmentBase)
+            if f.name != "traces"
+        ],
+        namespace={"__doc__": TransactionEnvironmentBase.__doc__},
+    )
+):
+    def __eq__(self, other):
+        return all(
+            getattr(self, field.name) == getattr(other, field.name)
+            for field in fields(self)
+        )
+
+    @functools.wraps(TransactionEnvironmentBase.__init__)
     def __init__(self, *args, **kwargs):
         if "traces" in kwargs:
             del kwargs["traces"]
@@ -279,7 +297,7 @@ def encode_account(raw_account_data: Account, storage_root: Bytes) -> Bytes:
 
 
 def account_exists_and_is_empty(state: State, address: Address) -> bool:
-    from ethereum.cancun.state import get_account_optional
+    from ethereum.prague.state import get_account_optional
 
     account = get_account_optional(state, address)
     # The storage root is intended not to be taken into account here.
@@ -288,7 +306,7 @@ def account_exists_and_is_empty(state: State, address: Address) -> bool:
 
 # TODO PR in EELS?
 def is_account_alive(state: State, address: Address) -> bool:
-    from ethereum.cancun.state import get_account_optional
+    from ethereum.prague.state import get_account_optional
 
     account = get_account_optional(state, address)
     if account is None:
@@ -300,7 +318,7 @@ def is_account_alive(state: State, address: Address) -> bool:
 
 
 def set_code(state: State, address: Address, code: Bytes) -> None:
-    from ethereum.cancun.state import modify_state
+    from ethereum.prague.state import modify_state
 
     def write_code(sender: Account) -> None:
         from ethereum.crypto.hash import keccak256
@@ -322,13 +340,12 @@ EMPTY_ACCOUNT = Account(
 
 
 # Re-definition of the Node type to be used in the tests.
-# This is required for the `encode_node` function in `ethereum.cancun.trie` to work.
+# This is required for the `encode_node` function in `ethereum.prague.trie` to work.
 Node = Union[Account, Bytes, LegacyTransaction, Receipt, Uint, U256, Withdrawal, None]
 
 _field_mapping = {
     "stack": Stack[U256],
     "memory": Memory,
-    "env": Environment,
     "error": Optional[EthereumException],
     "message": Message,
 }
@@ -474,8 +491,8 @@ class AddressAccountDiffEntry:
     prev_value: Optional[Account]
     new_value: Account
 
-    def hash_poseidon(self):
-        return poseidon_hash_many(
+    def hash_cairo(self):
+        return blake2s_hash_many(
             [
                 int.from_bytes(self.key, "little"),
                 *(self.prev_value.hash_args() if self.prev_value else []),
@@ -495,8 +512,8 @@ class StorageDiffEntry:
     prev_value: Optional[U256]
     new_value: Optional[U256]
 
-    def hash_poseidon(self):
-        return poseidon_hash_many(
+    def hash_cairo(self):
+        return blake2s_hash_many(
             [
                 int(self.key),
                 *(

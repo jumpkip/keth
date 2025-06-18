@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+features = ["pyo3/extension-module"]                   # add dhat-heap to enable heap profiling
 module-name = "cairo_addons.rust_bindings"
 python-packages = ["cairo_addons"]
 python-source = "src"
@@ -34,7 +34,16 @@ dev-dependencies = [
 [tool.isort]
 profile = "black"
 known_third_party = ["ethereum", "ethereum_rlp", "ethereum_types"]
-known_first_party = ["cairo_ec", "cairo_core", "cairo_addons", "eth_rpc", "mpt"]
+known_first_party = [
+  "cairo_ec",
+  "cairo_core",
+  "cairo_addons",
+  "eth_rpc",
+  "mpt",
+  "utils",
+  "tests",
+  "keth_types",
+]
 
 [project.entry-points."pytest11"]
 cairo_hooks = "cairo_addons.testing.hooks"

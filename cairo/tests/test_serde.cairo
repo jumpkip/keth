@@ -1,3 +1,4 @@
+// cairo-lint: disable-file
 from ethereum_types.numeric import bool, U64, U128, U256, Uint
 from ethereum_types.others import None
 from ethereum_types.bytes import (
@@ -12,7 +13,7 @@ from ethereum_types.bytes import (
     MappingBytesBytes,
 )
 
-from ethereum.cancun.fork_types import (
+from ethereum.prague.fork_types import (
     Address,
     Root,
     VersionedHash,
@@ -22,7 +23,7 @@ from ethereum.cancun.fork_types import (
     ListHash32,
 )
 
-from ethereum.cancun.blocks import (
+from ethereum.prague.blocks import (
     Withdrawal,
     TupleWithdrawal,
     Header,
@@ -33,8 +34,8 @@ from ethereum.cancun.blocks import (
     ListBlock,
 )
 
-from ethereum.cancun.transactions_types import (
-    TupleAccessList,
+from ethereum.prague.transactions_types import (
+    TupleAccess,
     Transaction,
     LegacyTransaction,
     AccessListTransaction,
@@ -42,14 +43,14 @@ from ethereum.cancun.transactions_types import (
     BlobTransaction,
 )
 
-from ethereum.cancun.vm.gas import MessageCallGas
+from ethereum.prague.vm.gas import MessageCallGas
 
-from ethereum.cancun.trie import BranchNode, ExtensionNode, InternalNode, LeafNode, Node, Subnodes
+from ethereum.prague.trie import BranchNode, ExtensionNode, InternalNode, LeafNode, Node, Subnodes
 from ethereum.exceptions import EthereumException
-from ethereum.cancun.state import TransientStorage
-from ethereum.cancun.vm.env_impl import Environment
-from ethereum.cancun.vm.interpreter import MessageCallOutput
-from ethereum.cancun.fork import BlockChain
+from ethereum.prague.state import TransientStorage
+from ethereum.prague.vm.env_impl import BlockEnvironment, BlockEnvironmentStruct, BlockEnvImpl, TransactionEnvImpl, TransactionEnvironment, TransactionEnvironmentStruct
+from ethereum.prague.vm.interpreter import MessageCallOutput
+from ethereum.prague.fork import BlockChain
 
 from ethereum.crypto.alt_bn128 import BNF12
 from ethereum.crypto.bls12_381 import BLSF

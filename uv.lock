@@ -12,6 +12,7 @@ members = [
     "cairo-addons",
     "cairo-core",
     "cairo-ec",
+    "cairo-lint",
     "eth-rpc",
     "keth",
     "keth-types",
@@ -482,7 +483,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "cairo-lang" },
-    { name = "ethereum" },
+    { name = "ethereum-execution" },
     { name = "hypothesis" },
     { name = "jupyter" },
     { name = "pytest" },
@@ -500,7 +501,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "cairo-lang", specifier = ">=0.13.0" },
-    { name = "ethereum", git = "https://github.com/kkrt-labs/execution-specs.git?branch=kakarot-changes" },
+    { name = "ethereum-execution", git = "https://github.com/kkrt-labs/execution-specs.git?rev=9e5f36b4d7f8e8ae2d8831d2460fbd88648fcdee" },
     { name = "hypothesis", specifier = ">=6.124.3" },
     { name = "jupyter", specifier = ">=1.1.1" },
     { name = "pytest", specifier = ">=7.0" },
@@ -538,6 +539,47 @@ dependencies = [
     { name = "web3" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/00/ba/213003b107bec47151b58c88cef1a7cbb57785e70400d7c216b91e52e38b/cairo-lang-0.13.3.zip", hash = "sha256:fcb01d5cc6f2409f593e2a40249b1f903346785ce7916faaf6f95f120ee3c52d", size = 11008548 }
+
+[[package]]
+name = "cairo-lint"
+version = "0.1.0"
+source = { editable = "python/cairo-lint" }
+dependencies = [
+    { name = "cairo-lang" },
+    { name = "rich" },
+    { name = "toml" },
+    { name = "typer" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cairo-lang", specifier = ">=0.13.3" },
+    { name = "rich", specifier = ">=14.0.0" },
+    { name = "toml" },
+    { name = "typer", specifier = ">=0.15.3" },
+]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8.3.3" }]
+
+[[package]]
+name = "cattrs"
+version = "24.1.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "attrs" },
+    { name = "exceptiongroup", marker = "python_full_version < '3.11'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/29/7b/da4aa2f95afb2f28010453d03d6eedf018f9e085bd001f039e15731aba89/cattrs-24.1.3.tar.gz", hash = "sha256:981a6ef05875b5bb0c7fb68885546186d306f10f0f6718fe9b96c226e68821ff", size = 426684 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3c/ee/d68a3de23867a9156bab7e0a22fb9a0305067ee639032a22982cf7f725e7/cattrs-24.1.3-py3-none-any.whl", hash = "sha256:adf957dddd26840f27ffbd060a6c4dd3b2192c5b7c2c0525ef1bd8131d8a83f5", size = 66462 },
+]
 
 [[package]]
 name = "certifi"
@@ -1097,13 +1139,13 @@ name = "eth-rpc"
 version = "0.1.0"
 source = { editable = "python/eth-rpc" }
 dependencies = [
-    { name = "ethereum" },
+    { name = "ethereum-execution" },
     { name = "python-dotenv" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "ethereum" },
+    { name = "ethereum-execution", git = "https://github.com/kkrt-labs/execution-specs.git?rev=9e5f36b4d7f8e8ae2d8831d2460fbd88648fcdee" },
     { name = "python-dotenv", specifier = ">=1.0.1" },
 ]
 
@@ -1135,9 +1177,9 @@ wheels = [
 ]
 
 [[package]]
-name = "ethereum"
-version = "0.1.0"
-source = { git = "https://github.com/kkrt-labs/execution-specs.git?branch=kakarot-changes#71d0c0b8b3b0dc5ca4da448a8ce0685bb5574d32" }
+name = "ethereum-execution"
+version = "1.17.0rc6"
+source = { git = "https://github.com/kkrt-labs/execution-specs.git?rev=9e5f36b4d7f8e8ae2d8831d2460fbd88648fcdee#9e5f36b4d7f8e8ae2d8831d2460fbd88648fcdee" }
 dependencies = [
     { name = "coincurve" },
     { name = "ethereum-rlp" },
@@ -1925,7 +1967,7 @@ dependencies = [
     { name = "cairo-lang" },
     { name = "colorama" },
     { name = "eth-rpc" },
-    { name = "ethereum" },
+    { name = "ethereum-execution" },
     { name = "garaga" },
     { name = "garaga-zero" },
     { name = "keth-types" },
@@ -1934,6 +1976,7 @@ dependencies = [
     { name = "pytest-randomly" },
     { name = "pytest-timeout" },
     { name = "python-dotenv" },
+    { name = "requests-cache" },
     { name = "toml" },
     { name = "web3" },
     { name = "xxhash" },
@@ -1941,6 +1984,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "cairo-lint" },
     { name = "eth-abi" },
     { name = "eth-account" },
     { name = "eth-keys" },
@@ -1967,7 +2011,7 @@ requires-dist = [
     { name = "cairo-lang", specifier = ">=0.13.3" },
     { name = "colorama", specifier = ">=0.4.6" },
     { name = "eth-rpc", editable = "python/eth-rpc" },
-    { name = "ethereum" },
+    { name = "ethereum-execution", git = "https://github.com/kkrt-labs/execution-specs.git?rev=9e5f36b4d7f8e8ae2d8831d2460fbd88648fcdee" },
     { name = "garaga" },
     { name = "garaga-zero", git = "https://github.com/kkrt-labs/garaga-zero?rev=08e80a99c60a11adc5715c329a4390937d12d77d" },
     { name = "keth-types", editable = "python/keth-types" },
@@ -1976,6 +2020,7 @@ requires-dist = [
     { name = "pytest-randomly", specifier = ">=3.16.0" },
     { name = "pytest-timeout", specifier = ">=2.3.1" },
     { name = "python-dotenv", specifier = ">=1.0.1" },
+    { name = "requests-cache", specifier = ">=1.2.1" },
     { name = "toml", specifier = ">=0.10.2" },
     { name = "web3", specifier = ">=7.2.0" },
     { name = "xxhash", specifier = ">=3.5.0" },
@@ -1983,6 +2028,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "cairo-lint", editable = "python/cairo-lint" },
     { name = "eth-abi", specifier = ">=5.1.0" },
     { name = "eth-account", specifier = ">=0.13.3" },
     { name = "eth-keys", specifier = ">=0.5.1" },
@@ -2006,11 +2052,11 @@ name = "keth-types"
 version = "0.1.0"
 source = { editable = "python/keth-types" }
 dependencies = [
-    { name = "ethereum" },
+    { name = "ethereum-execution" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "ethereum", git = "https://github.com/kkrt-labs/execution-specs.git?branch=kakarot-changes" }]
+requires-dist = [{ name = "ethereum-execution", git = "https://github.com/kkrt-labs/execution-specs.git?rev=9e5f36b4d7f8e8ae2d8831d2460fbd88648fcdee" }]
 
 [[package]]
 name = "lark"
@@ -2216,14 +2262,14 @@ dependencies = [
     { name = "cairo-lang" },
     { name = "click" },
     { name = "eth-rpc" },
-    { name = "ethereum" },
+    { name = "ethereum-execution" },
     { name = "maturin" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "cairo-lang" },
-    { name = "ethereum" },
+    { name = "ethereum-execution" },
     { name = "hypothesis" },
     { name = "jupyter" },
     { name = "pytest" },
@@ -2236,14 +2282,14 @@ requires-dist = [
     { name = "cairo-lang", specifier = ">=0.13.3" },
     { name = "click", specifier = ">=8.1.7" },
     { name = "eth-rpc", editable = "python/eth-rpc" },
-    { name = "ethereum", git = "https://github.com/kkrt-labs/execution-specs.git?branch=kakarot-changes" },
+    { name = "ethereum-execution", git = "https://github.com/kkrt-labs/execution-specs.git?rev=9e5f36b4d7f8e8ae2d8831d2460fbd88648fcdee" },
     { name = "maturin", specifier = ">=1.8.1" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "cairo-lang", specifier = ">=0.13.0" },
-    { name = "ethereum", git = "https://github.com/kkrt-labs/execution-specs.git?branch=kakarot-changes" },
+    { name = "ethereum-execution", git = "https://github.com/kkrt-labs/execution-specs.git?rev=9e5f36b4d7f8e8ae2d8831d2460fbd88648fcdee" },
     { name = "hypothesis", specifier = ">=6.124.3" },
     { name = "jupyter", specifier = ">=1.1.1" },
     { name = "pytest", specifier = ">=7.0" },
@@ -3451,6 +3497,23 @@ wheels = [
 ]
 
 [[package]]
+name = "requests-cache"
+version = "1.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "attrs" },
+    { name = "cattrs" },
+    { name = "platformdirs" },
+    { name = "requests" },
+    { name = "url-normalize" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1a/be/7b2a95a9e7a7c3e774e43d067c51244e61dea8b120ae2deff7089a93fb2b/requests_cache-1.2.1.tar.gz", hash = "sha256:68abc986fdc5b8d0911318fbb5f7c80eebcd4d01bfacc6685ecf8876052511d1", size = 3018209 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4e/2e/8f4051119f460cfc786aa91f212165bb6e643283b533db572d7b33952bd2/requests_cache-1.2.1-py3-none-any.whl", hash = "sha256:1285151cddf5331067baa82598afe2d47c7495a1334bfe7a7d329b43e9fd3603", size = 61425 },
+]
+
+[[package]]
 name = "rfc3339-validator"
 version = "0.1.4"
 source = { registry = "https://pypi.org/simple" }
@@ -3473,16 +3536,16 @@ wheels = [
 
 [[package]]
 name = "rich"
-version = "13.9.4"
+version = "14.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "markdown-it-py" },
     { name = "pygments" },
     { name = "typing-extensions", marker = "python_full_version < '3.11'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ab/3a/0316b28d0761c6734d6bc14e770d85506c986c85ffb239e688eeaab2c2bc/rich-13.9.4.tar.gz", hash = "sha256:439594978a49a09530cff7ebc4b5c7103ef57baf48d5ea3184f21d9a2befa098", size = 223149 }
+sdist = { url = "https://files.pythonhosted.org/packages/a1/53/830aa4c3066a8ab0ae9a9955976fb770fe9c6102117c8ec4ab3ea62d89e8/rich-14.0.0.tar.gz", hash = "sha256:82f1bc23a6a21ebca4ae0c45af9bdbc492ed20231dcb63f297d6d1021a9d5725", size = 224078 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/19/71/39c7c0d87f8d4e6c020a393182060eaefeeae6c01dab6a84ec346f2567df/rich-13.9.4-py3-none-any.whl", hash = "sha256:6049d5e6ec054bf2779ab3358186963bac2ea89175919d699e378b99738c2a90", size = 242424 },
+    { url = "https://files.pythonhosted.org/packages/0d/9b/63f4c7ebc259242c89b3acafdb37b41d1185c07ff0011164674e9076b491/rich-14.0.0-py3-none-any.whl", hash = "sha256:1c9491e1951aac09caffd42f448ee3d04e58923ffe14993f6e83068dc395d7e0", size = 243229 },
 ]
 
 [[package]]
@@ -3853,7 +3916,7 @@ wheels = [
 
 [[package]]
 name = "typer"
-version = "0.15.2"
+version = "0.15.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -3861,9 +3924,9 @@ dependencies = [
     { name = "shellingham" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8b/6f/3991f0f1c7fcb2df31aef28e0594d8d54b05393a0e4e34c65e475c2a5d41/typer-0.15.2.tar.gz", hash = "sha256:ab2fab47533a813c49fe1f16b1a370fd5819099c00b119e0633df65f22144ba5", size = 100711 }
+sdist = { url = "https://files.pythonhosted.org/packages/98/1a/5f36851f439884bcfe8539f6a20ff7516e7b60f319bbaf69a90dc35cc2eb/typer-0.15.3.tar.gz", hash = "sha256:818873625d0569653438316567861899f7e9972f2e6e0c16dab608345ced713c", size = 101641 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7f/fc/5b29fea8cee020515ca82cc68e3b8e1e34bb19a3535ad854cac9257b414c/typer-0.15.2-py3-none-any.whl", hash = "sha256:46a499c6107d645a9c13f7ee46c5d5096cae6f5fc57dd11eccbbb9ae3e44ddfc", size = 45061 },
+    { url = "https://files.pythonhosted.org/packages/48/20/9d953de6f4367163d23ec823200eb3ecb0050a2609691e512c8b95827a9b/typer-0.15.3-py3-none-any.whl", hash = "sha256:c86a65ad77ca531f03de08d1b9cb67cd09ad02ddddf4b34745b5008f43b239bd", size = 45253 },
 ]
 
 [[package]]
@@ -3925,6 +3988,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/31/c7/0336f2bd0bcbada6ccef7aaa25e443c118a704f828a0620c6fa0207c1b64/uri-template-1.3.0.tar.gz", hash = "sha256:0e00f8eb65e18c7de20d595a14336e9f337ead580c70934141624b6d1ffdacc7", size = 21678 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e7/00/3fca040d7cf8a32776d3d81a00c8ee7457e00f80c649f1e4a863c8321ae9/uri_template-1.3.0-py3-none-any.whl", hash = "sha256:a44a133ea12d44a0c0f06d7d42a52d71282e77e2f937d8abd5655b8d56fc1363", size = 11140 },
+]
+
+[[package]]
+name = "url-normalize"
+version = "2.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "idna" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/80/31/febb777441e5fcdaacb4522316bf2a527c44551430a4873b052d545e3279/url_normalize-2.2.1.tar.gz", hash = "sha256:74a540a3b6eba1d95bdc610c24f2c0141639f3ba903501e61a52a8730247ff37", size = 18846 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bc/d9/5ec15501b675f7bc07c5d16aa70d8d778b12375686b6efd47656efdc67cd/url_normalize-2.2.1-py3-none-any.whl", hash = "sha256:3deb687587dc91f7b25c9ae5162ffc0f057ae85d22b1e15cf5698311247f567b", size = 14728 },
 ]
 
 [[package]]
